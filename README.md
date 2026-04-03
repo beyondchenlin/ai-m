@@ -12,9 +12,7 @@ AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
 
 添加飞书群：
 
-| 飞书群 | 飞书群2 |
-|:---:|:---:|
-| ![飞书群](images/lark-chat.jpg) | ![飞书群2](images/lark-chat2.png) |
+![飞书群](images/lark-chat.png)
 
 本网站全程由 AI 驱动开发， 开发指南：https://github.com/twwch/vibe-coding
 
