@@ -1,5 +1,9 @@
 # AI Comic Builder
 
+
+社区交流：[https://linux.do/](https://linux.do/)
+
+
 > v0.2.2
 
 AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
