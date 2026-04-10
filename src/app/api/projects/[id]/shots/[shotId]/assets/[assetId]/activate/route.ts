@@ -11,15 +11,26 @@
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { shotAssets } from "@/lib/db/schema";
+import { shotAssets, shots } from "@/lib/db/schema";
 import { activateAssetVersion } from "@/lib/shot-asset-utils";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 export async function POST(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string; shotId: string; assetId: string }> }
 ) {
-  const { shotId, assetId } = await params;
+  const { id: projectId, shotId, assetId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  const [shotRow] = await db
+    .select({ id: shots.id })
+    .from(shots)
+    .where(and(eq(shots.id, shotId), eq(shots.projectId, projectId)));
+  if (!shotRow) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
 
   const [target] = await db
     .select()

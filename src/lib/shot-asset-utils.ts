@@ -167,6 +167,11 @@ export async function insertAssetVersion(
 
   const nextVersion = existing.length > 0 ? existing[0].assetVersion + 1 : 1;
 
+  // Previous row in this slot — we inherit meta / characters from it when
+  // the caller doesn't explicitly override. Version bump should NOT silently
+  // drop metadata like sceneName, character tags, etc.
+  const previousRow = existing[0];
+
   // Deactivate any currently active row in this slot.
   const activeIds = existing
     .filter((r) => r.isActive === 1)
@@ -177,6 +182,22 @@ export async function insertAssetVersion(
       .set({ isActive: 0, updatedAt: new Date() })
       .where(eq(shotAssets.id, id));
   }
+
+  // Resolve characters: explicit input > previous row's characters > null
+  const resolvedCharacters =
+    input.characters !== undefined
+      ? input.characters
+        ? JSON.stringify(input.characters)
+        : null
+      : previousRow?.characters ?? null;
+
+  // Resolve meta: explicit input > previous row's meta > null
+  const resolvedMeta =
+    input.meta !== undefined
+      ? input.meta
+        ? JSON.stringify(input.meta)
+        : null
+      : previousRow?.meta ?? null;
 
   const now = new Date();
   const newRow = {
@@ -189,10 +210,10 @@ export async function insertAssetVersion(
     prompt: input.prompt,
     fileUrl: input.fileUrl ?? null,
     status: input.status ?? "pending",
-    characters: input.characters ? JSON.stringify(input.characters) : null,
+    characters: resolvedCharacters,
     modelProvider: input.modelProvider ?? null,
     modelId: input.modelId ?? null,
-    meta: input.meta ? JSON.stringify(input.meta) : null,
+    meta: resolvedMeta,
     createdAt: now,
     updatedAt: now,
   };

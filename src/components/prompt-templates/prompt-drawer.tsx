@@ -39,11 +39,6 @@ function tKey(nameKey: string): string {
   return nameKey.replace(/^promptTemplates\./, "");
 }
 
-// A slot with its parent prompt key attached
-interface SlotWithPrompt extends SlotMeta {
-  promptKey: string;
-}
-
 // ── Props ────────────────────────────────────────────────
 
 interface PromptDrawerProps {
@@ -60,6 +55,7 @@ export function PromptDrawer({ open, onOpenChange, promptKeys: rawKeys, projectI
   const promptKeys = Array.isArray(rawKeys) ? rawKeys : [rawKeys];
 
   const [prompts, setPrompts] = useState<PromptMeta[]>([]);
+  const [selectedPromptKey, setSelectedPromptKey] = useState<string | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<{ promptKey: string; slotKey: string } | null>(null);
   // promptKey -> slotKey -> content
   const [slotContents, setSlotContents] = useState<Record<string, Record<string, string>>>({});
@@ -121,10 +117,12 @@ export function PromptDrawer({ open, onOpenChange, promptKeys: rawKeys, projectI
       setServerOverrides(overMap);
       setSlotContents(contents);
 
-      // Auto-select first editable slot of first prompt
-      const firstEditable = found[0]?.slots.find((s) => s.editable);
-      if (firstEditable) {
-        setSelectedSlot({ promptKey: found[0].key, slotKey: firstEditable.key });
+      // Auto-select first prompt + its first editable slot
+      const firstPrompt = found[0];
+      setSelectedPromptKey(firstPrompt?.key ?? null);
+      const firstEditable = firstPrompt?.slots.find((s) => s.editable);
+      if (firstPrompt && firstEditable) {
+        setSelectedSlot({ promptKey: firstPrompt.key, slotKey: firstEditable.key });
       }
     } catch {
       toast.error("Failed to load prompt data");
@@ -140,16 +138,6 @@ export function PromptDrawer({ open, onOpenChange, promptKeys: rawKeys, projectI
 
   if (prompts.length === 0 && !loading) return null;
 
-  // Build flat slot list grouped by prompt
-  const allSlots: SlotWithPrompt[] = [];
-  const allLockedSlots: SlotWithPrompt[] = [];
-  for (const prompt of prompts) {
-    for (const slot of prompt.slots) {
-      const item = { ...slot, promptKey: prompt.key };
-      if (slot.editable) allSlots.push(item);
-      else allLockedSlots.push(item);
-    }
-  }
 
   const currentSlotMeta = selectedSlot
     ? prompts.find((p) => p.key === selectedSlot.promptKey)?.slots.find((s) => s.key === selectedSlot.slotKey)
@@ -253,7 +241,7 @@ export function PromptDrawer({ open, onOpenChange, promptKeys: rawKeys, projectI
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="!fixed !top-0 !right-0 !left-auto !translate-x-0 !translate-y-0 !max-w-4xl !w-[min(900px,100vw)] !h-screen !rounded-none !rounded-l-2xl !p-0 flex flex-col"
+        className="!fixed !top-0 !right-0 !left-auto !translate-x-0 !translate-y-0 !max-w-5xl !w-[min(1100px,100vw)] !h-screen !rounded-none !rounded-l-2xl !p-0 flex flex-col"
         showCloseButton={false}
       >
         <DialogTitle className="sr-only">
@@ -305,70 +293,146 @@ export function PromptDrawer({ open, onOpenChange, promptKeys: rawKeys, projectI
           </div>
         ) : (
           <div className="flex flex-1 overflow-hidden">
-            {/* Slot list (left) */}
-            <div className="w-[170px] shrink-0 overflow-y-auto border-r border-[--border-subtle] p-2">
-              {prompts.map((prompt, pi) => (
-                <div key={prompt.key}>
-                  {/* Show prompt group header when multiple prompts */}
-                  {prompts.length > 1 && (
-                    <div className={`px-2 pb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[--text-muted] ${pi > 0 ? "pt-3 mt-1 border-t border-[--border-subtle]" : "pt-1"}`}>
-                      {t(tKey(prompt.nameKey) as Parameters<typeof t>[0])}
+            {/* Column 1: Prompt list, grouped by category (matches backend settings page) */}
+            <div className="w-[200px] shrink-0 overflow-y-auto border-r border-[--border-subtle] p-2">
+              {(() => {
+                const grouped: Record<string, PromptMeta[]> = {};
+                for (const p of prompts) {
+                  if (!grouped[p.category]) grouped[p.category] = [];
+                  grouped[p.category].push(p);
+                }
+                return Object.entries(grouped).map(([category, list]) => (
+                  <div key={category}>
+                    <div className="px-2 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.15em] text-[--text-muted]">
+                      {t(`categories.${category}` as Parameters<typeof t>[0])}
                     </div>
-                  )}
-                  {prompt.slots.filter((s) => s.editable).map((slot) => {
-                    const isSelected = selectedSlot?.promptKey === prompt.key && selectedSlot?.slotKey === slot.key;
-                    const modified = isModified(prompt.key, slot.key);
-                    return (
-                      <button
-                        key={`${prompt.key}:${slot.key}`}
-                        onClick={() => setSelectedSlot({ promptKey: prompt.key, slotKey: slot.key })}
-                        className={`flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left text-xs transition-all ${
-                          isSelected
-                            ? "border border-primary/15 bg-primary/5 text-[--text-primary] font-medium"
-                            : "border border-transparent hover:bg-[--surface] text-[--text-secondary]"
-                        }`}
-                      >
-                        <span className="flex-1 truncate">
-                          {t(tKey(slot.nameKey) as Parameters<typeof t>[0]) || slot.key}
-                        </span>
-                        {modified && (
-                          <Badge variant="default" className="shrink-0 text-[9px] px-1 py-0">
-                            {t("editor.modified")}
-                          </Badge>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
-              {allLockedSlots.length > 0 && (
-                <>
-                  <div className="my-1.5 border-t border-[--border-subtle]" />
-                  {allLockedSlots.map((slot) => {
-                    const isSelected = selectedSlot?.promptKey === slot.promptKey && selectedSlot?.slotKey === slot.key;
-                    return (
-                      <button
-                        key={`${slot.promptKey}:${slot.key}`}
-                        onClick={() => setSelectedSlot({ promptKey: slot.promptKey, slotKey: slot.key })}
-                        className={`flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left text-xs transition-all ${
-                          isSelected
-                            ? "border border-[--border-subtle] bg-[--surface] text-[--text-secondary]"
-                            : "border border-transparent text-[--text-muted] hover:bg-[--surface] opacity-60 hover:opacity-80"
-                        }`}
-                      >
-                        <Lock className="h-2.5 w-2.5 shrink-0" />
-                        <span className="flex-1 truncate">
-                          {t(tKey(slot.nameKey) as Parameters<typeof t>[0]) || slot.key}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </>
-              )}
+                    {list.map((prompt) => {
+                      const isSelected = selectedPromptKey === prompt.key;
+                      const dirtyCount = prompt.slots.filter(
+                        (s) => isModified(prompt.key, s.key)
+                      ).length;
+                      return (
+                        <button
+                          key={prompt.key}
+                          onClick={() => {
+                            setSelectedPromptKey(prompt.key);
+                            const firstEditable = prompt.slots.find((s) => s.editable);
+                            if (firstEditable) {
+                              setSelectedSlot({ promptKey: prompt.key, slotKey: firstEditable.key });
+                            } else {
+                              setSelectedSlot(null);
+                            }
+                          }}
+                          className={`flex w-full flex-col gap-0.5 rounded-xl px-2.5 py-2 text-left transition-all duration-200 ${
+                            isSelected
+                              ? "border border-primary/15 bg-primary/5"
+                              : "border border-transparent hover:bg-[--surface]"
+                          }`}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className={`text-[13px] ${
+                                isSelected
+                                  ? "text-[--text-primary] font-medium"
+                                  : "text-[--text-secondary]"
+                              }`}
+                            >
+                              {t(tKey(prompt.nameKey) as Parameters<typeof t>[0])}
+                            </span>
+                            {dirtyCount > 0 && (
+                              <Badge variant="default" className="text-[9px] px-1 py-0">
+                                {dirtyCount}
+                              </Badge>
+                            )}
+                          </div>
+                          <span className="font-mono text-[10px] text-[--text-muted]">
+                            {prompt.key}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ));
+              })()}
             </div>
 
-            {/* Editor (right) */}
-            <div className="flex flex-1 flex-col overflow-hidden">
+            {/* Column 2: Slot list of selected prompt */}
+            <div className="w-[170px] shrink-0 overflow-y-auto border-r border-[--border-subtle] p-2">
+              {(() => {
+                const prompt = prompts.find((p) => p.key === selectedPromptKey);
+                if (!prompt) {
+                  return (
+                    <div className="flex h-full items-center justify-center text-[10px] text-[--text-muted] px-2 text-center">
+                      {t("editor.slotMode")}
+                    </div>
+                  );
+                }
+                const editableSlots = prompt.slots.filter((s) => s.editable);
+                const lockedSlots = prompt.slots.filter((s) => !s.editable);
+                return (
+                  <>
+                    <div className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.15em] text-[--text-muted]">
+                      {t("editor.slots")} ({prompt.slots.length})
+                    </div>
+                    {editableSlots.map((slot) => {
+                      const isSelected =
+                        selectedSlot?.promptKey === prompt.key &&
+                        selectedSlot?.slotKey === slot.key;
+                      const modified = isModified(prompt.key, slot.key);
+                      return (
+                        <button
+                          key={slot.key}
+                          onClick={() => setSelectedSlot({ promptKey: prompt.key, slotKey: slot.key })}
+                          className={`flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left text-xs transition-all ${
+                            isSelected
+                              ? "border border-primary/15 bg-primary/5 text-[--text-primary] font-medium"
+                              : "border border-transparent hover:bg-[--surface] text-[--text-secondary]"
+                          }`}
+                        >
+                          <span className="flex-1 truncate">
+                            {t(tKey(slot.nameKey) as Parameters<typeof t>[0]) || slot.key}
+                          </span>
+                          {modified && (
+                            <Badge variant="default" className="shrink-0 text-[9px] px-1 py-0">
+                              {t("editor.modified")}
+                            </Badge>
+                          )}
+                        </button>
+                      );
+                    })}
+                    {lockedSlots.length > 0 && (
+                      <>
+                        <div className="my-1.5 border-t border-[--border-subtle]" />
+                        {lockedSlots.map((slot) => {
+                          const isSelected =
+                            selectedSlot?.promptKey === prompt.key &&
+                            selectedSlot?.slotKey === slot.key;
+                          return (
+                            <button
+                              key={slot.key}
+                              onClick={() => setSelectedSlot({ promptKey: prompt.key, slotKey: slot.key })}
+                              className={`flex w-full items-center gap-1.5 rounded-lg px-2.5 py-2 text-left text-xs transition-all ${
+                                isSelected
+                                  ? "border border-[--border-subtle] bg-[--surface] text-[--text-secondary]"
+                                  : "border border-transparent text-[--text-muted] hover:bg-[--surface] opacity-60 hover:opacity-80"
+                              }`}
+                            >
+                              <Lock className="h-2.5 w-2.5 shrink-0" />
+                              <span className="flex-1 truncate">
+                                {t(tKey(slot.nameKey) as Parameters<typeof t>[0]) || slot.key}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+
+            {/* Column 3: Editor (right) */}
+            <div className="flex flex-1 flex-col overflow-hidden min-w-0">
               {selectedSlot && currentSlotMeta ? (
                 <div className="flex flex-1 flex-col p-3 overflow-hidden">
                   <div className="mb-2 flex items-center gap-2">

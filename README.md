@@ -3,8 +3,7 @@
 
 社区交流：[https://linux.do/](https://linux.do/)
 
-
-> v0.2.2
+> v0.2.3
 
 AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
 
@@ -13,6 +12,8 @@ AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
 [Bilibili](https://www.bilibili.com/video/BV1gMQSBQEoi/) 
 
 [v0.2.1 版本更新](https://www.bilibili.com/video/BV13CXQB8EwL/)
+
+[v0.2.2 Seedance 2.0 接入 + 参考图模式重构](https://www.bilibili.com/video/BV1v4DZBmEiw/)
 
 添加飞书群：
 

@@ -5,12 +5,16 @@ import { NextResponse } from "next/server";
 import { checkContinuity } from "@/lib/pipeline/continuity-check";
 import { resolveAIProvider } from "@/lib/ai/provider-factory";
 import { loadShotLegacyViewsBatch } from "@/lib/shot-asset-utils";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 export async function POST(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (!(await assertProjectOwnership(req, id))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const body = await req.json();
 
   const allShots = await db

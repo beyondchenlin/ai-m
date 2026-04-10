@@ -55,6 +55,7 @@ interface RefImage {
   imagePath?: string;
   status: "pending" | "generated";
   characters?: string[];
+  sceneName?: string;
   model?: { providerId: string; modelId: string };
   history?: string[];
   /** Parallel array to history: shot_assets row IDs for each historical version */
@@ -84,6 +85,7 @@ function assetToRefImage(a: ShotAsset, allAssets: ShotAsset[] = []): RefImage {
     imagePath: a.fileUrl ?? undefined,
     status: a.status === "completed" && a.fileUrl ? "generated" : "pending",
     characters: a.characters ?? undefined,
+    sceneName: a.meta?.sceneName,
     model: a.modelProvider && a.modelId ? { providerId: a.modelProvider, modelId: a.modelId } : undefined,
     history: historyUrls,
     historyIds,
@@ -1009,8 +1011,8 @@ export function ShotCard({
           {generationMode === "reference" ? (
             <div className="mb-2.5 space-y-2">
               {parsedRefImages.length > 0 ? (
-                <div className="grid grid-cols-2 gap-2">
-                  {parsedRefImages.map((ref) => (
+                <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-2">
+                  {parsedRefImages.map((ref, refIdx) => (
                     <div key={ref.id} className="rounded-lg border border-[--border-subtle] bg-white overflow-hidden">
                       {/* Image or placeholder */}
                       <div className={`relative bg-[--surface] ${ref.imagePath ? "aspect-video" : "h-20"}`}>
@@ -1057,6 +1059,12 @@ export function ShotCard({
                           </div>
                         )}
                       </div>
+                      {/* Scene name badge — always rendered, falls back to "场景 N" */}
+                      <div className="border-t border-[--border-subtle] px-2 py-1 bg-primary/5">
+                        <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                          {ref.sceneName || `${t("shot.scene")} ${refIdx + 1}`}
+                        </span>
+                      </div>
                       {/* Editable prompt with auto-save */}
                       <div className="border-t border-[--border-subtle]">
                         <div className="flex items-center gap-1 px-2 pt-1">
@@ -1077,8 +1085,8 @@ export function ShotCard({
                           onChange={(e) => handleRefPromptChange(ref.id, e.target.value)}
                           onBlur={(e) => handleUpdateRefPrompt(ref.id, e.target.value)}
                           placeholder={t("shot.refImagePrompt")}
-                          rows={8}
-                          className="w-full resize-none border-0 bg-transparent px-2 py-1 text-[11px] leading-snug text-[--text-secondary] placeholder:text-[--text-muted] focus:outline-none"
+                          rows={6}
+                          className="w-full resize-none border-0 bg-transparent px-2 py-1 text-[10px] leading-snug text-[--text-secondary] placeholder:text-[--text-muted] focus:outline-none"
                         />
                       </div>
                       {/* Character tags */}
@@ -1184,7 +1192,6 @@ export function ShotCard({
                 const setEditValue = isStart ? setEditStartFrame : setEditEndFrame;
                 const dbField = isStart ? "startFrameDesc" : "endFrameDesc";
                 const label = isStart ? t("shot.startFrame") : t("shot.endFrame");
-                const colorClass = isStart ? "border-blue-200 bg-blue-50/30" : "border-amber-200 bg-amber-50/30";
 
                 const frameItem = isStart ? firstFrameItem : lastFrameItem;
                 const frameHistoryIds = frameItem?.historyIds || [];
@@ -1194,7 +1201,7 @@ export function ShotCard({
                   <div key={i} className="rounded-lg border border-[--border-subtle] bg-white overflow-hidden">
                     {/* Image */}
                     <div
-                      className={`relative bg-[--surface] ${asset.src ? "aspect-video" : "h-20"} ${asset.src && !isUploading ? "cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
+                      className={`relative bg-[--surface] ${asset.src ? "aspect-video" : "h-16"} ${asset.src && !isUploading ? "cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
                       onClick={() => asset.src && !isUploading && setPreviewSrc(uploadUrl(asset.src))}
                     >
                       {isUploading ? (
@@ -1233,10 +1240,12 @@ export function ShotCard({
                         </>
                       )}
                     </div>
-                    {/* Prompt */}
-                    <div className="border-t border-[--border-subtle]">
-                      <div className="flex items-center gap-1 px-2 pt-1">
-                        <p className={`text-[9px] font-semibold uppercase tracking-[0.1em] ${isStart ? "text-blue-500" : "text-amber-500"}`}>{label}</p>
+                    {/* Frame label badge (matches scene-name badge aesthetic) */}
+                    <div className="border-t border-[--border-subtle] px-2 py-1 bg-primary/5 flex items-center gap-1">
+                      <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                        {label}
+                      </span>
+                      <div className="ml-auto">
                         <AiOptimizeButton
                           value={editValue}
                           onOptimized={(v) => { setEditValue(v); saveKeyframePrompt(isStart ? "first_frame" : "last_frame", v); }}
@@ -1245,6 +1254,9 @@ export function ShotCard({
                           images={asset.src ? [asset.src] : undefined}
                         />
                       </div>
+                    </div>
+                    {/* Prompt textarea */}
+                    <div className="border-t border-[--border-subtle]">
                       <textarea
                         value={editValue}
                         onChange={(e) => {
@@ -1254,8 +1266,8 @@ export function ShotCard({
                         }}
                         onBlur={() => saveKeyframePrompt(isStart ? "first_frame" : "last_frame", editValue)}
                         placeholder={label}
-                        rows={8}
-                        className={`w-full resize-none border-0 bg-transparent px-2 py-1 text-[11px] leading-snug text-[--text-secondary] placeholder:text-[--text-muted] focus:outline-none`}
+                        rows={6}
+                        className="w-full resize-none border-0 bg-transparent px-2 py-1 text-[10px] leading-snug text-[--text-secondary] placeholder:text-[--text-muted] focus:outline-none"
                       />
                     </div>
                     {/* Character tags — read from first_frame/last_frame item */}

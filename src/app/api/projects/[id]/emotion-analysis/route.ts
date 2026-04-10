@@ -3,6 +3,7 @@ import { shots } from "@/lib/db/schema";
 import { eq, asc } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { resolveAIProvider } from "@/lib/ai/provider-factory";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 const EMOTION_PROMPT = `Analyze these shot descriptions from a screenplay and rate each for tension and emotional intensity on a 0-100 scale.
 
@@ -21,6 +22,9 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (!(await assertProjectOwnership(req, id))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const body = await req.json();
 
   const allShots = await db

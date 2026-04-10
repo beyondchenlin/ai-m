@@ -27,9 +27,10 @@
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { shotAssets } from "@/lib/db/schema";
+import { shotAssets, shots } from "@/lib/db/schema";
 import { and, eq, inArray } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 type ShotAssetType =
   | "first_frame"
@@ -52,7 +53,17 @@ export async function PUT(
   request: Request,
   { params }: { params: Promise<{ id: string; shotId: string }> }
 ) {
-  const { shotId } = await params;
+  const { id: projectId, shotId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  const [shotRow] = await db
+    .select({ id: shots.id })
+    .from(shots)
+    .where(and(eq(shots.id, shotId), eq(shots.projectId, projectId)));
+  if (!shotRow) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const body = (await request.json()) as { items: AssetPatchItem[] };
   if (!Array.isArray(body.items)) {
     return NextResponse.json({ error: "items must be an array" }, { status: 400 });

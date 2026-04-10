@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { shots } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import fs from "node:fs";
 import path from "node:path";
 import { id as genId } from "@/lib/id";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 const uploadDir = process.env.UPLOAD_DIR || "./uploads";
 
@@ -15,7 +16,17 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string; shotId: string }> }
 ) {
-  const { shotId } = await params;
+  const { id: projectId, shotId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  const [shotRow] = await db
+    .select({ id: shots.id })
+    .from(shots)
+    .where(and(eq(shots.id, shotId), eq(shots.projectId, projectId)));
+  if (!shotRow) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const formData = await request.formData();
   const file = formData.get("file") as File | null;
   const field = formData.get("field") as string | null;

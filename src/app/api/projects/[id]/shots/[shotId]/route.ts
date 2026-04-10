@@ -1,22 +1,34 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { shots } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
+
+async function assertShotInProject(shotId: string, projectId: string) {
+  const [row] = await db
+    .select({ id: shots.id })
+    .from(shots)
+    .where(and(eq(shots.id, shotId), eq(shots.projectId, projectId)));
+  return !!row;
+}
 
 /**
  * PATCH /api/projects/[id]/shots/[shotId]
  * Updates only metadata fields on the shots table. Image/video assets live
  * in the shot_assets table and must be patched via /shots/[shotId]/assets.
- *
- * Legacy fields (startFrameDesc/firstFrame/lastFrame/sceneRefFrame/videoUrl/
- * referenceImages/etc.) are silently ignored — they no longer exist on the
- * shots table.
  */
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string; shotId: string }> }
 ) {
-  const { shotId } = await params;
+  const { id: projectId, shotId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  if (!(await assertShotInProject(shotId, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
   const body = (await request.json()) as Partial<{
     prompt: string;
     duration: number;
@@ -35,7 +47,6 @@ export async function PATCH(
     costumeOverrides: string;
   }>;
 
-  // Whitelist: only allow fields that still exist on the shots table.
   const allowed: Record<string, unknown> = {};
   const ALLOWED_KEYS = [
     "prompt",
@@ -59,7 +70,6 @@ export async function PATCH(
   }
 
   if (Object.keys(allowed).length === 0) {
-    // Nothing to update — return current row
     const [row] = await db.select().from(shots).where(eq(shots.id, shotId));
     return NextResponse.json(row);
   }
@@ -74,10 +84,16 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string; shotId: string }> }
 ) {
-  const { shotId } = await params;
+  const { id: projectId, shotId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  if (!(await assertShotInProject(shotId, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   await db.delete(shots).where(eq(shots.id, shotId));
   return new NextResponse(null, { status: 204 });
 }

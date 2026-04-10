@@ -1,13 +1,27 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { characters } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+import { assertProjectOwnership } from "@/lib/assert-project-ownership";
 
 export async function PATCH(
   request: Request,
   { params }: { params: Promise<{ id: string; characterId: string }> }
 ) {
-  const { characterId } = await params;
+  const { id: projectId, characterId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  // Ensure character belongs to this project
+  const [existing] = await db
+    .select()
+    .from(characters)
+    .where(and(eq(characters.id, characterId), eq(characters.projectId, projectId)));
+  if (!existing) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
   const body = (await request.json()) as Partial<{
     name: string;
     description: string;
@@ -43,10 +57,15 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string; characterId: string }> }
 ) {
-  const { characterId } = await params;
-  await db.delete(characters).where(eq(characters.id, characterId));
+  const { id: projectId, characterId } = await params;
+  if (!(await assertProjectOwnership(request, projectId))) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+  await db
+    .delete(characters)
+    .where(and(eq(characters.id, characterId), eq(characters.projectId, projectId)));
   return new NextResponse(null, { status: 204 });
 }

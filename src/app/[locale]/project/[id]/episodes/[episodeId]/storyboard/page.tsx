@@ -661,11 +661,25 @@ export default function EpisodeStoryboardPage() {
         </div>
         <div className="flex items-center gap-2">
           <PromptEditButton
-            promptKeys={
-              generationMode === "reference"
-                ? ["shot_split", "ref_image_prompts", "scene_frame_generate"]
-                : "shot_split"
-            }
+            // Full set of storyboard-related prompts — matches the
+            // settings/prompts page "分镜" tab exactly (9 prompts across
+            // shot / frame / video categories). Both keyframe and
+            // reference modes share the same list so the quick-access
+            // drawer and the backend menu are 1:1 consistent.
+            promptKeys={[
+              // shot
+              "shot_split",
+              "shot_split_keyframe_assets",
+              // frame
+              "frame_generate_first",
+              "frame_generate_last",
+              "scene_frame_generate",
+              "ref_image_prompts",
+              // video
+              "video_generate",
+              "ref_video_generate",
+              "ref_video_prompt",
+            ]}
             projectId={project.id}
           />
           {totalShots > 0 && (
@@ -827,7 +841,7 @@ export default function EpisodeStoryboardPage() {
             <Button
               onClick={handleGenerateShots}
               disabled={anyGenerating}
-              variant={totalShots > 0 ? "outline" : "default"}
+              variant="default"
               size="sm"
             >
               {generating ? (
@@ -855,7 +869,7 @@ export default function EpisodeStoryboardPage() {
                 </Button>
                 <Button
                   size="sm"
-                  variant={shotsWithAllRefImages === totalShots && totalShots > 0 ? "outline" : "default"}
+                  variant="default"
                   onClick={() => handleBatchGenerateSceneFrames(false)}
                   disabled={anyGenerating || totalShots === 0 || !hasReferenceImages || shotsWithRefPrompts === 0}
                 >
@@ -889,7 +903,7 @@ export default function EpisodeStoryboardPage() {
                 <Button
                   onClick={() => handleBatchGenerateFrames(false)}
                   disabled={anyGenerating || totalShots === 0 || shotsWithKeyframePrompts === 0}
-                  variant={shotsWithFrames === totalShots && totalShots > 0 ? "outline" : "default"}
+                  variant="default"
                   size="sm"
                 >
                   {generatingFrames && !generatingFramesOverwrite ? (
@@ -925,7 +939,7 @@ export default function EpisodeStoryboardPage() {
             <Button
               onClick={handleBatchGenerateVideoPrompts}
               disabled={anyGenerating || shotsWithFrameAny === 0}
-              variant={shotsWithVideoPrompts === totalShots && totalShots > 0 ? "outline" : "default"}
+              variant="default"
               size="sm"
             >
               {generatingVideoPrompts ? (
@@ -956,7 +970,7 @@ export default function EpisodeStoryboardPage() {
     ? !hasReferenceImages || !allRefImagesGenerated || shotsWithRefPrompts !== totalShots
     : shotsWithFrames !== totalShots)
 }
-              variant={shotsWithVideo === totalShots && totalShots > 0 ? "outline" : "default"}
+              variant="default"
               size="sm"
             >
               {generatingVideos && !generatingVideosOverwrite ? (
@@ -1004,7 +1018,7 @@ export default function EpisodeStoryboardPage() {
                 <Button
                   onClick={handleAutoRun}
                   disabled={anyGenerating}
-                  variant="outline"
+                  variant="default"
                   size="sm"
                   className="gap-1.5"
                 >

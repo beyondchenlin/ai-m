@@ -1,21 +1,25 @@
 import { db } from "@/lib/db";
 import { projects, shots, characters } from "@/lib/db/schema";
-import { eq, asc } from "drizzle-orm";
+import { and, eq, asc } from "drizzle-orm";
 import archiver from "archiver";
 import path from "node:path";
 import fs from "node:fs";
 import { loadShotLegacyViewsBatch } from "@/lib/shot-asset-utils";
+import { getUserIdFromRequest } from "@/lib/get-user-id";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: projectId } = await params;
+  const userId = getUserIdFromRequest(request);
 
-  const [project] = await db
-    .select()
-    .from(projects)
-    .where(eq(projects.id, projectId));
+  const [project] = userId
+    ? await db
+        .select()
+        .from(projects)
+        .where(and(eq(projects.id, projectId), eq(projects.userId, userId)))
+    : [];
 
   if (!project) {
     return new Response("Project not found", { status: 404 });

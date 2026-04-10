@@ -48,6 +48,7 @@ export interface ShotAsset {
   characters: string[] | null;
   modelProvider?: string | null;
   modelId?: string | null;
+  meta?: { sceneName?: string } | null;
 }
 
 export interface Shot {

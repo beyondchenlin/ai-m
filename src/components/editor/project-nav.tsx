@@ -30,8 +30,9 @@ export function ProjectNav({ projectId, episodeId }: ProjectNavProps) {
 
   return (
     <>
-      {/* Desktop sidebar */}
-      <nav className="hidden w-60 flex-shrink-0 border-r border-[--border-subtle] bg-white lg:block">
+      {/* Desktop sidebar — stays fixed relative to the header (h-14),
+          doesn't scroll with the main content on the right. */}
+      <nav className="hidden w-60 flex-shrink-0 border-r border-[--border-subtle] bg-white lg:block self-start sticky top-14 h-[calc(100vh-3.5rem)] overflow-y-auto">
         <div className="flex flex-col gap-1 p-3 pt-4">
           <Link
             href={`/${locale}/project/${projectId}/episodes`}

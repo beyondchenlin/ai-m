@@ -97,6 +97,7 @@ export async function GET(
         characters: a.characters ? JSON.parse(a.characters) : null,
         modelProvider: a.modelProvider,
         modelId: a.modelId,
+        meta: a.meta ? JSON.parse(a.meta) : null,
       }));
       return { ...shot, dialogues: shotDialogues, assets };
     })

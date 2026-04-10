@@ -855,6 +855,34 @@ async function handleShotSplitStream(
     .filter((c) => c.performanceStyle)
     .map((c) => ({ name: c.name, performanceStyle: c.performanceStyle! }));
 
+  // Load character relationships — CRITICAL for shot planning. Without
+  // this block the LLM treats enemies as bystanders (e.g. "如来佛祖" gets
+  // rendered as a Buddha statue in the background instead of an active
+  // combatant against 孙悟空).
+  const shotRelations = await db
+    .select()
+    .from(characterRelations)
+    .where(eq(characterRelations.projectId, projectId));
+  let relationsText = "";
+  if (shotRelations.length > 0) {
+    relationsText = "\n\n## 角色关系（必须用于决定站位、眼神、肢体对抗、画面张力）\n";
+    for (const rel of shotRelations) {
+      const charA = shotCharacters.find((c) => c.id === rel.characterAId);
+      const charB = shotCharacters.find((c) => c.id === rel.characterBId);
+      if (charA && charB) {
+        relationsText += `- ${charA.name} ↔ ${charB.name}：${rel.relationType}${rel.description ? `（${rel.description}）` : ""}\n`;
+      }
+    }
+    relationsText += `
+**关系驱动构图规则（最高优先级）**：
+- **敌对 / 对立 / 仇人**：两人必须都是**活人角色同屏对峙**——直接对视、肢体对抗、武器对准彼此。禁止把任一方画成背景的雕像/神像/虚影/浮雕。
+- **友好 / 盟友**：并肩、相互掩护、眼神交流。
+- **爱慕 / 亲密**：靠近、牵手、拥抱、温柔对视。
+- **父女 / 师徒**：长辈在前/侧，晚辈在后/侧随从。
+- 任何被标记为角色关系的双方，在包含他们的镜头中都必须作为**真实的活人**出现，而不是背景装饰。
+`;
+  }
+
   // Fetch world setting and target duration from project
   const [projData] = await db.select({ worldSetting: projects.worldSetting, targetDuration: projects.targetDuration }).from(projects).where(eq(projects.id, projectId));
   let targetDuration = projData?.targetDuration || 0;
@@ -907,6 +935,9 @@ async function handleShotSplitStream(
   const chunkResults = await Promise.all(
     sceneChunks.map(async (chunk, idx) => {
       let prompt = buildShotSplitPrompt(chunk, characterDescriptions, characterVisualHints, undefined, characterPerformanceStyles.length > 0 ? characterPerformanceStyles : undefined);
+
+      // Inject character relations (drives on-screen interaction framing)
+      if (relationsText) prompt += relationsText;
 
       // Inject world setting
       if (projData?.worldSetting) {
@@ -1239,8 +1270,6 @@ async function handleBatchFrameGenerate(
     .join("\n");
 
   const charsWithImages = frameCharacters.filter((c) => c.referenceImage);
-  const charRefImages = charsWithImages.map((c) => c.referenceImage!) ;
-  const charRefLabels = charsWithImages.map((c) => c.name);
 
   const ai = resolveImageProvider(modelConfig, versionedUploadDir);
   const results: Array<{ shotId: string; sequence: number; status: string; firstFrame?: string; lastFrame?: string; error?: string }> = [];
@@ -1283,6 +1312,23 @@ async function handleBatchFrameGenerate(
       try {
         await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shot.id));
 
+        // Per-shot character filter: read the first_frame / last_frame asset
+        // characters metadata (set by handleGenerateKeyframePrompts). Only
+        // inject those characters' ref images into the image model, so shots
+        // only see their relevant characters.
+        const ffAssetExisting = await getActiveAsset(shot.id, "first_frame", 0);
+        const lfAssetExisting = await getActiveAsset(shot.id, "last_frame", 0);
+        const shotCharNameSet = new Set<string>([
+          ...(ffAssetExisting?.characters ?? []),
+          ...(lfAssetExisting?.characters ?? []),
+        ]);
+        const filteredChars = shotCharNameSet.size > 0
+          ? charsWithImages.filter((c) => shotCharNameSet.has(c.name))
+          : charsWithImages;
+        const shotCharRefImages = filteredChars.map((c) => c.referenceImage!);
+        const shotCharRefLabels = filteredChars.map((c) => c.name);
+        const shotCharsForPersist = filteredChars.length > 0 ? filteredChars.map((c) => c.name) : undefined;
+
         // Each shot is independent — generate its own first frame from prompt.
         const firstPrompt = buildFirstFramePrompt({
           sceneDescription: shot.prompt || "",
@@ -1293,8 +1339,8 @@ async function handleBatchFrameGenerate(
         const firstFramePath = await ai.generateImage(firstPrompt, {
           ...imageOpts,
           quality: "hd",
-          referenceImages: charRefImages,
-          referenceLabels: charRefLabels,
+          referenceImages: shotCharRefImages,
+          referenceLabels: shotCharRefLabels,
         });
 
         const lastPrompt = buildLastFramePrompt({
@@ -1307,14 +1353,13 @@ async function handleBatchFrameGenerate(
         const lastFramePath = await ai.generateImage(lastPrompt, {
           ...imageOpts,
           quality: "hd",
-          referenceImages: [firstFramePath, ...charRefImages],
-          referenceLabels: ["首帧/First Frame", ...charRefLabels],
+          referenceImages: [firstFramePath, ...shotCharRefImages],
+          referenceLabels: ["首帧/First Frame", ...shotCharRefLabels],
         });
 
         await db.update(shots).set({ status: "completed" }).where(eq(shots.id, shot.id));
 
-        const ffEx = await getActiveAsset(shot.id, "first_frame", 0);
-        if (ffEx) await patchAsset(ffEx.id, { fileUrl: firstFramePath, status: "completed" });
+        if (ffAssetExisting) await patchAsset(ffAssetExisting.id, { fileUrl: firstFramePath, status: "completed" });
         else
           await insertAssetVersion({
             shotId: shot.id,
@@ -1323,9 +1368,9 @@ async function handleBatchFrameGenerate(
             prompt: shotLegacy?.startFrameDesc ?? "",
             fileUrl: firstFramePath,
             status: "completed",
+            characters: shotCharsForPersist,
           });
-        const lfEx = await getActiveAsset(shot.id, "last_frame", 0);
-        if (lfEx) await patchAsset(lfEx.id, { fileUrl: lastFramePath, status: "completed" });
+        if (lfAssetExisting) await patchAsset(lfAssetExisting.id, { fileUrl: lastFramePath, status: "completed" });
         else
           await insertAssetVersion({
             shotId: shot.id,
@@ -1334,6 +1379,7 @@ async function handleBatchFrameGenerate(
             prompt: shotLegacy?.endFrameDesc ?? "",
             fileUrl: lastFramePath,
             status: "completed",
+            characters: shotCharsForPersist,
           });
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -1417,9 +1463,16 @@ async function handleSingleFrameGenerate(
     .map((c) => `${c.name}: ${c.description}`)
     .join("\n");
 
-  const charRefImages = projectCharacters
-    .map((c) => c.referenceImage)
-    .filter(Boolean) as string[];
+  // Per-shot character filter: only inject refs for characters declared
+  // on the first_frame / last_frame asset metadata for this shot.
+  const shotCharNameSet = new Set<string>([
+    ...(ffAsset?.characters ?? []),
+    ...(lfAsset?.characters ?? []),
+  ]);
+  const filteredChars = shotCharNameSet.size > 0
+    ? projectCharacters.filter((c) => c.referenceImage && shotCharNameSet.has(c.name))
+    : projectCharacters.filter((c) => c.referenceImage);
+  const shotCharRefImages = filteredChars.map((c) => c.referenceImage as string);
 
   const ai = resolveImageProvider(modelConfig, versionedUploadDir);
   const imageOpts = ratioToImageOpts(payload?.ratio as string | undefined);
@@ -1439,7 +1492,7 @@ async function handleSingleFrameGenerate(
     const firstFramePath = await ai.generateImage(firstPrompt, {
       ...imageOpts,
       quality: "hd",
-      referenceImages: charRefImages,
+      referenceImages: shotCharRefImages,
     });
 
     const lastPrompt = buildLastFramePrompt({
@@ -1452,7 +1505,7 @@ async function handleSingleFrameGenerate(
     const lastFramePath = await ai.generateImage(lastPrompt, {
       ...imageOpts,
       quality: "hd",
-      referenceImages: [firstFramePath, ...charRefImages],
+      referenceImages: [firstFramePath, ...shotCharRefImages],
     });
 
     await db.update(shots).set({ status: "completed" }).where(eq(shots.id, shotId));
@@ -1743,27 +1796,6 @@ async function handleSingleSceneFrame(
 
   const versionedUploadDir = await getVersionedUploadDir(shot.versionId);
 
-  const projectCharacters = await db
-    .select()
-    .from(characters)
-    .where(eq(characters.projectId, shot.projectId));
-
-  const charRefs = projectCharacters
-    .filter((c) => !!c.referenceImage)
-    .map((c) => ({ name: c.name, imagePath: c.referenceImage as string }));
-
-  if (charRefs.length === 0) {
-    return NextResponse.json(
-      { error: "No character reference images available. Please generate character reference images first." },
-      { status: 400 }
-    );
-  }
-
-  const charRefMapping = charRefs.map((c, i) => `${c.name}=图片${i + 1}`).join("，");
-  const characterDescriptions = projectCharacters
-    .map((c) => `${c.name}: ${c.description}`)
-    .join("\n");
-
   try {
     await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shotId));
 
@@ -1772,25 +1804,39 @@ async function handleSingleSceneFrame(
     const sceneFrameView = await loadShotLegacyView(shot.id);
     const sceneFramePrompt = buildSceneFramePrompt({
       sceneDescription: shot.prompt || "",
-      charRefMapping,
-      characterDescriptions,
+      charRefMapping: "",
+      characterDescriptions: "",
       cameraDirection: shot.cameraDirection,
       startFrameDesc: sceneFrameView.startFrameDesc,
       motionScript: shot.motionScript,
       slotContents,
     });
 
-    console.log(`[SingleSceneFrame] Shot ${shot.sequence}: generating scene frame, mapping="${charRefMapping}"`);
+    console.log(`[SingleSceneFrame] Shot ${shot.sequence}: generating scene-only frame (no character refs)`);
 
+    // Scene-only: no character reference images injected.
     const sceneFramePath = await imageProvider.generateImage(sceneFramePrompt, {
       quality: "hd",
-      referenceImages: charRefs.map((c) => c.imagePath),
     });
 
     {
       const refEx = await getActiveAsset(shotId, "reference", 0);
-      if (refEx) await patchAsset(refEx.id, { fileUrl: sceneFramePath, status: "completed" });
-      else await insertAssetVersion({ shotId, type: "reference", sequenceInType: 0, prompt: "", fileUrl: sceneFramePath, status: "completed" });
+      if (refEx) {
+        // Preserve pre-existing characters metadata on regeneration.
+        await patchAsset(refEx.id, { fileUrl: sceneFramePath, status: "completed" });
+      } else {
+        // Fresh creation: copy characters from sibling ref assets if any.
+        const siblingChars = sceneFrameView.referenceImages[0]?.characters ?? undefined;
+        await insertAssetVersion({
+          shotId,
+          type: "reference",
+          sequenceInType: 0,
+          prompt: "",
+          fileUrl: sceneFramePath,
+          status: "completed",
+          characters: siblingChars,
+        });
+      }
     }
     await db
       .update(shots)
@@ -1835,13 +1881,6 @@ async function handleBatchSceneFrame(
     ? await getVersionedUploadDir(batchVersionId)
     : process.env.UPLOAD_DIR || "./uploads";
 
-  const projectCharacters = await getEpisodeCharacters(projectId, episodeId);
-  const charsWithRefs = projectCharacters.filter((c) => !!c.referenceImage);
-
-  if (charsWithRefs.length === 0) {
-    return NextResponse.json({ error: "No character reference images available." }, { status: 400 });
-  }
-
   const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
   const allShotsLegacy = await loadShotLegacyViewsBatch(allShots.map((s) => s.id));
 
@@ -1870,27 +1909,18 @@ async function handleBatchSceneFrame(
         return { shotId: shot.id, sequence: shot.sequence, status: "ok" as const, generated: 0 };
       }
 
-      // Use pre-stored character names
-      const storedCharNames = targets[0]?.characters || [];
-      const relevantChars = storedCharNames.length > 0
-        ? charsWithRefs.filter((c) => storedCharNames.includes(c.name))
-        : charsWithRefs.slice(0, 3);
-      const shotCharRefs = relevantChars.map((c) => c.referenceImage as string);
+      console.log(`[BatchSceneFrame] Shot ${shot.sequence}: ${targets.length} scene-only refs (no character injection)`);
 
-      // Build character mapping prompt prefix
-      const promptPrefix = buildCharMappingPrefix(relevantChars);
-
-      console.log(`[BatchSceneFrame] Shot ${shot.sequence}: ${targets.length} refs, ${relevantChars.length} chars: ${relevantChars.map(c => c.name).join(", ")}`);
-
-      // Generate all ref images for this shot concurrently
+      // Generate all ref images for this shot concurrently.
+      // Scene-only: NO character reference images passed to the image model.
+      // But the per-shot `characters` metadata is preserved so downstream
+      // video generation knows which characters belong to this shot.
       const genResults = await Promise.all(
         targets.map(async (entry) => {
           try {
-            const fullPrompt = promptPrefix + entry.prompt;
-            const imagePath = await imageProvider.generateImage(fullPrompt, {
+            const imagePath = await imageProvider.generateImage(entry.prompt, {
               quality: "hd",
               ...imageOpts,
-              referenceImages: shotCharRefs,
             });
             // Persist as a new version of this reference slot
             await insertAssetVersion({
@@ -1953,20 +1983,24 @@ async function handleSingleReferenceVideo(
     .from(characters)
     .where(eq(characters.projectId, shot.projectId));
 
-  // Toonflow pattern: collect all character reference images
-  const charRefs = projectCharacters
-    .filter((c) => !!c.referenceImage)
-    .map((c) => ({ name: c.name, imagePath: c.referenceImage as string }));
-
-  if (charRefs.length === 0) {
-    return NextResponse.json(
-      { error: "No character reference images available. Please generate character reference images first." },
-      { status: 400 }
-    );
+  // Collect the union of character names declared on this shot's
+  // reference assets — this is the precise set of characters the AI said
+  // will act in this shot. Only these get passed to the video model.
+  const shotCharNameSet = new Set<string>();
+  for (const r of shotView.referenceImages) {
+    for (const n of r.characters ?? []) shotCharNameSet.add(n);
   }
 
-  // Build Toonflow name→image mapping: "角色A=图片1，角色B=图片2"
-  const charRefMapping = charRefs.map((c, i) => `${c.name}=图片${i + 1}`).join("，");
+  const charRefs = projectCharacters
+    .filter((c) => !!c.referenceImage && shotCharNameSet.has(c.name))
+    .map((c) => ({ name: c.name, imagePath: c.referenceImage as string }));
+
+  // charRefs may be empty — that's legal for shots with no characters
+  // (pure environment / transition shots). Scene-only videos will be
+  // generated from scene frames alone.
+
+  // Seedance @ syntax mapping: "@图1是角色A，@图2是角色B"
+  const charRefMapping = charRefs.map((c, i) => `@图片${i + 1}是${c.name}`).join("，");
 
   const characterDescriptions = projectCharacters
     .map((c) => `${c.name}: ${c.description}`)
@@ -2001,46 +2035,61 @@ async function handleSingleReferenceVideo(
   try {
     await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shotId));
 
-    // Step 1: Prefer the first user-selected reference image, fall back to sceneRefFrame
-    const refItemsForVideo = shotView.referenceImages.filter((r) => r.fileUrl);
-    let sceneFramePath: string | null = refItemsForVideo[0]?.fileUrl || shotView.sceneRefFrame || null;
-    if (!sceneFramePath) {
-      const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
-      const refSlotContents = await resolveSlotContents("scene_frame_generate", { userId, projectId });
-      const sceneFramePrompt = buildSceneFramePrompt({
-        sceneDescription: shot.prompt || "",
-        charRefMapping,
-        characterDescriptions,
-        cameraDirection: shot.cameraDirection,
-        startFrameDesc: shotView.startFrameDesc,
-        motionScript: shot.motionScript,
-        slotContents: refSlotContents,
-      });
-      console.log(`[SingleReferenceVideo] Shot ${shot.sequence}: generating scene frame, mapping="${charRefMapping}"`);
-      sceneFramePath = await imageProvider.generateImage(sceneFramePrompt, {
-        quality: "hd",
-        referenceImages: charRefs.map((c) => c.imagePath),
-      });
-      {
-        const refEx = await getActiveAsset(shotId, "reference", 0);
-        if (refEx) await patchAsset(refEx.id, { fileUrl: sceneFramePath, status: "completed" });
-        else await insertAssetVersion({ shotId, type: "reference", sequenceInType: 0, prompt: "", fileUrl: sceneFramePath, status: "completed" });
-      }
-    } else {
-      console.log(`[SingleReferenceVideo] Shot ${shot.sequence}: reusing existing scene frame`);
+    // Step 1: Collect scene frames (pure environment) — may be multiple per shot
+    //         (e.g. ground → sky transitions in an action beat).
+    const sceneFramePaths: string[] = shotView.referenceImages
+      .filter((r) => r.fileUrl)
+      .sort((a, b) => a.sequenceInType - b.sequenceInType)
+      .map((r) => r.fileUrl as string);
+
+    if (sceneFramePaths.length === 0) {
+      return NextResponse.json(
+        { error: "No scene reference images. Please generate scene reference images first." },
+        { status: 400 }
+      );
     }
 
-    // Step 2: Generate video using scene frame as initial image
+    console.log(`[SingleReferenceVideo] Shot ${shot.sequence}: ${sceneFramePaths.length} scene frame(s), ${charRefs.length} character ref(s)`);
+
+    // Step 2: Build Seedance 2 multi-reference image list.
+    //         Order matters — it becomes 图1, 图2, … in the mapping.
+    const orderedRefImages: string[] = [
+      ...charRefs.map((c) => c.imagePath),
+      ...sceneFramePaths,
+    ];
+
+    // Build explicit index mapping for the prompt builder
+    const characterRefInfos = charRefs.map((c, i) => ({
+      name: c.name,
+      index: i + 1,
+      visualHint: projectCharacters.find((pc) => pc.name === c.name)?.visualHint,
+    }));
+    const sceneAssetList = shotView.referenceImages
+      .filter((r) => r.fileUrl)
+      .sort((a, b) => a.sequenceInType - b.sequenceInType);
+    const sceneFrameInfos = sceneFramePaths.map((_, i) => {
+      const metaObj = sceneAssetList[i]?.meta as { sceneName?: string } | null;
+      const name = metaObj?.sceneName || (sceneFramePaths.length > 1 ? `场景-${i + 1}` : `场景`);
+      return { label: name, index: charRefs.length + i + 1 };
+    });
+    const fullMapping = [
+      ...characterRefInfos.map((c) => `@图片${c.index}是${c.name}`),
+      ...sceneFrameInfos.map((s) => `@图片${s.index}是${s.label}`),
+    ].join("，") + "。";
+
     const videoProvider = resolveVideoProvider(modelConfig, versionedUploadDir);
 
     const videoModelId = modelConfig?.video?.modelId;
     const videoMaxDuration = getModelMaxDuration(videoModelId);
     const effectiveDuration = Math.min(shot.duration ?? 10, videoMaxDuration);
 
-    // Step 2b: Use stored videoPrompt if available; otherwise generate from scene frame via vision AI
+    // Step 3: Use stored videoPrompt if available; otherwise auto-plan via AI
     let videoPrompt: string;
     if (shot.videoPrompt) {
-      videoPrompt = shot.videoPrompt;
+      // If the stored prompt already has mapping, trust it; otherwise prepend.
+      videoPrompt = shot.videoPrompt.includes("图像映射")
+        ? shot.videoPrompt
+        : `图像映射：${fullMapping}。\n\n${shot.videoPrompt}`;
     } else {
       const textProvider = resolveAIProvider(modelConfig);
       const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
@@ -2050,19 +2099,20 @@ async function handleSingleReferenceVideo(
           motionScript: motionContext,
           cameraDirection: shot.cameraDirection || "static",
           duration: effectiveDuration,
-          characters: projectCharacters,
+          characters: characterRefInfos,
+          sceneFrames: sceneFrameInfos,
           dialogues: dialogueList.length > 0 ? dialogueList : undefined,
         });
         console.log(`[SingleReferenceVideo] Shot ${shot.sequence} promptRequest:\n${promptRequest}`);
         const rawPrompt = await textProvider.generateText(promptRequest, {
           systemPrompt: refVideoSystem,
-          images: [sceneFramePath],
+          images: sceneFramePaths,
           temperature: 0.7,
         });
         videoPrompt = `Duration: ${effectiveDuration}s.\n\n${rawPrompt.trim()}`;
       } catch (err) {
         console.warn("[SingleReferenceVideo] Vision prompt generation failed, falling back:", err);
-        videoPrompt = buildReferenceVideoPrompt({
+        const fallback = buildReferenceVideoPrompt({
           videoScript: shot.videoScript || shot.motionScript || shot.prompt || "",
           cameraDirection: shot.cameraDirection || "static",
           duration: effectiveDuration,
@@ -2070,25 +2120,18 @@ async function handleSingleReferenceVideo(
           dialogues: dialogueList.length > 0 ? dialogueList : undefined,
           slotContents: refVideoSlots,
         });
+        videoPrompt = `图像映射：${fullMapping}。\n\n${fallback}`;
       }
     }
 
-    console.log(`[SingleReferenceVideo] Shot ${shot.sequence}: generating video from scene frame`);
-
-    // Use generated reference images (active reference assets), fall back to character refs
-    const shotRefItems = shotView.referenceImages
-      .filter((r) => r.fileUrl)
-      .map((r) => r.fileUrl as string);
-    const allRefImages = shotRefItems.length > 0
-      ? shotRefItems
-      : charRefs.map((c) => c.imagePath);
+    console.log(`[SingleReferenceVideo] Shot ${shot.sequence}: generating video with ${orderedRefImages.length} reference images`);
 
     const result = await videoProvider.generateVideo({
-      initialImage: sceneFramePath,
+      initialImage: sceneFramePaths[0],
       prompt: videoPrompt,
       duration: effectiveDuration,
       ratio,
-      referenceImages: allRefImages,
+      referenceImages: orderedRefImages,
     });
 
     await insertAssetVersion({
@@ -2154,20 +2197,16 @@ async function handleBatchReferenceVideo(
 
   const projectCharacters = await getEpisodeCharacters(projectId, episodeId);
 
-  // Toonflow pattern: collect all character reference images
-  const charRefs = projectCharacters
-    .filter((c) => !!c.referenceImage)
-    .map((c) => ({ name: c.name, imagePath: c.referenceImage as string }));
-
-  if (charRefs.length === 0) {
+  // Character list is now per-shot (derived from that shot's reference
+  // assets' `characters` metadata). Project-wide charRefs is not used in
+  // the batch pipeline anymore; it's computed fresh inside the shot loop.
+  const charsWithRefsAll = projectCharacters.filter((c) => !!c.referenceImage);
+  if (charsWithRefsAll.length === 0) {
     return NextResponse.json(
       { error: "No character reference images available." },
       { status: 400 }
     );
   }
-
-  // Build Toonflow name→image mapping (same for all shots — characters are consistent)
-  const charRefMapping = charRefs.map((c, i) => `${c.name}=图片${i + 1}`).join("，");
 
   const characterDescriptions = projectCharacters
     .map((c) => `${c.name}: ${c.description}`)
@@ -2215,42 +2254,55 @@ async function handleBatchReferenceVideo(
           };
         });
 
-        // Step 1: Prefer user-selected first reference image; only regenerate scene frame if absent
-        const refItemsForBatchVideo = shotLegacy.referenceImages.filter((r) => r.fileUrl);
-        let sceneFramePath: string = refItemsForBatchVideo[0]?.fileUrl || shotLegacy.sceneRefFrame || "";
+        // Step 1: Collect all scene frames (pure environments, ordered by sequenceInType)
+        const sceneFramePaths: string[] = shotLegacy.referenceImages
+          .filter((r) => r.fileUrl)
+          .sort((a, b) => a.sequenceInType - b.sequenceInType)
+          .map((r) => r.fileUrl as string);
 
-        if (!sceneFramePath) {
-          const batchRefSlots = await resolveSlotContents("scene_frame_generate", { userId, projectId });
-          const sceneFramePrompt = buildSceneFramePrompt({
-            sceneDescription: shot.prompt || "",
-            charRefMapping,
-            characterDescriptions,
-            cameraDirection: shot.cameraDirection,
-            startFrameDesc: shotLegacy.startFrameDesc,
-            motionScript: shot.motionScript,
-            slotContents: batchRefSlots,
-          });
-
-          console.log(`[BatchReferenceVideo] Shot ${shot.sequence}: generating scene frame, mapping="${charRefMapping}"`);
-
-          sceneFramePath = await imageProvider.generateImage(sceneFramePrompt, {
-            quality: "hd",
-            referenceImages: charRefs.map((c) => c.imagePath),
-          });
-
-          {
-            const refEx = await getActiveAsset(shot.id, "reference", 0);
-            if (refEx) await patchAsset(refEx.id, { fileUrl: sceneFramePath, status: "completed" });
-            else await insertAssetVersion({ shotId: shot.id, type: "reference", sequenceInType: 0, prompt: "", fileUrl: sceneFramePath, status: "completed" });
-          }
-        } else {
-          console.log(`[BatchReferenceVideo] Shot ${shot.sequence}: using selected ref image as scene frame`);
+        if (sceneFramePaths.length === 0) {
+          throw new Error("No scene reference images. Generate scene reference images first.");
         }
 
-        // Step 2: Use stored videoPrompt if available; otherwise generate from scene frame via vision AI
+        // Per-shot character set from ref assets' metadata
+        const shotCharNameSet = new Set<string>();
+        for (const r of shotLegacy.referenceImages) {
+          for (const n of r.characters ?? []) shotCharNameSet.add(n);
+        }
+        const charRefs = charsWithRefsAll
+          .filter((c) => shotCharNameSet.size === 0 || shotCharNameSet.has(c.name))
+          .map((c) => ({ name: c.name, imagePath: c.referenceImage as string }));
+
+        // Step 2: Build ordered Seedance 2 reference image list (chars first, scenes second)
+        const orderedRefImages: string[] = [
+          ...charRefs.map((c) => c.imagePath),
+          ...sceneFramePaths,
+        ];
+        const characterRefInfos = charRefs.map((c, i) => ({
+          name: c.name,
+          index: i + 1,
+          visualHint: projectCharacters.find((pc) => pc.name === c.name)?.visualHint,
+        }));
+        // Scene labels: prefer AI-generated sceneName from meta, fall back to index
+        const sceneAssetList = shotLegacy.referenceImages
+          .filter((r) => r.fileUrl)
+          .sort((a, b) => a.sequenceInType - b.sequenceInType);
+        const sceneFrameInfos = sceneFramePaths.map((_, i) => {
+          const metaObj = sceneAssetList[i]?.meta as { sceneName?: string } | null;
+          const name = metaObj?.sceneName || (sceneFramePaths.length > 1 ? `场景-${i + 1}` : `场景`);
+          return { label: name, index: charRefs.length + i + 1 };
+        });
+        const fullMapping = [
+          ...characterRefInfos.map((c) => `@图片${c.index}是${c.name}`),
+          ...sceneFrameInfos.map((s) => `@图片${s.index}是${s.label}`),
+        ].join("，") + "。";
+
+        // Step 3: Resolve video prompt
         let videoPrompt: string;
         if (shot.videoPrompt) {
-          videoPrompt = shot.videoPrompt;
+          videoPrompt = shot.videoPrompt.includes("图像映射")
+            ? shot.videoPrompt
+            : `图像映射：${fullMapping}。\n\n${shot.videoPrompt}`;
         } else {
           try {
             const motionContext = shot.motionScript || shot.videoScript || shot.prompt || "";
@@ -2258,18 +2310,19 @@ async function handleBatchReferenceVideo(
               motionScript: motionContext,
               cameraDirection: shot.cameraDirection || "static",
               duration: effectiveDuration,
-              characters: projectCharacters,
+              characters: characterRefInfos,
+              sceneFrames: sceneFrameInfos,
               dialogues: dialogueList.length > 0 ? dialogueList : undefined,
             });
             const rawPrompt = await textProvider.generateText(promptRequest, {
               systemPrompt: refVideoSystem,
-              images: [sceneFramePath],
+              images: sceneFramePaths,
               temperature: 0.7,
             });
             videoPrompt = `Duration: ${effectiveDuration}s.\n\n${rawPrompt.trim()}`;
           } catch (err) {
             console.warn("[BatchReferenceVideo] Vision prompt generation failed, falling back:", err);
-            videoPrompt = buildReferenceVideoPrompt({
+            const fallback = buildReferenceVideoPrompt({
               videoScript: shot.videoScript || shot.motionScript || shot.prompt || "",
               cameraDirection: shot.cameraDirection || "static",
               duration: effectiveDuration,
@@ -2277,25 +2330,18 @@ async function handleBatchReferenceVideo(
               dialogues: dialogueList.length > 0 ? dialogueList : undefined,
               slotContents: refVideoSlots,
             });
+            videoPrompt = `图像映射：${fullMapping}。\n\n${fallback}`;
           }
         }
 
-        console.log(`[BatchReferenceVideo] Shot ${shot.sequence}: generating video from scene frame`);
-
-        // Use generated reference images (active reference assets), fall back to character refs
-        const shotRefItems = shotLegacy.referenceImages
-          .filter((r) => r.fileUrl)
-          .map((r) => r.fileUrl as string);
-        const allRefImages = shotRefItems.length > 0
-          ? shotRefItems
-          : charRefs.map((c) => c.imagePath);
+        console.log(`[BatchReferenceVideo] Shot ${shot.sequence}: ${sceneFramePaths.length} scenes + ${charRefs.length} chars → video`);
 
         const result = await videoProvider.generateVideo({
-          initialImage: sceneFramePath,
+          initialImage: sceneFramePaths[0],
           prompt: videoPrompt,
           duration: effectiveDuration,
           ratio,
-          referenceImages: allRefImages,
+          referenceImages: orderedRefImages,
         });
 
         await insertAssetVersion({
@@ -2485,10 +2531,22 @@ async function handleSingleVideoPrompt(
   }
 
   // Keyframe mode: pass first + last frames for transition description
-  // Reference mode: pass only the scene reference frame
+  // Reference mode: pass ALL scene reference frames (ordered) so multi-
+  // scene shots (ground → sky etc.) get the full spatial context.
   const visionFrames: string[] = [];
+  let sceneMetaList: Array<{ sceneName?: string } | null> = [];
   if (genMode === "reference") {
-    if (shotView.sceneRefFrame) visionFrames.push(shotView.sceneRefFrame);
+    const sceneAssets = shotView.referenceImages
+      .filter((r) => r.fileUrl)
+      .sort((a, b) => a.sequenceInType - b.sequenceInType);
+    for (const r of sceneAssets) {
+      visionFrames.push(r.fileUrl as string);
+      sceneMetaList.push((r.meta as { sceneName?: string } | null) ?? null);
+    }
+    if (visionFrames.length === 0 && shotView.sceneRefFrame) {
+      visionFrames.push(shotView.sceneRefFrame);
+      sceneMetaList.push(null);
+    }
   } else {
     if (shotView.firstFrame) visionFrames.push(shotView.firstFrame);
     if (shotView.lastFrame) visionFrames.push(shotView.lastFrame);
@@ -2530,11 +2588,29 @@ async function handleSingleVideoPrompt(
     const textProvider = resolveAIProvider(modelConfig);
     const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
     const motionContext = shot.motionScript || shot.videoScript || shot.prompt || "";
+    // Filter to characters declared on this shot's reference assets
+    const shotCharNameSetVP = new Set<string>();
+    for (const r of shotView.referenceImages) {
+      for (const n of r.characters ?? []) shotCharNameSetVP.add(n);
+    }
+    const charsWithRefsHere = shotCharacters.filter(
+      (c) => !!c.referenceImage && (shotCharNameSetVP.size === 0 || shotCharNameSetVP.has(c.name))
+    );
+    const characterRefInfos = charsWithRefsHere.map((c, i) => ({
+      name: c.name,
+      index: i + 1,
+      visualHint: c.visualHint,
+    }));
+    const sceneFrameInfos = visionFrames.map((_, i) => {
+      const name = sceneMetaList[i]?.sceneName || (visionFrames.length > 1 ? `场景-${i + 1}` : `场景`);
+      return { label: name, index: charsWithRefsHere.length + i + 1 };
+    });
     const promptRequest = buildRefVideoPromptRequest({
       motionScript: motionContext,
       cameraDirection: shot.cameraDirection || "static",
       duration: effectiveDuration,
-      characters: shotCharacters,
+      characters: characterRefInfos,
+      sceneFrames: sceneFrameInfos,
       dialogues: dialogueList.length > 0 ? dialogueList : undefined,
     });
     console.log(`[SingleVideoPrompt] Shot ${shot.sequence} promptRequest:\n${promptRequest}`);
@@ -2600,14 +2676,26 @@ async function handleBatchVideoPrompt(
         const shotLegacy = batchShotsLegacy.get(shot.id);
         const shotStart = Date.now();
         const effectiveDuration = Math.min(shot.duration ?? 10, videoMaxDuration);
-        // Keyframe: pass first + last frames; Reference: pass only scene ref frame
+        // Keyframe: first + last frames. Reference: ALL scene reference frames (ordered).
         const visionFrames: string[] = [];
+        let sceneMetaList: Array<{ sceneName?: string } | null> = [];
         if (batchGenMode === "reference") {
-          if (shotLegacy?.sceneRefFrame) visionFrames.push(shotLegacy.sceneRefFrame);
+          const sceneAssets = (shotLegacy?.referenceImages ?? [])
+            .filter((r) => r.fileUrl)
+            .sort((a, b) => a.sequenceInType - b.sequenceInType);
+          for (const r of sceneAssets) {
+            visionFrames.push(r.fileUrl as string);
+            sceneMetaList.push((r.meta as { sceneName?: string } | null) ?? null);
+          }
+          if (visionFrames.length === 0 && shotLegacy?.sceneRefFrame) {
+            visionFrames.push(shotLegacy.sceneRefFrame);
+            sceneMetaList.push(null);
+          }
         } else {
           if (shotLegacy?.firstFrame) visionFrames.push(shotLegacy.firstFrame);
           if (shotLegacy?.lastFrame) visionFrames.push(shotLegacy.lastFrame);
           if (visionFrames.length === 0 && shotLegacy?.sceneRefFrame) visionFrames.push(shotLegacy.sceneRefFrame);
+          sceneMetaList = visionFrames.map(() => null);
         }
         const shotDialogues = await db
           .select({ text: dialogues.text, characterId: dialogues.characterId, sequence: dialogues.sequence })
@@ -2630,11 +2718,29 @@ async function handleBatchVideoPrompt(
         });
 
         const motionContext = shot.videoScript || shot.motionScript || shot.prompt || "";
+        // Filter characters to those declared on this shot's reference assets
+        const shotCharNameSetBVP = new Set<string>();
+        for (const r of shotLegacy?.referenceImages ?? []) {
+          for (const n of r.characters ?? []) shotCharNameSetBVP.add(n);
+        }
+        const batchCharsWithRefs = batchCharacters.filter(
+          (c) => !!c.referenceImage && (shotCharNameSetBVP.size === 0 || shotCharNameSetBVP.has(c.name))
+        );
+        const characterRefInfos = batchCharsWithRefs.map((c, i) => ({
+          name: c.name,
+          index: i + 1,
+          visualHint: c.visualHint,
+        }));
+        const sceneFrameInfos = visionFrames.map((_, i) => {
+          const name = sceneMetaList[i]?.sceneName || (visionFrames.length > 1 ? `场景-${i + 1}` : `场景`);
+          return { label: name, index: batchCharsWithRefs.length + i + 1 };
+        });
         const promptRequest = buildRefVideoPromptRequest({
           motionScript: motionContext,
           cameraDirection: shot.cameraDirection || "static",
           duration: effectiveDuration,
-          characters: batchCharacters,
+          characters: characterRefInfos,
+          sceneFrames: sceneFrameInfos,
           dialogues: dialogueList.length > 0 ? dialogueList : undefined,
         });
         const rawPrompt = await textProvider.generateText(promptRequest, {
@@ -2749,10 +2855,6 @@ async function handleBatchRefImageGenerate(
     ? await getVersionedUploadDir(batchVersionId)
     : process.env.UPLOAD_DIR || "./uploads";
 
-  // Get character references
-  const projectCharacters = await getEpisodeCharacters(projectId, episodeId);
-  const charsWithRefs = projectCharacters.filter((c) => !!c.referenceImage);
-
   const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
 
   const results: Array<{
@@ -2780,21 +2882,12 @@ async function handleBatchRefImageGenerate(
         const batchRatio = (payload?.ratio as string) || "16:9";
         const batchImageOpts = ratioToImageOpts(batchRatio);
 
-        // Smart character matching for THIS entry
-        const entryStoredChars = entry.characters || [];
-        const entryRelevantChars = entryStoredChars.length > 0
-          ? charsWithRefs.filter((c) => entryStoredChars.includes(c.name))
-          : charsWithRefs.slice(0, 3);
-        const entryCharRefs = entryRelevantChars.map((c) => c.referenceImage as string);
-
-        // Build prompt with explicit character mapping
-        const promptPrefix = buildCharMappingPrefix(entryRelevantChars);
-        const fullPrompt = promptPrefix ? promptPrefix + entry.prompt : entry.prompt;
-
-        const imagePath = await imageProvider.generateImage(fullPrompt, {
+        // Scene-only: do NOT inject character references. Scene frames are
+        // pure environments; character consistency is handled at the video
+        // generation step via Seedance 2 multi-reference mode.
+        const imagePath = await imageProvider.generateImage(entry.prompt, {
           quality: "hd",
           ...batchImageOpts,
-          referenceImages: entryCharRefs,
         });
         await insertAssetVersion({
           shotId: shot.id, type: "reference", sequenceInType: entry.sequenceInType,
@@ -2848,30 +2941,17 @@ async function handleSingleRefImageGenerate(
     return NextResponse.json({ error: "No prompt provided" }, { status: 400 });
   }
 
-  // Scope characters to the shot's episode
-  const projectCharacters = await getEpisodeCharacters(projectId, shot.episodeId);
-  const charsWithRefs = projectCharacters.filter((c) => !!c.referenceImage);
-  const storedCharNames = entry.characters || [];
-  const relevantChars = storedCharNames.length > 0
-    ? charsWithRefs.filter((c) => storedCharNames.includes(c.name))
-    : charsWithRefs.slice(0, 3);
-  const charRefs = relevantChars.map((c) => c.referenceImage as string);
-
-  // Build prompt with explicit character mapping (includes height/proportion enforcement)
-  const promptPrefix = buildCharMappingPrefix(relevantChars);
-  const fullPrompt = promptPrefix ? promptPrefix + entry.prompt : entry.prompt;
-
-  console.log(`[SingleRefImage] Shot ${shot.sequence}: using ${relevantChars.length} chars (${relevantChars.map(c => c.name).join(", ")}) for ref "${refImageId}"`);
+  console.log(`[SingleRefImage] Shot ${shot.sequence}: generating scene-only ref image "${refImageId}"`);
 
   const ratio = (payload?.ratio as string) || "16:9";
   const imgOpts = ratioToImageOpts(ratio);
   const imageProvider = resolveImageProvider(modelConfig);
 
   try {
-    const imagePath = await imageProvider.generateImage(fullPrompt, {
+    // Scene-only: do NOT inject character references here.
+    const imagePath = await imageProvider.generateImage(entry.prompt, {
       quality: "hd",
       ...imgOpts,
-      referenceImages: charRefs,
     });
 
     await insertAssetVersion({
@@ -2900,15 +2980,30 @@ async function handleGenerateRefPrompts(
   }
 
   const batchVersionId = payload?.versionId as string | undefined;
-  const shotWhereConditions = [eq(shots.projectId, projectId)];
-  if (batchVersionId) shotWhereConditions.push(eq(shots.versionId, batchVersionId));
-  if (episodeId) shotWhereConditions.push(eq(shots.episodeId, episodeId));
+  const buildWhere = (includeVersion: boolean) => {
+    const conds = [eq(shots.projectId, projectId)];
+    if (includeVersion && batchVersionId) conds.push(eq(shots.versionId, batchVersionId));
+    if (episodeId) conds.push(eq(shots.episodeId, episodeId));
+    return and(...conds);
+  };
 
-  const allShots = await db
+  let allShots = await db
     .select()
     .from(shots)
-    .where(and(...shotWhereConditions))
+    .where(buildWhere(true))
     .orderBy(asc(shots.sequence));
+
+  // Fallback: if the strict version filter returns empty (e.g. stale
+  // selectedVersionId on the client), retry without version — use the
+  // shots that actually exist for this project+episode.
+  if (allShots.length === 0 && batchVersionId) {
+    console.warn(`[GenerateRefPrompts] strict filter empty (versionId=${batchVersionId}), falling back to no-version filter`);
+    allShots = await db
+      .select()
+      .from(shots)
+      .where(buildWhere(false))
+      .orderBy(asc(shots.sequence));
+  }
 
   if (allShots.length === 0) {
     return NextResponse.json({ error: "No shots found" }, { status: 400 });
@@ -2933,94 +3028,175 @@ async function handleGenerateRefPrompts(
   const metaEra = pickField("时代美学");
   const metaMood = pickField("氛围情绪");
   const metaRatio = pickField("画幅比例");
-  const metaDirector = pickField("参考导演");
+  // 参考导演 is intentionally NOT injected into visualStyle anymore —
+  // it carries real person names that trigger content filters at both
+  // the text LLM (400) and the image API (400 invalid_request_error).
 
-  // Compose a richer visual style string for downstream ref-image prompt generation.
-  // Keeps backward compatibility: if only 视觉风格 is present, behavior is unchanged.
   const visualStyle = [
     metaVisualStyle,
     metaColorTone && `色彩基调：${metaColorTone}`,
     metaEra && `时代美学：${metaEra}`,
     metaMood && `氛围情绪：${metaMood}`,
     metaRatio && `画幅比例：${metaRatio}`,
-    metaDirector && metaDirector !== "无" && metaDirector !== "None" && `参考导演：${metaDirector}`,
   ].filter(Boolean).join("；");
+
+  // Load character relationships — drives on-screen interaction framing
+  // when scene frames plan out the space for enemies / allies.
+  const refRelations = await db
+    .select()
+    .from(characterRelations)
+    .where(eq(characterRelations.projectId, projectId));
+  let refRelationsText = "";
+  if (refRelations.length > 0) {
+    refRelationsText = "\n\n## 角色关系（必须用于决定场景空间规划）\n";
+    for (const rel of refRelations) {
+      const charA = projectCharacters.find((c) => c.id === rel.characterAId);
+      const charB = projectCharacters.find((c) => c.id === rel.characterBId);
+      if (charA && charB) {
+        refRelationsText += `- ${charA.name} ↔ ${charB.name}：${rel.relationType}${rel.description ? `（${rel.description}）` : ""}\n`;
+      }
+    }
+    refRelationsText += `
+**关系驱动场景规划规则**：
+- **敌对**：场景需要有明确的对峙空间轴线——两个站位点之间留出视觉通道。
+- **友好/父女/师徒**：场景留出并肩站位的空间。
+- 这些只影响场景帧的空间布局（景别/构图/空间轴线），场景帧本身**仍然不画任何人物**。
+`;
+  }
 
   const textProvider = resolveAIProvider(modelConfig);
   const refImageSystem = await resolvePrompt("ref_image_prompts", { userId, projectId });
   const { deleteAssetsByType } = await import("@/lib/shot-asset-utils");
 
-  // Concurrent per-shot generation: each shot is a separate LLM call so they
-  // run in parallel via Promise.all. Token-heavier than one big call but
-  // dramatically faster (≈ N×) and resilient to a single shot failing.
+  // Batch generation strategy — each LLM call receives a chunk of 8
+  // consecutive shots so the AI can maintain narrative continuity across
+  // them (lighting evolution, spatial flow, prop reuse). Batches run
+  // SEQUENTIALLY so each batch can see the previous batch's last shot as
+  // continuity context. Concurrent per-shot calls broke story coherence —
+  // each shot got a near-duplicate "intro scene" from the LLM.
   const total = allShots.length;
-  let doneCount = 0;
-  console.log(`[GenerateRefPrompts] Starting concurrent generation: 0/${total}`);
-  const results = await Promise.allSettled(
-    allShots.map(async (shot) => {
-      try {
-        const promptRequest = buildRefImagePromptsRequest(
-          [{
-            sequence: shot.sequence,
-            prompt: shot.prompt || "",
-            motionScript: shot.motionScript,
-            cameraDirection: shot.cameraDirection,
-          }],
-          projectCharacters.map((c) => ({ name: c.name, description: c.description })),
-          visualStyle
-        );
+  const BATCH_SIZE = 8;
+  const batches: typeof allShots[] = [];
+  for (let i = 0; i < allShots.length; i += BATCH_SIZE) {
+    batches.push(allShots.slice(i, i + BATCH_SIZE));
+  }
+  console.log(`[GenerateRefPrompts] Starting sequential batched generation: ${batches.length} batch(es) of up to ${BATCH_SIZE} shots, total ${total}`);
 
-        const result = await textProvider.generateText(promptRequest, {
-          systemPrompt: refImageSystem,
-          temperature: 0.7,
-        });
+  let updatedCount = 0;
+  const failed: Array<{ seq: number; err: string }> = [];
+  let previousBatchTail: { sequence: number; sceneName?: string; prompt: string } | null = null;
 
-        const jsonMatch = result.match(/\[[\s\S]*\]/);
-        if (!jsonMatch) {
-          throw new Error(`Shot ${shot.sequence}: invalid JSON response`);
-        }
-        const parsed = JSON.parse(jsonMatch[0]) as Array<{
-          shotSequence: number;
-          characters?: string[];
-          prompts: string[];
-        }>;
-        const entry = parsed.find((e) => e.shotSequence === shot.sequence) || parsed[0];
-        if (!entry || !Array.isArray(entry.prompts) || entry.prompts.length === 0) {
-          throw new Error(`Shot ${shot.sequence}: empty prompts`);
-        }
+  for (let bi = 0; bi < batches.length; bi++) {
+    const batch = batches[bi];
+    const batchStart = Date.now();
+    try {
+      const baseRefRequest = buildRefImagePromptsRequest(
+        batch.map((s) => ({
+          sequence: s.sequence,
+          prompt: s.prompt || "",
+          motionScript: s.motionScript,
+          cameraDirection: s.cameraDirection,
+          duration: s.duration,
+        })),
+        projectCharacters.map((c) => ({ name: c.name, description: c.description })),
+        visualStyle
+      );
 
-        const shotCharacters = entry.characters || projectCharacters.map((c) => c.name);
-        await deleteAssetsByType(shot.id, "reference");
-        for (let pi = 0; pi < entry.prompts.length; pi++) {
-          await insertAssetVersion({
-            shotId: shot.id,
-            type: "reference",
-            sequenceInType: pi,
-            prompt: entry.prompts[pi],
-            status: "pending",
-            characters: shotCharacters,
-          });
-        }
-        doneCount++;
-        console.log(`[GenerateRefPrompts] ✓ shot ${shot.sequence} (${doneCount}/${total})`);
-        return shot.sequence;
-      } catch (err) {
-        doneCount++;
-        console.warn(`[GenerateRefPrompts] ✗ shot ${shot.sequence} (${doneCount}/${total}): ${String(err)}`);
-        throw err;
+      let promptRequest = refRelationsText
+        ? baseRefRequest + refRelationsText
+        : baseRefRequest;
+
+      // Continuity context from the last shot of the previous batch.
+      if (previousBatchTail) {
+        promptRequest += `\n\n## 剧情连续性上下文\n本批次的镜头 ${batch[0].sequence} 紧接上一批次镜头 ${previousBatchTail.sequence} 之后。上一个镜头的结束场景是"${previousBatchTail.sceneName || "未命名"}"：${previousBatchTail.prompt.slice(0, 160)}...\n请让本批次第一个镜头的场景在空间/光线/色调上与之自然衔接，避免突兀重置到"起始场景"风格。`;
       }
-    })
-  );
 
-  const updatedCount = results.filter((r) => r.status === "fulfilled").length;
-  const failed = results
-    .map((r, i) => (r.status === "rejected" ? { seq: allShots[i].sequence, err: String(r.reason) } : null))
-    .filter(Boolean);
+      const result = await textProvider.generateText(promptRequest, {
+        systemPrompt: refImageSystem,
+        temperature: 0.7,
+      });
+
+      const jsonMatch = result.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        throw new Error(`Batch ${bi + 1}: invalid JSON response`);
+      }
+      const parsed = JSON.parse(jsonMatch[0]) as Array<{
+        shotSequence: number;
+        characters?: string[];
+        scenes?: Array<{ name: string; prompt: string }>;
+        prompts?: string[]; // legacy shape
+      }>;
+
+      let batchUpdated = 0;
+      let lastEntryForContinuity: { sequence: number; sceneName?: string; prompt: string } | null = null;
+      for (const shot of batch) {
+        try {
+          const entry = parsed.find((e) => e.shotSequence === shot.sequence);
+          if (!entry) {
+            console.warn(`[GenerateRefPrompts] batch ${bi + 1}: shot ${shot.sequence} missing from LLM output`);
+            failed.push({ seq: shot.sequence, err: "missing from batch output" });
+            continue;
+          }
+
+          // Normalize: accept new { scenes: [{name, prompt}] } or legacy
+          // { prompts: [string] } format.
+          let sceneList: Array<{ name: string; prompt: string }> = [];
+          if (Array.isArray(entry.scenes) && entry.scenes.length > 0) {
+            sceneList = entry.scenes.filter((s) => s && typeof s.prompt === "string" && s.prompt.trim());
+          } else if (Array.isArray(entry.prompts) && entry.prompts.length > 0) {
+            sceneList = entry.prompts.map((p, i) => ({ name: `场景 ${i + 1}`, prompt: p }));
+          }
+          if (sceneList.length === 0) {
+            failed.push({ seq: shot.sequence, err: "empty scenes/prompts" });
+            continue;
+          }
+
+          const shotCharacters = Array.isArray(entry.characters) ? entry.characters : [];
+          if (shotCharacters.length === 0) {
+            console.warn(`[GenerateRefPrompts] Shot ${shot.sequence}: AI did not emit 'characters' field`);
+          }
+          await deleteAssetsByType(shot.id, "reference");
+          for (let pi = 0; pi < sceneList.length; pi++) {
+            const scene = sceneList[pi];
+            await insertAssetVersion({
+              shotId: shot.id,
+              type: "reference",
+              sequenceInType: pi,
+              prompt: scene.prompt,
+              status: "pending",
+              characters: shotCharacters,
+              meta: { sceneName: scene.name || `场景 ${pi + 1}` },
+            });
+          }
+          updatedCount++;
+          batchUpdated++;
+          // Track the last successfully parsed shot in this batch — fed
+          // into the next batch as continuity context.
+          const lastScene = sceneList[sceneList.length - 1];
+          lastEntryForContinuity = {
+            sequence: shot.sequence,
+            sceneName: lastScene.name,
+            prompt: lastScene.prompt,
+          };
+        } catch (shotErr) {
+          failed.push({ seq: shot.sequence, err: String(shotErr) });
+        }
+      }
+      if (lastEntryForContinuity) previousBatchTail = lastEntryForContinuity;
+      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(1);
+      console.log(`[GenerateRefPrompts] ✓ batch ${bi + 1}/${batches.length} (${batch[0].sequence}..${batch[batch.length - 1].sequence}): ${batchUpdated}/${batch.length} shots in ${elapsed}s`);
+    } catch (err) {
+      const elapsed = ((Date.now() - batchStart) / 1000).toFixed(1);
+      console.warn(`[GenerateRefPrompts] ✗ batch ${bi + 1}/${batches.length} failed in ${elapsed}s: ${String(err)}`);
+      for (const shot of batch) failed.push({ seq: shot.sequence, err: String(err) });
+    }
+  }
+
   if (failed.length > 0) {
     console.warn(`[GenerateRefPrompts] ${failed.length} shots failed:`, failed);
   }
-  console.log(`[GenerateRefPrompts] Updated ${updatedCount}/${allShots.length} shots (concurrent)`);
-  return NextResponse.json({ updatedCount, totalShots: allShots.length });
+  console.log(`[GenerateRefPrompts] Updated ${updatedCount}/${total} shots (sequential batched)`);
+  return NextResponse.json({ updatedCount, totalShots: total });
 }
 
 // --- single_ref_image_generate_all: generate all pending ref images for one shot ---
@@ -3104,15 +3280,27 @@ async function handleGenerateKeyframePrompts(
   }
 
   const batchVersionId = payload?.versionId as string | undefined;
-  const shotWhereConditions = [eq(shots.projectId, projectId)];
-  if (batchVersionId) shotWhereConditions.push(eq(shots.versionId, batchVersionId));
-  if (episodeId) shotWhereConditions.push(eq(shots.episodeId, episodeId));
+  const buildWhere = (includeVersion: boolean) => {
+    const conds = [eq(shots.projectId, projectId)];
+    if (includeVersion && batchVersionId) conds.push(eq(shots.versionId, batchVersionId));
+    if (episodeId) conds.push(eq(shots.episodeId, episodeId));
+    return and(...conds);
+  };
 
-  const allShots = await db
+  let allShots = await db
     .select()
     .from(shots)
-    .where(and(...shotWhereConditions))
+    .where(buildWhere(true))
     .orderBy(asc(shots.sequence));
+
+  if (allShots.length === 0 && batchVersionId) {
+    console.warn(`[GenerateKeyframePrompts] strict filter empty (versionId=${batchVersionId}), falling back to no-version filter`);
+    allShots = await db
+      .select()
+      .from(shots)
+      .where(buildWhere(false))
+      .orderBy(asc(shots.sequence));
+  }
 
   if (allShots.length === 0) {
     return NextResponse.json({ error: "No shots found" }, { status: 400 });
@@ -3139,6 +3327,32 @@ async function handleGenerateKeyframePrompts(
     pickField("画幅比例") && `画幅比例：${pickField("画幅比例")}`,
   ].filter(Boolean).join("；");
 
+  // Load character relationships — drives on-screen interaction framing.
+  // Enemies must face each other as live combatants, not background icons.
+  const kfRelations = await db
+    .select()
+    .from(characterRelations)
+    .where(eq(characterRelations.projectId, projectId));
+  let kfRelationsText = "";
+  if (kfRelations.length > 0) {
+    kfRelationsText = "\n\n## 角色关系（必须用于决定站位、眼神、肢体对抗、画面张力）\n";
+    for (const rel of kfRelations) {
+      const charA = projectCharacters.find((c) => c.id === rel.characterAId);
+      const charB = projectCharacters.find((c) => c.id === rel.characterBId);
+      if (charA && charB) {
+        kfRelationsText += `- ${charA.name} ↔ ${charB.name}：${rel.relationType}${rel.description ? `（${rel.description}）` : ""}\n`;
+      }
+    }
+    kfRelationsText += `
+**关系驱动构图规则（最高优先级）**：
+- **敌对 / 对立 / 仇人**：两人必须都是**活人角色同屏对峙**，直接对视、肢体对抗、武器对准彼此。严禁把任一方画成背景的雕像/神像/虚影/浮雕/壁画。
+- **友好 / 盟友**：并肩站位、相互掩护、眼神交流。
+- **爱慕 / 亲密**：靠近、牵手、拥抱、温柔对视。
+- **父女 / 师徒**：长辈在前或侧，晚辈跟随。
+- 凡是出现在 characters 列表里的角色，在首尾帧画面里都必须是真实的活人，不允许以雕像/虚影形式出场。
+`;
+  }
+
   const textProvider = resolveAIProvider(modelConfig);
   const keyframeSystemPrompt = await resolvePrompt("shot_split_keyframe_assets", {
     userId,
@@ -3152,7 +3366,7 @@ async function handleGenerateKeyframePrompts(
   const results = await Promise.allSettled(
     allShots.map(async (shot) => {
       try {
-        const promptRequest = buildKeyframePromptsRequest(
+        const basePromptRequest = buildKeyframePromptsRequest(
           [{
             sequence: shot.sequence,
             prompt: shot.prompt || "",
@@ -3166,6 +3380,9 @@ async function handleGenerateKeyframePrompts(
           })),
           visualStyle
         );
+        const promptRequest = kfRelationsText
+          ? basePromptRequest + kfRelationsText
+          : basePromptRequest;
 
         const result = await textProvider.generateText(promptRequest, {
           systemPrompt: keyframeSystemPrompt,

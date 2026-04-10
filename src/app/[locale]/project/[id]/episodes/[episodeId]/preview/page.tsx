@@ -143,7 +143,7 @@ export default function EpisodePreviewPage() {
           )}
           <Button
             onClick={handleAssemble}
-            disabled={!allShotsHaveVideo || assembling}
+            disabled={assembling}
             size="sm"
           >
             {assembling ? (

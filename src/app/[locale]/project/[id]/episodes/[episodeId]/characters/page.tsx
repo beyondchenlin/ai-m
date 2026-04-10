@@ -105,12 +105,11 @@ export default function EpisodeCharactersPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <PromptEditButton promptKeys="character_extract" projectId={project.id} />
           <InlineModelPicker capability="text" />
           <Button
             onClick={handleExtractCharacters}
             disabled={extracting}
-            variant="outline"
+            variant="default"
             size="sm"
           >
             {extracting ? (
@@ -126,6 +125,7 @@ export default function EpisodeCharactersPage() {
               <Button
                 onClick={handleBatchGenerateImages}
                 disabled={generatingImages}
+                variant="default"
                 size="sm"
               >
                 {generatingImages ? (
@@ -139,6 +139,7 @@ export default function EpisodeCharactersPage() {
               </Button>
             </>
           )}
+          <PromptEditButton promptKeys="character_extract" projectId={project.id} />
         </div>
       </div>
 

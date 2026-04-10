@@ -1,51 +1,62 @@
 /**
- * AI vision-based video prompt generation for reference image mode.
- * Given a rendered scene reference frame, generates a Seedance-style video prompt.
+ * User-message builder for the `ref_video_prompt` AI call.
+ *
+ * NOTE: The system prompt is NOT defined here — it lives in
+ * `registry.ts` under `refVideoPromptDef` (single source of truth, also
+ * exposed in the prompt management UI so users can override it).
+ * This file only builds the per-request user payload.
+ *
+ * Output style follows the official 即梦 / Seedance inline syntax:
+ *   - References are written as `@图片N` (not `@图片N`)
+ *   - Flowing natural-language prose, no structured mapping header, no
+ *     "节拍 1/2/3" labels, no 【对白口型】tags
+ *   - Dialogue inline as "角色台词：..." appended after the action prose
  */
 
-export const REF_VIDEO_PROMPT_SYSTEM = `你是一位 Seedance 2.0 视频提示词撰写专家。给定一个镜头的首帧（起始状态）和末帧（终止状态），以及剧本上下文，撰写精确的运动提示词，描述两帧之间的过渡。
+export interface SceneFrameInfo {
+  label: string;      // e.g. "宫殿外"、"竹林"
+  index: number;      // 1-based position in the ordered reference list
+}
 
-## 核心原则
-视频模型将首帧作为起始点。你的任务是精确描述如何从首帧过渡到末帧——什么在动、怎么动、何时动。仔细研究两帧：注意角色位置、表情、光照、机位角度和环境在两帧之间的变化。
-
-## 规则
-- 与剧本上下文的语言保持一致（中文剧本 → 中文提示词，英文 → 英文），纯散文，无标签
-- 首次提及角色时："名字（视觉标识）"——必须使用下方角色视觉标识中提供的准确标识（如有提供）。绝不自行编造替代描述。
-- 机位运动：要具体——"缓慢推进"、"固定"、"从 X 到 Y 的焦点转换"、"手持漂移"
-- 将动作分解为精确的节拍，具有清晰的因果关系：先发生什么 → 然后 → 结果
-- 每个节拍应描述物理运动：距离、速度、方向、运动质感
-- 不使用空洞修饰词（"优雅地"、"轻柔地"、"温柔地"），除非它们具体说明了运动方式
-- 仅在氛围/环境元素有运动时才描述（摇摆的树枝、升腾的雾气、闪烁的光）
-- 40-70 词
-- 如有对白，保持原文语言，单独放在最后一行：【对白口型】名字（视觉标识）: "原文台词"
-- 仅输出提示词，不要前言
-
-## 质量基准
-
-反面示例（模糊、外观导向）：
-他的手指发出温暖的光芒，优雅地放下棋子。氛围宁静而美好。
-
-正面示例（精确、运动导向）：
-机位固定。一哲（浅蓝长袍）捏起玉棋子，在晨雾中以极慢的弧线落下。触碰——棋盘表面微颤，一滴露珠滚落。手指停顿一拍，随即以一个流畅的动作收回。焦点从指尖转换到落定的棋子。背景中柳枝随风轻拂。`;
+export interface CharacterRefInfo {
+  name: string;
+  index: number;      // 1-based position in the ordered reference list
+  visualHint?: string | null;
+}
 
 export function buildRefVideoPromptRequest(params: {
   motionScript: string;
   cameraDirection: string;
   duration: number;
-  characters?: Array<{ name: string; visualHint?: string | null }>;
+  characters: CharacterRefInfo[];
+  sceneFrames: SceneFrameInfo[];
   dialogues?: Array<{ characterName: string; text: string; offscreen?: boolean; visualHint?: string }>;
 }): string {
-  const lines: string[] = [
-    `你将收到两张图片：该镜头的首帧（起始状态）和末帧（终止状态）。请撰写一段 Seedance 风格的视频提示词，描述从首帧到末帧的运动过渡，语言与下方剧本动作保持一致。`,
-    ``,
-  ];
+  const lines: string[] = [];
 
-  const withHints = (params.characters ?? []).filter((c) => c.visualHint);
-  if (withHints.length) {
-    lines.push(`角色视觉标识（必须使用——提及角色时原文照用）：`);
-    for (const c of withHints) {
-      lines.push(`  ${c.name}：${c.visualHint}`);
-    }
+  lines.push(
+    `你会收到以下参考图（顺序严格对应 @图片1、@图片2、@图片3 ...，必须使用 \`@图片N\` 形式，**不能**写成 \`@图片N\`）：`
+  );
+  for (const c of params.characters) {
+    const hint = c.visualHint ? `（${c.visualHint}）` : "";
+    lines.push(`  @图片${c.index} = 角色：${c.name}${hint}`);
+  }
+  for (const s of params.sceneFrames) {
+    lines.push(`  @图片${s.index} = 场景：${s.label}`);
+  }
+  lines.push(``);
+
+  if (params.sceneFrames.length > 1) {
+    lines.push(
+      `本镜头有 ${params.sceneFrames.length} 张场景参考图，按顺序对应镜头内的空间切换。散文中要依次经过这些场景并写清楚过渡。`
+    );
+    lines.push(``);
+  }
+
+  if (params.characters.length === 0) {
+    lines.push(
+      `注意：本镜头没有角色登场，只描述场景环境变化和镜头运动，不要编造任何人物。`
+    );
     lines.push(``);
   }
 
@@ -54,8 +65,21 @@ export function buildRefVideoPromptRequest(params: {
   lines.push(`时长：${params.duration}s`);
 
   if (params.dialogues?.length) {
-    lines.push(`对白：${params.dialogues.map(d => `${d.characterName}: "${d.text}"`).join("; ")}`);
+    lines.push(
+      `对白（保持原文语言，直接嵌入散文末尾，用"角色名台词：..."的格式）：${params.dialogues
+        .map((d) => `${d.characterName}: "${d.text}"`)
+        .join("; ")}`
+    );
   }
+
+  lines.push(``);
+  lines.push(`严格要求：`);
+  lines.push(`1. 使用 \`@图片N\` 形式引用所有角色和场景（例：@图片1、@图片2），禁止写成 \`@图片N\``);
+  lines.push(`2. 写作风格为连贯的自然散文，把 @图片N 直接嵌入描述里，禁止"节拍 1/2/3"结构化标签`);
+  lines.push(`3. 禁止提示词开头写"图像映射：@图片1是 X，@图片2是 Y" 这种单独映射声明行——信息要融进散文`);
+  lines.push(`4. 禁止每次 @图片N 后面都加括号注释，首次出现可以补一下，后面重复用 @图片N 即可`);
+  lines.push(`5. 对白（如有）直接写在散文末尾：角色名台词：原文台词（不要 【对白口型】 等标签）`);
+  lines.push(`6. 仅输出提示词正文，无前言，无 markdown`);
 
   return lines.join("\n");
 }

@@ -31,9 +31,9 @@ export default function EpisodeLayout({
   }
 
   return (
-    <div className="flex flex-1 overflow-hidden">
+    <div className="flex flex-1">
       <ProjectNav projectId={id} episodeId={episodeId} />
-      <main className="flex-1 overflow-y-auto bg-[--surface] p-6 pb-24 lg:pb-6">
+      <main className="flex-1 bg-[--surface] p-6 pb-24 lg:pb-6 min-w-0">
         {children}
       </main>
     </div>
