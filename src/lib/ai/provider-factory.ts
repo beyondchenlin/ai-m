@@ -4,6 +4,8 @@ import { SeedanceProvider } from "./providers/seedance";
 import { VeoProvider } from "./providers/veo";
 import { KlingImageProvider } from "./providers/kling-image";
 import { KlingVideoProvider } from "./providers/kling-video";
+import { WanVideoProvider } from "./providers/wan-video";
+import { UCloudSeedanceProvider } from "./providers/ucloud-seedance";
 import { getAIProvider, getVideoProvider } from "./index";
 import type { AIProvider, VideoProvider } from "./types";
 
@@ -70,6 +72,20 @@ export function createVideoProvider(config: ProviderConfig, uploadDir?: string):
       return new KlingVideoProvider({
         apiKey: config.apiKey,
         secretKey: config.secretKey,
+        baseUrl: config.baseUrl,
+        model: config.modelId,
+        ...(uploadDir && { uploadDir }),
+      });
+    case "wan":
+      return new WanVideoProvider({
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+        model: config.modelId,
+        ...(uploadDir && { uploadDir }),
+      });
+    case "ucloud-seedance":
+      return new UCloudSeedanceProvider({
+        apiKey: config.apiKey,
         baseUrl: config.baseUrl,
         model: config.modelId,
         ...(uploadDir && { uploadDir }),

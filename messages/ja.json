@@ -17,7 +17,8 @@
     "generationCompleted": "生成が完了しました",
     "batchPartialFailed": "一部のアイテムの生成に失敗しました。後でもう一度お試しください。",
     "promptTemplates": "プロンプト管理",
-    "upload": "アップロード"
+    "upload": "アップロード",
+    "uploadFailed": "アップロードに失敗しました。もう一度お試しください。"
   },
   "dashboard": {
     "title": "マイプロジェクト",
@@ -101,6 +102,7 @@
     "description": "説明",
     "referenceImage": "参照画像",
     "generateImage": "ターンアラウンド生成",
+    "uploadImage": "参照画像をアップロード",
     "batchGenerateImages": "一括ターンアラウンド生成",
     "visualHint": "外見の識別子（例：銀髪、金目）",
     "noCharacters": "まだキャラクターがいません。「キャラクター解析」をクリックして脚本からキャラクターを抽出してください。",

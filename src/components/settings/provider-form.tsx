@@ -17,7 +17,9 @@ const DEFAULT_BASE_URLS: Record<Protocol, string> = {
   openai: "https://api.openai.com",
   gemini: "https://generativelanguage.googleapis.com",
   seedance: "https://ark.cn-beijing.volces.com",
+  "ucloud-seedance": "https://api.modelverse.cn",
   kling: "https://api.klingai.com",
+  wan: "https://dashscope.aliyuncs.com/api/v1",
 };
 
 function getProtocolOptions(capability: Capability): { value: Protocol; label: string }[] {
@@ -37,8 +39,10 @@ function getProtocolOptions(capability: Capability): { value: Protocol; label: s
   // video
   return [
     { value: "seedance", label: "Seedance" },
+    { value: "ucloud-seedance", label: "Seedance (UCloud)" },
     { value: "gemini", label: "Gemini (Veo)" },
     { value: "kling", label: "Kling" },
+    { value: "wan", label: "Wan (通义万相)" },
   ];
 }
 

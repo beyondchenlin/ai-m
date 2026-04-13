@@ -17,7 +17,8 @@
     "generationCompleted": "生成完成",
     "batchPartialFailed": "部分项目生成失败，请稍后重试",
     "promptTemplates": "提示词管理",
-    "upload": "上传"
+    "upload": "上传",
+    "uploadFailed": "上传失败，请重试"
   },
   "dashboard": {
     "title": "我的项目",
@@ -102,6 +103,7 @@
     "description": "角色描述",
     "referenceImage": "参考图",
     "generateImage": "生成四视图",
+    "uploadImage": "上传参考图",
     "batchGenerateImages": "批量生成四视图",
     "visualHint": "外貌标识（如：白发金瞳）",
     "noCharacters": "还没有角色，点击「角色解析」从剧本中提取角色",

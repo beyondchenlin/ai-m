@@ -11,6 +11,13 @@ export const MODEL_MAX_DURATIONS: Record<string, number> = {
   "doubao-seedance-1-5-pro-250528": 12,
   "doubao-seedance-1-5-pro-251215": 12,
   "doubao-seedance-1-0-lite-250528": 5,
+  "wan2.7-t2v": 15,
+  "wan2.7-r2v": 15,
+  "wan2.6-t2v": 15,
+  "wan2.6-i2v-flash": 15,
+  "wan2.6-i2v": 10,
+  "wan2.6-r2v": 10,
+  "wan2.6-r2v-flash": 10,
 };
 
 /** Family-level fallback: if modelId contains this substring, use this duration */
@@ -20,6 +27,9 @@ const FAMILY_MAX_DURATIONS: [string, number][] = [
   ["kling", 10],
   ["seedance-1-0", 5],
   ["seedance", 12],
+  ["wan2.7", 15],
+  ["wan2.6", 15],
+  ["wan", 15],
 ];
 
 export const DEFAULT_MAX_DURATION = 12;

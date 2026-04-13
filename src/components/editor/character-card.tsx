@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "next-intl";
 import { uploadUrl } from "@/lib/utils/upload-url";
 import { useModelStore, type ModelRef } from "@/stores/model-store";
-import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight } from "lucide-react";
+import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight, Upload } from "lucide-react";
 import { InlineModelPicker } from "@/components/editor/model-selector";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelGuard } from "@/hooks/use-model-guard";
@@ -62,6 +62,8 @@ export function CharacterCard({
   const [generating, setGenerating] = useState(false);
   const [lightbox, setLightbox] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const imageGuard = useModelGuard("image");
   const isGenerating = generating || (!!batchGenerating && !referenceImage);
 
@@ -107,6 +109,26 @@ export function CharacterCard({
     }
     setGenerating(false);
     onUpdate();
+  }
+
+  async function handleUploadImage(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    setUploading(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      await apiFetch(`/api/projects/${projectId}/characters/${id}/upload`, {
+        method: "POST",
+        body: form,
+      });
+      onUpdate();
+    } catch (err) {
+      console.error("Character image upload error:", err);
+      toast.error(t("common.uploadFailed"));
+    }
+    setUploading(false);
   }
 
   return (
@@ -252,6 +274,20 @@ export function CharacterCard({
                 variant="outline"
                 size="sm"
                 className="shrink-0 px-2.5"
+                title={t("character.uploadImage")}
+                disabled={uploading}
+                onClick={() => uploadInputRef.current?.click()}
+              >
+                {uploading ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Upload className="h-3.5 w-3.5" />
+                )}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0 px-2.5"
                 title="Copy image prompt"
                 onClick={async () => {
                   const prompt = buildCharacterTurnaroundPrompt(editDesc || editName, editName);
@@ -290,6 +326,15 @@ export function CharacterCard({
           </DialogContent>
         </Dialog>
       )}
+
+      {/* Hidden file input for image upload */}
+      <input
+        ref={uploadInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handleUploadImage}
+      />
     </div>
   );
 }

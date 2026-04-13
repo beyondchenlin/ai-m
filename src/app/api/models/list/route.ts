@@ -82,6 +82,29 @@ export async function POST(request: Request) {
       });
     }
 
+    if (body.protocol === "ucloud-seedance") {
+      return NextResponse.json({
+        models: [
+          { id: "doubao-seedance-1-5-pro-251215", name: "Seedance 1.5 Pro (UCloud)" },
+          { id: "doubao-seedance-2-0-260128", name: "Seedance 2.0 (UCloud)" },
+        ],
+      });
+    }
+
+    if (body.protocol === "wan") {
+      return NextResponse.json({
+        models: [
+          { id: "wan2.7-t2v", name: "Wan 2.7 文生视频" },
+          { id: "wan2.7-r2v", name: "Wan 2.7 参考生视频" },
+          { id: "wan2.6-t2v", name: "Wan 2.6 文生视频" },
+          { id: "wan2.6-i2v-flash", name: "Wan 2.6 图生视频 Flash" },
+          { id: "wan2.6-i2v", name: "Wan 2.6 图生视频" },
+          { id: "wan2.6-r2v", name: "Wan 2.6 参考生视频" },
+          { id: "wan2.6-r2v-flash", name: "Wan 2.6 参考生视频 Flash" },
+        ],
+      });
+    }
+
     if (!body.baseUrl) {
       return NextResponse.json({ error: "Base URL is required" }, { status: 400 });
     }

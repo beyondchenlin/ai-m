@@ -17,7 +17,8 @@
     "generationCompleted": "Generation completed",
     "batchPartialFailed": "Some items failed to generate. Please try again.",
     "promptTemplates": "Prompt Templates",
-    "upload": "Upload"
+    "upload": "Upload",
+    "uploadFailed": "Upload failed. Please try again."
   },
   "dashboard": {
     "title": "My Projects",
@@ -101,6 +102,7 @@
     "description": "Description",
     "referenceImage": "Reference Image",
     "generateImage": "Generate Turnaround",
+    "uploadImage": "Upload Reference Image",
     "batchGenerateImages": "Batch Generate Turnarounds",
     "visualHint": "Visual ID (e.g. silver hair, gold eyes)",
     "noCharacters": "No characters yet. Click \"Parse Characters\" to extract characters from the script.",
