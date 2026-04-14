@@ -3,7 +3,8 @@ import { streamText, generateText } from "ai";
 import { createLanguageModel, extractJSON } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db } from "@/lib/db";
-import { projects, episodes, characters, shots, dialogues, storyboardVersions, episodeCharacters, characterRelations } from "@/lib/db/schema";
+import { projects, episodes, characters, shots, dialogues, storyboardVersions, episodeCharacters, characterRelations, agentBindings, agents } from "@/lib/db/schema";
+import { callBailianAgent, validateAgentOutput, type AgentCategory } from "@/lib/ai/bailian-agent";
 import { eq, asc, and, lt, gt, desc, or, isNull, inArray } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import path from "path";
@@ -125,6 +126,21 @@ interface ModelConfig {
   text?: ProviderConfig | null;
   image?: ProviderConfig | null;
   video?: ProviderConfig | null;
+}
+
+async function findBoundAgent(projectId: string, category: AgentCategory) {
+  const [binding] = await db
+    .select({ agentId: agentBindings.agentId })
+    .from(agentBindings)
+    .where(
+      and(
+        eq(agentBindings.projectId, projectId),
+        eq(agentBindings.category, category),
+      ),
+    );
+  if (!binding?.agentId) return null;
+  const [agent] = await db.select().from(agents).where(eq(agents.id, binding.agentId));
+  return agent ?? null;
 }
 
 export async function POST(
@@ -276,6 +292,24 @@ async function handleScriptOutlineAction(
   if (!idea.trim()) {
     return NextResponse.json({ error: "No idea provided" }, { status: 400 });
   }
+
+  // === 智能体路由 ===
+  const boundAgent = await findBoundAgent(projectId, "script_outline");
+  if (boundAgent) {
+    const rawText = await callBailianAgent(
+      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+      `创意构想：${idea}`,
+    );
+    const result = validateAgentOutput("script_outline", rawText) as { outline: string };
+    const outline = result.outline;
+    if (episodeId) {
+      await db.update(episodes).set({ outline, updatedAt: new Date() }).where(eq(episodes.id, episodeId));
+    } else {
+      await db.update(projects).set({ outline, updatedAt: new Date() }).where(eq(projects.id, projectId));
+    }
+    return NextResponse.json({ text: outline });
+  }
+  // === 智能体路由结束 ===
 
   if (!modelConfig?.text) {
     return NextResponse.json(
@@ -429,6 +463,18 @@ async function handleScriptParseStream(
     );
   }
 
+  // === 智能体路由 ===
+  const boundAgent = await findBoundAgent(projectId, "script_parse");
+  if (boundAgent) {
+    const rawText = await callBailianAgent(
+      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+      script,
+    );
+    validateAgentOutput("script_parse", rawText);
+    return NextResponse.json({ text: rawText });
+  }
+  // === 智能体路由结束 ===
+
   if (!modelConfig?.text) {
     return NextResponse.json(
       { error: "No text model configured" },
@@ -488,13 +534,6 @@ async function handleCharacterExtract(
     );
   }
 
-  if (!modelConfig?.text) {
-    return NextResponse.json(
-      { error: "No text model configured" },
-      { status: 400 }
-    );
-  }
-
   // Fetch all existing project characters for dedup
   const existingChars = await db
     .select()
@@ -516,17 +555,30 @@ async function handleCharacterExtract(
     await db.delete(episodeCharacters).where(eq(episodeCharacters.episodeId, episodeId));
   }
 
-  const model = createLanguageModel(modelConfig.text);
-  const charExtractSystem = await resolvePrompt("character_extract", { userId, projectId });
-  console.log("[CharacterExtract] resolved system prompt:\n", charExtractSystem);
+  let aiText: string;
+  const boundAgent = await findBoundAgent(projectId, "character_extract");
+  if (boundAgent) {
+    aiText = await callBailianAgent(
+      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+      buildCharacterExtractPrompt(script),
+    );
+    validateAgentOutput("character_extract", aiText);
+  } else {
+    if (!modelConfig?.text) {
+      return NextResponse.json({ error: "No text model configured" }, { status: 400 });
+    }
+    const model = createLanguageModel(modelConfig.text);
+    const charExtractSystem = await resolvePrompt("character_extract", { userId, projectId });
+    console.log("[CharacterExtract] resolved system prompt:\n", charExtractSystem);
+    const { text } = await generateText({
+      model,
+      system: charExtractSystem,
+      prompt: buildCharacterExtractPrompt(script),
+    });
+    aiText = text;
+  }
 
-  const { text } = await generateText({
-    model,
-    system: charExtractSystem,
-    prompt: buildCharacterExtractPrompt(script),
-  });
-
-  const parsed = JSON.parse(extractJSON(text));
+  const parsed = JSON.parse(extractJSON(aiText));
 
   // Support both formats: new { characters, relationships } and legacy array
   const extracted: Array<{
@@ -821,6 +873,20 @@ async function handleShotSplitStream(
     script = project.script ?? null;
     generationMode = project.generationMode ?? "keyframe";
   }
+
+  // === 智能体路由 ===
+  if (script) {
+    const boundAgent = await findBoundAgent(projectId, "shot_split");
+    if (boundAgent) {
+      const rawText = await callBailianAgent(
+        { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+        script,
+      );
+      validateAgentOutput("shot_split", rawText);
+      return NextResponse.json({ text: rawText });
+    }
+  }
+  // === 智能体路由结束 ===
 
   if (!modelConfig?.text) {
     return NextResponse.json(
