@@ -2,9 +2,10 @@
 
 import { DefaultModelPicker } from "@/components/settings/default-model-picker";
 import { ProviderSection } from "@/components/settings/provider-section";
+import { AgentSection } from "@/components/settings/agent-section";
 import { useTranslations } from "next-intl";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, Wand2 } from "lucide-react";
+import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, Wand2, Bot } from "lucide-react";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import Link from "next/link";
 
@@ -59,6 +60,9 @@ export default function SettingsPage() {
               <div className="text-xs text-[--text-muted]">{t("promptTemplatesDesc")}</div>
             </div>
           </Link>
+
+          {/* Agent Management */}
+          <AgentSection />
 
           {/* Language Models section */}
           <ProviderSection
