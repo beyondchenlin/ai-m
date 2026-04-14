@@ -296,7 +296,21 @@
     "imageModels": "Image Models",
     "videoModels": "Video Models",
     "promptTemplates": "Prompt Templates",
-    "promptTemplatesDesc": "Customize AI generation prompt templates"
+    "promptTemplatesDesc": "Customize AI generation prompt templates",
+    "agents": "Agents",
+    "addAgent": "Add Agent",
+    "agentName": "Name",
+    "agentNamePlaceholder": "e.g. Character Analyst",
+    "agentCategory": "Category",
+    "agentCategory_scriptOutline": "Story Outline",
+    "agentCategory_scriptParse": "Script Parse",
+    "agentCategory_characterExtract": "Character Extract",
+    "agentCategory_shotSplit": "Shot Split",
+    "agentAppId": "App ID",
+    "agentDescription": "Description",
+    "agentDescriptionPlaceholder": "Optional: describe the agent",
+    "noAgents": "No agents yet. Click the button above to add one.",
+    "defaultAgent": "Default"
   },
   "promptTemplates": {
     "title": "Prompt Templates",

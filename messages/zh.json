@@ -298,7 +298,21 @@
     "imageModels": "图片模型",
     "videoModels": "视频模型",
     "promptTemplates": "提示词管理",
-    "promptTemplatesDesc": "自定义 AI 生成提示词模板"
+    "promptTemplatesDesc": "自定义 AI 生成提示词模板",
+    "agents": "智能体",
+    "addAgent": "添加智能体",
+    "agentName": "名称",
+    "agentNamePlaceholder": "例：角色分析大师",
+    "agentCategory": "分类",
+    "agentCategory_scriptOutline": "故事大纲",
+    "agentCategory_scriptParse": "剧本解析",
+    "agentCategory_characterExtract": "角色提取",
+    "agentCategory_shotSplit": "分镜拆分",
+    "agentAppId": "应用 ID",
+    "agentDescription": "描述",
+    "agentDescriptionPlaceholder": "可选：描述智能体用途",
+    "noAgents": "暂无智能体，点击上方按钮添加",
+    "defaultAgent": "默认"
   },
   "promptTemplates": {
     "title": "提示词管理",

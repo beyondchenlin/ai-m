@@ -296,7 +296,21 @@
     "imageModels": "画像モデル",
     "videoModels": "動画モデル",
     "promptTemplates": "プロンプト管理",
-    "promptTemplatesDesc": "AI 生成プロンプトテンプレートをカスタマイズ"
+    "promptTemplatesDesc": "AI 生成プロンプトテンプレートをカスタマイズ",
+    "agents": "Agents",
+    "addAgent": "Add Agent",
+    "agentName": "Name",
+    "agentNamePlaceholder": "e.g. Character Analyst",
+    "agentCategory": "Category",
+    "agentCategory_scriptOutline": "Story Outline",
+    "agentCategory_scriptParse": "Script Parse",
+    "agentCategory_characterExtract": "Character Extract",
+    "agentCategory_shotSplit": "Shot Split",
+    "agentAppId": "App ID",
+    "agentDescription": "Description",
+    "agentDescriptionPlaceholder": "Optional: describe the agent",
+    "noAgents": "No agents yet. Click the button above to add one.",
+    "defaultAgent": "Default"
   },
   "promptTemplates": {
     "title": "プロンプト管理",
