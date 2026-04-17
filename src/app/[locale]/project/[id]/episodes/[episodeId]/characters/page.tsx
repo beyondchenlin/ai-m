@@ -12,6 +12,7 @@ import { InlineModelPicker } from "@/components/editor/model-selector";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelGuard } from "@/hooks/use-model-guard";
 import { PromptEditButton } from "@/components/prompt-templates/prompt-edit-button";
+import { AgentPicker } from "@/components/agent-picker";
 import { toast } from "sonner";
 
 export default function EpisodeCharactersPage() {
@@ -105,6 +106,7 @@ export default function EpisodeCharactersPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <AgentPicker projectId={project.id} category="character_extract" />
           <InlineModelPicker capability="text" />
           <Button
             onClick={handleExtractCharacters}

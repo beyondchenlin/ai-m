@@ -18,6 +18,7 @@ export async function POST(request: Request) {
   const userId = getUserIdFromRequest(request);
   const body = (await request.json()) as {
     name: string;
+    platform?: string;
     category: string;
     appId: string;
     apiKey: string;
@@ -28,7 +29,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
 
-  const validCategories = ["script_outline", "script_parse", "character_extract", "shot_split"];
+  const validCategories = ["script_outline", "script_generate", "script_parse", "character_extract", "shot_split", "keyframe_prompts", "video_prompts", "ref_image_prompts", "ref_video_prompts"];
   if (!validCategories.includes(body.category)) {
     return NextResponse.json({ error: "Invalid category" }, { status: 400 });
   }
@@ -39,6 +40,7 @@ export async function POST(request: Request) {
     id,
     userId,
     name: body.name,
+    platform: (body.platform || "bailian") as typeof agents.$inferInsert.platform,
     category: body.category as typeof agents.$inferInsert.category,
     appId: body.appId,
     apiKey: body.apiKey,

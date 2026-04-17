@@ -4,7 +4,29 @@ import { createLanguageModel, extractJSON } from "@/lib/ai/ai-sdk";
 import type { ProviderConfig } from "@/lib/ai/ai-sdk";
 import { db } from "@/lib/db";
 import { projects, episodes, characters, shots, dialogues, storyboardVersions, episodeCharacters, characterRelations, agentBindings, agents } from "@/lib/db/schema";
-import { callBailianAgent, validateAgentOutput, type AgentCategory } from "@/lib/ai/bailian-agent";
+import { callAgent, callAgentStream, validateAgentOutput, type AgentCategory } from "@/lib/ai/agent-caller";
+
+/** Wrap agent call + validation, returning user-friendly error response on failure */
+async function callAndValidateAgent(
+  agent: { platform: string; appId: string; apiKey: string },
+  category: AgentCategory,
+  prompt: string,
+): Promise<{ text: string } | NextResponse> {
+  try {
+    const rawText = await callAgent(
+      { platform: agent.platform as "bailian" | "dify" | "coze", appId: agent.appId, apiKey: agent.apiKey },
+      prompt,
+    );
+    if (category !== "keyframe_prompts" && category !== "video_prompts") {
+      validateAgentOutput(category, rawText);
+    }
+    return { text: rawText };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[Agent ${category}] Error:`, message);
+    return NextResponse.json({ error: message }, { status: 422 });
+  }
+}
 import { eq, asc, and, lt, gt, desc, or, isNull, inArray } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 import path from "path";
@@ -138,8 +160,12 @@ async function findBoundAgent(projectId: string, category: AgentCategory) {
         eq(agentBindings.category, category),
       ),
     );
-  if (!binding?.agentId) return null;
+  if (!binding?.agentId) {
+    console.log(`[findBoundAgent] ${category}: no binding for project ${projectId}`);
+    return null;
+  }
   const [agent] = await db.select().from(agents).where(eq(agents.id, binding.agentId));
+  console.log(`[findBoundAgent] ${category}: found agent "${agent?.name}" (platform=${agent?.platform}, appId=${agent?.appId?.slice(0, 10)}...)`);
   return agent ?? null;
 }
 
@@ -167,6 +193,7 @@ export async function POST(
   };
 
   const { action, payload, modelConfig, episodeId } = body;
+  console.log(`[Generate] action=${action}, projectId=${projectId}, episodeId=${episodeId || "none"}`);
 
   if (action === "script_outline") {
     return handleScriptOutlineAction(projectId, userId, payload, modelConfig, episodeId);
@@ -293,21 +320,45 @@ async function handleScriptOutlineAction(
     return NextResponse.json({ error: "No idea provided" }, { status: 400 });
   }
 
-  // === 智能体路由 ===
+  // === 智能体路由（流式）===
   const boundAgent = await findBoundAgent(projectId, "script_outline");
   if (boundAgent) {
-    const rawText = await callBailianAgent(
-      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
-      `创意构想：${idea}`,
-    );
-    const result = validateAgentOutput("script_outline", rawText) as { outline: string };
-    const outline = result.outline;
-    if (episodeId) {
-      await db.update(episodes).set({ outline, updatedAt: new Date() }).where(eq(episodes.id, episodeId));
-    } else {
-      await db.update(projects).set({ outline, updatedAt: new Date() }).where(eq(projects.id, projectId));
+    try {
+      const agentStream = await callAgentStream(
+        { platform: boundAgent.platform as "bailian" | "dify" | "coze", appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+        `创意构想：${idea}`,
+      );
+      // TransformStream: accumulate chunks, save to DB in flush (tied to response lifecycle)
+      const decoder = new TextDecoder();
+      let outlineBuf = "";
+      const saveTransform = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          outlineBuf += decoder.decode(chunk, { stream: true });
+          controller.enqueue(chunk);
+        },
+        async flush() {
+          const outline = outlineBuf.trim();
+          if (!outline) return;
+          try {
+            if (episodeId) {
+              await db.update(episodes).set({ outline, updatedAt: new Date() }).where(eq(episodes.id, episodeId));
+            } else {
+              await db.update(projects).set({ outline, updatedAt: new Date() }).where(eq(projects.id, projectId));
+            }
+            console.log(`[ScriptOutline Agent] Saved outline (${outline.length} chars)`);
+          } catch (err) {
+            console.error(`[ScriptOutline Agent] DB save failed:`, err);
+          }
+        },
+      });
+      return new Response(agentStream.pipeThrough(saveTransform), {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Transfer-Encoding": "chunked" },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[Agent script_outline] Error:`, message);
+      return NextResponse.json({ error: message }, { status: 422 });
     }
-    return NextResponse.json({ text: outline });
   }
   // === 智能体路由结束 ===
 
@@ -364,13 +415,6 @@ async function handleScriptGenerate(
     return NextResponse.json({ error: "No idea provided" }, { status: 400 });
   }
 
-  if (!modelConfig?.text) {
-    return NextResponse.json(
-      { error: "No text model configured" },
-      { status: 400 }
-    );
-  }
-
   // Save the original idea before generating
   if (episodeId) {
     await db
@@ -382,6 +426,58 @@ async function handleScriptGenerate(
       .update(projects)
       .set({ idea, updatedAt: new Date() })
       .where(eq(projects.id, projectId));
+  }
+
+  // === 智能体路由（流式）===
+  const sgBoundAgent = await findBoundAgent(projectId, "script_generate");
+  if (sgBoundAgent) {
+    try {
+      const outline = (payload?.outline as string) || "";
+      const agentPrompt = outline
+        ? `创意构想：${idea}\n\n故事大纲：${outline}`
+        : `创意构想：${idea}`;
+      const agentStream = await callAgentStream(
+        { platform: sgBoundAgent.platform as "bailian" | "dify" | "coze", appId: sgBoundAgent.appId, apiKey: sgBoundAgent.apiKey },
+        agentPrompt,
+      );
+      const sgDecoder = new TextDecoder();
+      let scriptBuf = "";
+      const sgSaveTransform = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          scriptBuf += sgDecoder.decode(chunk, { stream: true });
+          controller.enqueue(chunk);
+        },
+        async flush() {
+          const script = scriptBuf.trim();
+          if (!script) return;
+          try {
+            if (episodeId) {
+              await db.update(episodes).set({ script, updatedAt: new Date() }).where(eq(episodes.id, episodeId));
+            } else {
+              await db.update(projects).set({ script, updatedAt: new Date() }).where(eq(projects.id, projectId));
+            }
+            console.log(`[ScriptGenerate Agent] Saved script (${script.length} chars)`);
+          } catch (err) {
+            console.error(`[ScriptGenerate Agent] DB save failed:`, err);
+          }
+        },
+      });
+      return new Response(agentStream.pipeThrough(sgSaveTransform), {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Transfer-Encoding": "chunked" },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[Agent script_generate] Error:`, message);
+      return NextResponse.json({ error: message }, { status: 422 });
+    }
+  }
+  // === 智能体路由结束 ===
+
+  if (!modelConfig?.text) {
+    return NextResponse.json(
+      { error: "No text model configured" },
+      { status: 400 }
+    );
   }
 
   // Use outline from payload (latest from UI) or fallback to DB
@@ -463,15 +559,37 @@ async function handleScriptParseStream(
     );
   }
 
-  // === 智能体路由 ===
+    // === 智能体路由（流式）===
   const boundAgent = await findBoundAgent(projectId, "script_parse");
   if (boundAgent) {
-    const rawText = await callBailianAgent(
-      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
-      script,
-    );
-    validateAgentOutput("script_parse", rawText);
-    return NextResponse.json({ text: rawText });
+    try {
+      const agentStream = await callAgentStream(
+        { platform: boundAgent.platform as "bailian" | "dify" | "coze", appId: boundAgent.appId, apiKey: boundAgent.apiKey },
+        script,
+      );
+      const spSaveTransform = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) { controller.enqueue(chunk); },
+        async flush() {
+          try {
+            if (episodeId) {
+              await db.update(episodes).set({ updatedAt: new Date() }).where(eq(episodes.id, episodeId));
+            } else {
+              await db.update(projects).set({ updatedAt: new Date() }).where(eq(projects.id, projectId));
+            }
+            console.log(`[ScriptParse Agent] Updated timestamp`);
+          } catch (err) {
+            console.error(`[ScriptParse Agent] DB update failed:`, err);
+          }
+        },
+      });
+      return new Response(agentStream.pipeThrough(spSaveTransform), {
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Transfer-Encoding": "chunked" },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[Agent script_parse] Error:`, message);
+      return NextResponse.json({ error: message }, { status: 422 });
+    }
   }
   // === 智能体路由结束 ===
 
@@ -558,11 +676,9 @@ async function handleCharacterExtract(
   let aiText: string;
   const boundAgent = await findBoundAgent(projectId, "character_extract");
   if (boundAgent) {
-    aiText = await callBailianAgent(
-      { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
-      buildCharacterExtractPrompt(script),
-    );
-    validateAgentOutput("character_extract", aiText);
+    const agentResult = await callAndValidateAgent(boundAgent, "character_extract", buildCharacterExtractPrompt(script));
+    if (agentResult instanceof NextResponse) return agentResult;
+    aiText = agentResult.text;
   } else {
     if (!modelConfig?.text) {
       return NextResponse.json({ error: "No text model configured" }, { status: 400 });
@@ -875,15 +991,94 @@ async function handleShotSplitStream(
   }
 
   // === 智能体路由 ===
-  if (script) {
+  console.log(`[ShotSplit] projectId=${projectId}, episodeId=${episodeId}, script length=${script?.length ?? 0}`);
+  {
     const boundAgent = await findBoundAgent(projectId, "shot_split");
     if (boundAgent) {
-      const rawText = await callBailianAgent(
-        { appId: boundAgent.appId, apiKey: boundAgent.apiKey },
-        script,
-      );
-      validateAgentOutput("shot_split", rawText);
-      return NextResponse.json({ text: rawText });
+      if (!script) {
+        // Agent 模式下也需要剧本 — 尝试从 episode 或 project 重新获取
+        if (episodeId) {
+          const [ep] = await db.select().from(episodes).where(eq(episodes.id, episodeId));
+          script = ep?.script ?? null;
+        }
+        if (!script) {
+          const [proj] = await db.select().from(projects).where(eq(projects.id, projectId));
+          script = proj?.script ?? null;
+        }
+        if (!script) {
+          return NextResponse.json({ error: "没有剧本内容，请先编写或生成剧本" }, { status: 400 });
+        }
+      }
+      const agentResult = await callAndValidateAgent(boundAgent, "shot_split", script);
+      if (agentResult instanceof NextResponse) return agentResult;
+
+      // Parse agent output and save to DB (same logic as built-in pipeline)
+      const agentParsed = JSON.parse(extractJSON(agentResult.text));
+      let agentShots: ParsedShot[];
+      if (Array.isArray(agentParsed) && agentParsed.length > 0 && agentParsed[0].shots) {
+        agentShots = agentParsed.flatMap((scene: { sceneDescription?: string; shots?: ParsedShot[] }) =>
+          (scene.shots || []).map((s) => ({ ...s, sceneDescription: s.sceneDescription || scene.sceneDescription || "" }))
+        );
+      } else if (Array.isArray(agentParsed)) {
+        agentShots = agentParsed;
+      } else {
+        agentShots = agentParsed.shots || [];
+      }
+      agentShots.forEach((s, i) => { s.sequence = i + 1; });
+
+      if (agentShots.length === 0) {
+        return NextResponse.json({ error: "智能体未返回有效分镜数据" }, { status: 422 });
+      }
+
+      // Fetch characters for dialogue matching
+      const agentCharacters = await getEpisodeCharacters(projectId, episodeId);
+
+      // Create version
+      const agentVerWhere = episodeId
+        ? and(eq(storyboardVersions.projectId, projectId), eq(storyboardVersions.episodeId, episodeId))
+        : eq(storyboardVersions.projectId, projectId);
+      const [agentMaxVer] = await db.select({ maxNum: storyboardVersions.versionNum })
+        .from(storyboardVersions).where(agentVerWhere).orderBy(desc(storyboardVersions.versionNum)).limit(1);
+      const agentNextVer = (agentMaxVer?.maxNum ?? 0) + 1;
+      const agentDate = new Date();
+      const agentDateStr = agentDate.getUTCFullYear().toString() +
+        String(agentDate.getUTCMonth() + 1).padStart(2, "0") +
+        String(agentDate.getUTCDate()).padStart(2, "0");
+      const agentVersionId = genId();
+      await db.insert(storyboardVersions).values({
+        id: agentVersionId, projectId, label: `${agentDateStr}-V${agentNextVer}`,
+        versionNum: agentNextVer, createdAt: agentDate, episodeId: episodeId ?? null,
+      });
+
+      for (const shot of agentShots) {
+        const shotId = genId();
+        await db.insert(shots).values({
+          id: shotId, projectId, versionId: agentVersionId,
+          sequence: shot.sequence,
+          prompt: shot.startFrame || shot.sceneDescription || "",
+          motionScript: shot.motionScript || "",
+          videoScript: shot.videoScript ?? null,
+          cameraDirection: shot.cameraDirection || "static",
+          duration: shot.duration || 8,
+          transitionIn: shot.transitionIn || "cut",
+          transitionOut: shot.transitionOut || "cut",
+          compositionGuide: shot.compositionGuide || "",
+          focalPoint: shot.focalPoint || "",
+          depthOfField: shot.depthOfField || "medium",
+          soundDesign: shot.soundDesign || "",
+          musicCue: shot.musicCue || "",
+          episodeId: episodeId ?? null,
+        });
+        for (let i = 0; i < (shot.dialogues || []).length; i++) {
+          const d = shot.dialogues[i];
+          const mc = agentCharacters.find((c) => c.name === d.character);
+          if (mc) {
+            await db.insert(dialogues).values({ id: genId(), shotId, characterId: mc.id, text: d.text, sequence: i });
+          }
+        }
+      }
+      console.log(`[ShotSplit Agent] Created ${agentShots.length} shots`);
+      return NextResponse.json({ shots: agentShots.length });
     }
   }
   // === 智能体路由结束 ===
@@ -2703,6 +2898,63 @@ async function handleBatchVideoPrompt(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
+  // === 智能体路由 ===
+  // Check generation mode to decide which agent category to use
+  const vpModeSource = episodeId
+    ? await db.select({ mode: episodes.generationMode }).from(episodes).where(eq(episodes.id, episodeId))
+    : await db.select({ mode: projects.generationMode }).from(projects).where(eq(projects.id, projectId));
+  const vpCategory: AgentCategory = vpModeSource[0]?.mode === "reference" ? "ref_video_prompts" : "video_prompts";
+  const vpBoundAgent = await findBoundAgent(projectId, vpCategory);
+  if (vpBoundAgent) {
+    // Build prompt from shots data (same info as built-in pipeline)
+    const vpVersionId = payload?.versionId as string | undefined;
+    const vpWhereConds = [eq(shots.projectId, projectId)];
+    if (vpVersionId) vpWhereConds.push(eq(shots.versionId, vpVersionId));
+    if (episodeId) vpWhereConds.push(eq(shots.episodeId, episodeId));
+    const vpAgentShots = await db.select().from(shots).where(and(...vpWhereConds)).orderBy(asc(shots.sequence));
+    if (vpAgentShots.length === 0) {
+      return NextResponse.json({ error: "没有分镜数据，请先生成分镜" }, { status: 400 });
+    }
+    const vpAgentChars = await getEpisodeCharacters(projectId, episodeId);
+    const vpPrompt = JSON.stringify({
+      shots: vpAgentShots.map((s) => ({
+        sequence: s.sequence,
+        sceneDescription: s.prompt,
+        motionScript: s.motionScript,
+        videoScript: s.videoScript,
+        cameraDirection: s.cameraDirection,
+        duration: s.duration,
+      })),
+      characters: vpAgentChars.map((c) => ({ name: c.name, visualHint: c.visualHint })),
+    }, null, 2);
+
+    const agentResult = await callAndValidateAgent(vpBoundAgent, "video_prompts", vpPrompt);
+    if (agentResult instanceof NextResponse) return agentResult;
+
+    // Parse agent output and save videoPrompt to each shot
+    try {
+      const vpParsed = JSON.parse(extractJSON(agentResult.text)) as Array<Record<string, unknown>>;
+
+      let updatedCount = 0;
+      for (const entry of vpParsed) {
+        const seq = (entry.sequence as number) ?? (entry.shotSequence as number);
+        const shot = vpAgentShots.find((s) => s.sequence === seq);
+        if (!shot) continue;
+        const videoPrompt = (entry.videoPrompt || entry.prompt || "") as string;
+        if (videoPrompt) {
+          await db.update(shots).set({ videoPrompt: `Duration: ${shot.duration || 8}s.\n\n${videoPrompt.trim()}` }).where(eq(shots.id, shot.id));
+          updatedCount++;
+        }
+      }
+      console.log(`[VideoPrompts Agent] Updated ${updatedCount} shots`);
+      return NextResponse.json({ results: vpParsed.map((e) => ({ shotId: e.sequence, status: "ok" })), status: "ok" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return NextResponse.json({ error: `智能体视频提示词解析失败: ${msg}` }, { status: 422 });
+    }
+  }
+  // === 智能体路由结束 ===
+
   const batchVersionId = payload?.versionId as string | undefined;
 
   const shotWhereConditions = [eq(shots.projectId, projectId)];
@@ -3041,6 +3293,76 @@ async function handleGenerateRefPrompts(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
+  // === 智能体路由 ===
+  const refBoundAgent = await findBoundAgent(projectId, "ref_image_prompts");
+  if (refBoundAgent) {
+    const refVersionId = payload?.versionId as string | undefined;
+    const refWhereConds = [eq(shots.projectId, projectId)];
+    if (refVersionId) refWhereConds.push(eq(shots.versionId, refVersionId));
+    if (episodeId) refWhereConds.push(eq(shots.episodeId, episodeId));
+    const refAgentShots = await db.select().from(shots).where(and(...refWhereConds)).orderBy(asc(shots.sequence));
+    if (refAgentShots.length === 0) {
+      return NextResponse.json({ error: "没有分镜数据，请先生成分镜" }, { status: 400 });
+    }
+    const refAgentChars = await getEpisodeCharacters(projectId, episodeId);
+    const refPrompt = JSON.stringify({
+      shots: refAgentShots.map((s) => ({
+        sequence: s.sequence,
+        sceneDescription: s.prompt,
+        motionScript: s.motionScript,
+        cameraDirection: s.cameraDirection,
+        duration: s.duration,
+      })),
+      characters: refAgentChars.map((c) => ({ name: c.name, description: c.description, visualHint: c.visualHint })),
+    }, null, 2);
+
+    const agentResult = await callAndValidateAgent(refBoundAgent, "ref_image_prompts", refPrompt);
+    if (agentResult instanceof NextResponse) return agentResult;
+
+    try {
+      const refParsed = JSON.parse(extractJSON(agentResult.text)) as Array<Record<string, unknown>>;
+      if (!Array.isArray(refParsed)) {
+        return NextResponse.json({ error: "智能体必须返回 JSON 数组格式的参考图提示词" }, { status: 422 });
+      }
+
+      let savedCount = 0;
+      console.log(`[RefImagePrompts Agent] Parsed ${refParsed.length} entries, keys: ${refParsed[0] ? Object.keys(refParsed[0]).join(",") : "empty"}`);
+      for (const entry of refParsed) {
+        const seq = (entry.sequence as number) ?? (entry.shotSequence as number) ?? 0;
+        const shot = refAgentShots.find((s) => s.sequence === seq);
+        if (!shot) { console.log(`[RefImagePrompts Agent] No shot found for seq=${seq}`); continue; }
+
+        const scenes = (entry.scenes || entry.prompts || []) as Array<Record<string, unknown>>;
+        const chars = Array.isArray(entry.characters) ? entry.characters as string[] : [];
+        console.log(`[RefImagePrompts Agent] seq=${seq}, scenes=${scenes.length}, chars=${chars.length}`);
+
+        for (let i = 0; i < scenes.length; i++) {
+          const scene = scenes[i];
+          const prompt = (scene.prompt || scene as unknown as string || "") as string;
+          const name = (scene.name || `scene_${i}`) as string;
+          if (prompt && typeof prompt === "string") {
+            await insertAssetVersion({
+              shotId: shot.id,
+              type: "reference",
+              sequenceInType: i,
+              prompt,
+              status: "pending",
+              characters: chars,
+              meta: { sceneName: name },
+            });
+            savedCount++;
+          }
+        }
+      }
+      console.log(`[RefImagePrompts Agent] Saved ${savedCount} reference prompts`);
+      return NextResponse.json({ updatedCount: refParsed.length, totalShots: refAgentShots.length });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return NextResponse.json({ error: `智能体参考图提示词解析失败: ${msg}` }, { status: 422 });
+    }
+  }
+  // === 智能体路由结束 ===
+
   if (!modelConfig?.text) {
     return NextResponse.json({ error: "No text model configured" }, { status: 400 });
   }
@@ -3341,6 +3663,68 @@ async function handleGenerateKeyframePrompts(
   modelConfig?: ModelConfig,
   episodeId?: string
 ) {
+  // === 智能体路由 ===
+  const kpBoundAgent = await findBoundAgent(projectId, "keyframe_prompts");
+  if (kpBoundAgent) {
+    // Build prompt from shots data (same info as built-in pipeline)
+    const batchVersionId = payload?.versionId as string | undefined;
+    const kpWhereConds = [eq(shots.projectId, projectId)];
+    if (batchVersionId) kpWhereConds.push(eq(shots.versionId, batchVersionId));
+    if (episodeId) kpWhereConds.push(eq(shots.episodeId, episodeId));
+    const kpAgentShots = await db.select().from(shots).where(and(...kpWhereConds)).orderBy(asc(shots.sequence));
+    if (kpAgentShots.length === 0) {
+      return NextResponse.json({ error: "没有分镜数据，请先生成分镜" }, { status: 400 });
+    }
+    const kpAgentChars = await getEpisodeCharacters(projectId, episodeId);
+    const kpPrompt = JSON.stringify({
+      shots: kpAgentShots.map((s) => ({
+        sequence: s.sequence,
+        sceneDescription: s.prompt,
+        motionScript: s.motionScript,
+        cameraDirection: s.cameraDirection,
+        duration: s.duration,
+      })),
+      characters: kpAgentChars.map((c) => ({ name: c.name, description: c.description, visualHint: c.visualHint })),
+    }, null, 2);
+
+    const agentResult = await callAndValidateAgent(kpBoundAgent, "keyframe_prompts", kpPrompt);
+    if (agentResult instanceof NextResponse) return agentResult;
+
+    // Parse agent output — must be JSON array
+    try {
+      const kpParsed = JSON.parse(extractJSON(agentResult.text)) as Array<Record<string, unknown>>;
+      if (!Array.isArray(kpParsed)) {
+        return NextResponse.json({ error: "智能体必须返回 JSON 数组格式的首尾帧提示词" }, { status: 422 });
+      }
+
+      let savedCount = 0;
+      for (const entry of kpParsed) {
+        const seq = (entry.sequence as number) ?? (entry.shotSequence as number) ?? 0;
+        const shot = kpAgentShots.find((s) => s.sequence === seq);
+        if (!shot) continue;
+
+        const startFrame = (entry.startFrame || (entry.prompts as string[])?.[0] || "") as string;
+        const endFrame = (entry.endFrame || (entry.prompts as string[])?.[1] || "") as string;
+        const chars = Array.isArray(entry.characters) ? entry.characters as string[] : [];
+
+        if (startFrame) {
+          await insertAssetVersion({ shotId: shot.id, type: "first_frame", sequenceInType: 0, prompt: startFrame, status: "pending", characters: chars });
+          savedCount++;
+        }
+        if (endFrame) {
+          await insertAssetVersion({ shotId: shot.id, type: "last_frame", sequenceInType: 0, prompt: endFrame, status: "pending", characters: chars });
+          savedCount++;
+        }
+      }
+      console.log(`[KeyframePrompts Agent] Saved ${savedCount} assets from ${kpParsed.length} shots`);
+      return NextResponse.json({ updatedCount: kpParsed.length, totalShots: kpAgentShots.length });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return NextResponse.json({ error: `智能体首尾帧提示词解析失败: ${msg}` }, { status: 422 });
+    }
+  }
+  // === 智能体路由结束 ===
+
   if (!modelConfig?.text) {
     return NextResponse.json({ error: "No text model configured" }, { status: 400 });
   }

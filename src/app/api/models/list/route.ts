@@ -105,6 +105,20 @@ export async function POST(request: Request) {
       });
     }
 
+    if (body.protocol === "dashscope") {
+      return NextResponse.json({
+        models: [
+          { id: "wan2.7-image-pro", name: "Wan 2.7 Image Pro (4K)" },
+          { id: "wan2.7-image", name: "Wan 2.7 Image" },
+          { id: "qwen-image-2.0-pro", name: "Qwen Image 2.0 Pro" },
+          { id: "qwen-image-2.0", name: "Qwen Image 2.0" },
+          { id: "qwen-image-max", name: "Qwen Image Max" },
+          { id: "qwen-image-plus", name: "Qwen Image Plus" },
+          { id: "z-image-turbo", name: "Z-Image Turbo" },
+        ],
+      });
+    }
+
     if (!body.baseUrl) {
       return NextResponse.json({ error: "Base URL is required" }, { status: 400 });
     }

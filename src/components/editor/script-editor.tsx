@@ -8,6 +8,7 @@ import { useModelStore } from "@/stores/model-store";
 import { useTranslations } from "next-intl";
 import { Sparkles, Loader2, FileText, Lightbulb, ListOrdered } from "lucide-react";
 import { InlineModelPicker } from "@/components/editor/model-selector";
+import { AgentPicker } from "@/components/agent-picker";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelGuard } from "@/hooks/use-model-guard";
 import { PromptEditButton } from "@/components/prompt-templates/prompt-edit-button";
@@ -285,18 +286,21 @@ export function ScriptEditor() {
                 {t("project.outline")}
               </span>
             </div>
-            <Button
-              size="sm"
-              onClick={handleGenerateOutline}
-              disabled={generatingOutline || generating || !project.idea?.trim()}
-            >
-              {generatingOutline ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" />
-              )}
-              {generatingOutline ? t("common.generating") : t("project.generateOutline")}
-            </Button>
+            <div className="flex items-center gap-2">
+              <AgentPicker projectId={project.id} category="script_outline" />
+              <Button
+                size="sm"
+                onClick={handleGenerateOutline}
+                disabled={generatingOutline || generating || !project.idea?.trim()}
+              >
+                {generatingOutline ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5" />
+                )}
+                {generatingOutline ? t("common.generating") : t("project.generateOutline")}
+              </Button>
+            </div>
           </div>
 
           <Textarea
@@ -320,18 +324,21 @@ export function ScriptEditor() {
                 {t("project.generatedScript")}
               </span>
             </div>
-            <Button
-              size="sm"
-              onClick={handleGenerateScript}
-              disabled={generating || generatingOutline || !project.idea?.trim()}
-            >
-              {generating ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" />
-              )}
-              {generating ? t("common.generating") : t("project.generateScript")}
-            </Button>
+            <div className="flex items-center gap-2">
+              <AgentPicker projectId={project.id} category="script_generate" />
+              <Button
+                size="sm"
+                onClick={handleGenerateScript}
+                disabled={generating || generatingOutline || !project.idea?.trim()}
+              >
+                {generating ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5" />
+                )}
+                {generating ? t("common.generating") : t("project.generateScript")}
+              </Button>
+            </div>
           </div>
           {project.script ? (
             <Textarea

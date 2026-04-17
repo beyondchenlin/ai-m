@@ -20,6 +20,7 @@ const DEFAULT_BASE_URLS: Record<Protocol, string> = {
   "ucloud-seedance": "https://api.modelverse.cn",
   kling: "https://api.klingai.com",
   wan: "https://dashscope.aliyuncs.com/api/v1",
+  dashscope: "https://dashscope.aliyuncs.com/api/v1",
 };
 
 function getProtocolOptions(capability: Capability): { value: Protocol; label: string }[] {
@@ -34,6 +35,7 @@ function getProtocolOptions(capability: Capability): { value: Protocol; label: s
       { value: "openai", label: "OpenAI" },
       { value: "gemini", label: "Gemini" },
       { value: "kling", label: "Kling" },
+      { value: "dashscope", label: "百炼 (图片)" },
     ];
   }
   // video
@@ -42,7 +44,7 @@ function getProtocolOptions(capability: Capability): { value: Protocol; label: s
     { value: "ucloud-seedance", label: "Seedance (UCloud)" },
     { value: "gemini", label: "Gemini (Veo)" },
     { value: "kling", label: "Kling" },
-    { value: "wan", label: "Wan (通义万相)" },
+    { value: "wan", label: "百炼 (视频)" },
   ];
 }
 

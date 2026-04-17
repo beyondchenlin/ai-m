@@ -6,6 +6,7 @@ import { KlingImageProvider } from "./providers/kling-image";
 import { KlingVideoProvider } from "./providers/kling-video";
 import { WanVideoProvider } from "./providers/wan-video";
 import { UCloudSeedanceProvider } from "./providers/ucloud-seedance";
+import { DashScopeImageProvider } from "./providers/dashscope-image";
 import { getAIProvider, getVideoProvider } from "./index";
 import type { AIProvider, VideoProvider } from "./types";
 
@@ -43,6 +44,13 @@ export function createAIProvider(config: ProviderConfig, uploadDir?: string): AI
       return new KlingImageProvider({
         apiKey: config.apiKey,
         secretKey: config.secretKey,
+        baseUrl: config.baseUrl,
+        model: config.modelId,
+        ...(uploadDir && { uploadDir }),
+      });
+    case "dashscope":
+      return new DashScopeImageProvider({
+        apiKey: config.apiKey,
         baseUrl: config.baseUrl,
         model: config.modelId,
         ...(uploadDir && { uploadDir }),

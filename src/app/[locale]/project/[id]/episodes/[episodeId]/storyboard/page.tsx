@@ -45,6 +45,7 @@ import { CharactersInlinePanel } from "@/components/editor/characters-inline-pan
 import { ShotKanban } from "@/components/editor/shot-kanban";
 import { VersionCompare } from "@/components/editor/version-compare";
 import { PromptEditButton } from "@/components/prompt-templates/prompt-edit-button";
+import { AgentPicker } from "@/components/agent-picker";
 import Link from "next/link";
 
 export default function EpisodeStoryboardPage() {
@@ -62,8 +63,8 @@ export default function EpisodeStoryboardPage() {
   const [generatingFramesOverwrite, setGeneratingFramesOverwrite] = useState(false);
   const [generatingVideosOverwrite, setGeneratingVideosOverwrite] = useState(false);
   const [videoRatio, setVideoRatio] = useState("16:9");
-  const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
-  const [versions, setVersions] = useState<StoryboardVersion[]>([]);
+  const versions = project?.versions ?? [];
+  const [_selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
   const [openDrawerShotId, setOpenDrawerShotId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"list" | "kanban">("list");
   const [versionDropdownOpen, setVersionDropdownOpen] = useState(false);
@@ -104,16 +105,10 @@ export default function EpisodeStoryboardPage() {
     if (stored === "list" || stored === "kanban") setViewMode(stored);
   }, [project?.id]);
 
-  useEffect(() => {
-    if (!project?.versions) return;
-    setVersions(project.versions);
-    setSelectedVersionId((current) => {
-      if (current === null && project.versions!.length > 0) {
-        return project.versions![0].id;
-      }
-      return current;
-    });
-  }, [project?.versions]);
+  // Derived: if user's selection is valid keep it, otherwise fall back to latest
+  const selectedVersionId = (_selectedVersionId && versions.some((v) => v.id === _selectedVersionId))
+    ? _selectedVersionId
+    : (versions[0]?.id ?? null);
 
   const sceneGroups = useMemo(() => {
     if (!project) return { groups: [], ungrouped: [] };
@@ -227,8 +222,8 @@ export default function EpisodeStoryboardPage() {
     }
 
     setGenerating(false);
-    setSelectedVersionId(null);
     await fetchProject(project.id, useProjectStore.getState().currentEpisodeId!);
+    setSelectedVersionId(null); // derived value will auto-select latest
   }
 
   async function handleBatchGenerateFrames(overwrite = false) {
@@ -381,7 +376,7 @@ export default function EpisodeStoryboardPage() {
       if (!resp.ok) throw new Error("Failed");
       const data = await resp.json();
       toast.success(`已生成 ${data.updatedCount}/${data.totalShots} 个镜头的参考图提示词`);
-      await fetchProject(project.id, currentEpisodeId || undefined);
+      await fetchProject(project.id, currentEpisodeId || undefined, selectedVersionId || undefined);
     } catch (err) {
       toast.error("Failed to generate ref prompts");
       console.error(err);
@@ -412,7 +407,7 @@ export default function EpisodeStoryboardPage() {
       if (!resp.ok) throw new Error("Failed");
       const data = await resp.json();
       toast.success(`已生成 ${data.updatedCount}/${data.totalShots} 个镜头的首尾帧提示词`);
-      await fetchProject(project.id, currentEpisodeId || undefined);
+      await fetchProject(project.id, currentEpisodeId || undefined, selectedVersionId || undefined);
     } catch (err) {
       toast.error("生成首尾帧提示词失败");
       console.error(err);
@@ -760,7 +755,7 @@ export default function EpisodeStoryboardPage() {
                   key={v.id}
                   onClick={() => {
                     setSelectedVersionId(v.id);
-                    fetchProject(project!.id, undefined, v.id);
+                    fetchProject(project!.id, currentEpisodeId || undefined, v.id);
                   }}
                   className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
                     selectedVersionId === v.id
@@ -797,7 +792,7 @@ export default function EpisodeStoryboardPage() {
                           key={v.id}
                           onClick={() => {
                             setSelectedVersionId(v.id);
-                            fetchProject(project!.id, undefined, v.id);
+                            fetchProject(project!.id, currentEpisodeId || undefined, v.id);
                             setVersionDropdownOpen(false);
                           }}
                           className={`w-full px-3 py-2 text-left text-[13px] font-medium transition-colors hover:bg-[--surface] ${
@@ -837,6 +832,7 @@ export default function EpisodeStoryboardPage() {
           {/* Row 1: Generate text / shots */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="w-4 h-4 flex-shrink-0 flex items-center justify-center rounded-full bg-[--surface] text-[10px] font-bold text-[--text-muted]">1</span>
+            <AgentPicker projectId={project.id} category="shot_split" />
             <InlineModelPicker capability="text" />
             <Button
               onClick={handleGenerateShots}
@@ -856,6 +852,7 @@ export default function EpisodeStoryboardPage() {
           {/* Row 2: Frames */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="w-4 h-4 flex-shrink-0 flex items-center justify-center rounded-full bg-[--surface] text-[10px] font-bold text-[--text-muted]">2</span>
+            <AgentPicker projectId={project.id} category={generationMode === "reference" ? "ref_image_prompts" : "keyframe_prompts"} />
             <InlineModelPicker capability="image" />
             {generationMode === "reference" ? (
               <>
@@ -871,7 +868,7 @@ export default function EpisodeStoryboardPage() {
                   size="sm"
                   variant="default"
                   onClick={() => handleBatchGenerateSceneFrames(false)}
-                  disabled={anyGenerating || totalShots === 0 || !hasReferenceImages || shotsWithRefPrompts === 0}
+                  disabled={anyGenerating || totalShots === 0 || shotsWithRefPrompts === 0}
                 >
                   {generatingSceneFrames && !sceneFramesOverwrite ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
                   {generatingSceneFrames && !sceneFramesOverwrite ? t("common.generating") : (t("storyboard.batchGenerateRefImages") || "Batch Generate Ref Images")}
@@ -935,6 +932,7 @@ export default function EpisodeStoryboardPage() {
           {/* Row 3: Video prompts */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="w-4 h-4 flex-shrink-0 flex items-center justify-center rounded-full bg-[--surface] text-[10px] font-bold text-[--text-muted]">3</span>
+            <AgentPicker projectId={project.id} category={generationMode === "reference" ? "ref_video_prompts" : "video_prompts"} />
             <InlineModelPicker capability="text" />
             <Button
               onClick={handleBatchGenerateVideoPrompts}
