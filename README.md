@@ -15,9 +15,6 @@ AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
 
 [v0.2.2 Seedance 2.0 接入 + 参考图模式重构](https://www.bilibili.com/video/BV1v4DZBmEiw/)
 
-添加飞书群：
-
-![飞书群](images/lark-chat.png)
 
 本网站全程由 AI 驱动开发， 开发指南：https://github.com/twwch/vibe-coding
 
