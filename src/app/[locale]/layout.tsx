@@ -51,7 +51,10 @@ export default async function LocaleLayout({
       className={`dark ${playfair.variable} ${karla.variable} ${jetbrains.variable}`}
       suppressHydrationWarning
     >
-      <body className="min-h-screen bg-background font-sans antialiased">
+      <body
+        className="min-h-screen bg-background font-sans antialiased"
+        suppressHydrationWarning
+      >
         <NextIntlClientProvider messages={messages}>
           <FingerprintProvider>{children}</FingerprintProvider>
           <Toaster position="top-center" theme="dark" />
