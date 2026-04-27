@@ -1,12 +1,12 @@
 import createMiddleware from "next-intl/middleware";
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 import { routing } from "./i18n/routing";
 
 const COOKIE_NAME = "ai_comic_uid";
 
 const intlMiddleware = createMiddleware(routing);
 
-export default function middleware(request: NextRequest) {
+export default function proxy(request: NextRequest) {
   const response = intlMiddleware(request);
 
   // Ensure ai_comic_uid cookie exists before any page renders.
