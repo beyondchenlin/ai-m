@@ -9,6 +9,7 @@
  */
 
 import { claimJob, renewJobClaim, releaseJobClaim, scanExpiredClaims, LEASE_CONFIG } from "@/lib/generation/resources/leases";
+import { executeGenerationJob } from "@/lib/generation/worker-executor";
 import { isEnabled, FF } from "@/lib/feature-flags";
 
 // Worker 标识
@@ -86,16 +87,15 @@ async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>
       return;
     }
 
-    // TODO: PR-05 实现实际执行逻辑
-    // 1. 创建 generationAttempts 记录
-    // 2. 解析 executionSnapshotJson
-    // 3. 根据 adapterKind 调用对应适配器
-    // 4. 收集输出工件
-    // 5. 原子提交工件
-    // 6. 记录 generationEvents
-
-    // 模拟执行（占位）
-    console.log(`[${WORKER_ID}] Processing job ${job.id}...`);
+    // 检查是否启用 ComfyUI 传输
+    if (isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
+      console.log(`[${WORKER_ID}] Executing job ${job.id} via ComfyUI transport...`);
+      const result = await executeGenerationJob(job, WORKER_ID, fencingToken);
+      console.log(`[${WORKER_ID}] Job ${job.id} finished: ${result.finalPhase}`);
+    } else {
+      // 无传输层时的占位处理
+      console.log(`[${WORKER_ID}] ComfyUI transport not enabled, skipping execution for job ${job.id}`);
+    }
 
     // 执行完成后释放
     await releaseJobClaim(job.id, WORKER_ID, fencingToken);
