@@ -24,12 +24,15 @@ import { isEnabled, FF } from "@/lib/feature-flags";
 import { id as genId } from "@/lib/id";
 import { normalizeParameters, type InputParameters } from "./parameter-normalization";
 import { processReferenceImages, type ReferenceImageInput } from "./reference-image-processor";
+import { chunkText, type ChunkingConfig } from "./audio-chunking";
+import { getVoiceProfile } from "./voice-profiles";
 
 /** 业务上下文类型 */
 export type BusinessContextKind =
   | "character-image"
   | "shot-frame"
-  | "scene-frame";
+  | "scene-frame"
+  | "dialogue-audio";
 
 /** 创建角色图生成任务 */
 export async function createCharacterImageJob(
@@ -204,6 +207,91 @@ export async function createShotFrameJob(
   const job = await createGenerationJob(input, { userId, roles: ["user"] });
 
   return { jobId: job.id, profileRevisionId };
+}
+
+/** 创建对话音频生成任务 */
+export async function createDialogueAudioJob(
+  dialogueId: string,
+  projectId: string,
+  userId: string,
+  options: {
+    text?: string;
+    voiceProfileId?: string;
+    speed?: number;
+    chunkingConfig?: Partial<ChunkingConfig>;
+  } = {}
+): Promise<{ jobId: string; profileRevisionId: string; chunkCount: number }> {
+  if (!isEnabled(FF.V2_LOCAL_AUDIO)) {
+    throw new Error("v2.0 local audio generation is not enabled");
+  }
+
+  // 解析生成配置
+  const profileRevisionId = await resolveDefaultProfile("audio");
+  if (!profileRevisionId) {
+    throw new Error("No default audio generation profile configured");
+  }
+
+  // 验证音色档案（如果提供）
+  if (options.voiceProfileId) {
+    const voiceProfile = await getVoiceProfile(options.voiceProfileId);
+    if (!voiceProfile) {
+      throw new Error(`Voice profile not found: ${options.voiceProfileId}`);
+    }
+  }
+
+  // 构建文本
+  const text = options.text || "";
+  if (!text) {
+    throw new Error("No text provided for dialogue audio generation");
+  }
+
+  // 文本分块
+  const chunkingResult = chunkText(text, options.chunkingConfig);
+
+  // 创建生成任务（使用第一个块作为主任务）
+  const input: CreateGenerationJobInput = {
+    capability: "audio",
+    profileRevisionId,
+    projectId,
+    request: {
+      text: chunkingResult.chunks[0]?.text || text,
+      voiceProfileId: options.voiceProfileId,
+      speed: options.speed || 1.0,
+    },
+    businessContext: {
+      kind: "dialogue-audio",
+      id: dialogueId,
+    },
+  };
+
+  const job = await createGenerationJob(input, { userId, roles: ["user"] });
+
+  // 将分块信息附加到任务元数据
+  if (chunkingResult.chunkCount > 1) {
+    await db
+      .update(generationJobs)
+      .set({
+        metadataJson: {
+          ...(job.metadataJson as Record<string, unknown> || {}),
+          audioChunks: {
+            totalChunks: chunkingResult.chunkCount,
+            chunks: chunkingResult.chunks.map(chunk => ({
+              index: chunk.index,
+              text: chunk.text,
+              estimatedDuration: chunk.estimatedDuration,
+            })),
+            totalEstimatedDuration: chunkingResult.totalEstimatedDuration,
+          },
+        },
+      })
+      .where(eq(generationJobs.id, job.id));
+  }
+
+  return { 
+    jobId: job.id, 
+    profileRevisionId,
+    chunkCount: chunkingResult.chunkCount,
+  };
 }
 
 /** 查询业务任务关联的生成任务 */
