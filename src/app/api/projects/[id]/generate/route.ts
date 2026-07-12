@@ -217,6 +217,11 @@ export async function POST(
     return handleSingleCharacterImage(payload, modelConfig);
   }
 
+  // v2 本地生成：角色图
+  if (action === "single_character_image_v2") {
+    return handleSingleCharacterImageV2(projectId, userId, payload);
+  }
+
   if (action === "batch_character_image") {
     return handleBatchCharacterImage(projectId, modelConfig, episodeId);
   }
@@ -3894,4 +3899,41 @@ async function handleGenerateKeyframePrompts(
   }
   console.log(`[GenerateKeyframePrompts] Updated ${updatedCount}/${allShots.length} shots (concurrent)`);
   return NextResponse.json({ updatedCount, totalShots: allShots.length });
+}
+
+// --- v2 本地生成：角色图 ---
+
+async function handleSingleCharacterImageV2(
+  projectId: string,
+  userId: string,
+  payload?: Record<string, unknown>
+) {
+  const characterId = payload?.characterId as string | undefined;
+  const profileRevisionId = payload?.profileRevisionId as string | undefined;
+
+  if (!characterId) {
+    return NextResponse.json({ error: "No characterId provided" }, { status: 400 });
+  }
+
+  if (!profileRevisionId) {
+    return NextResponse.json({ error: "No profileRevisionId provided" }, { status: 400 });
+  }
+
+  try {
+    // 导入 v2 业务适配层
+    const { createCharacterImageJob } = await import("@/lib/generation/business-adapter");
+
+    // 创建 v2 生成任务
+    const { jobId } = await createCharacterImageJob(characterId, projectId, userId);
+
+    console.log(`[SingleCharacterImageV2] Created job ${jobId} for character ${characterId}`);
+
+    return NextResponse.json({ jobId, status: "queued" });
+  } catch (err) {
+    console.error(`[SingleCharacterImageV2] Error:`, err);
+    return NextResponse.json(
+      { error: `Failed to create v2 generation job: ${extractErrorMessage(err)}` },
+      { status: 500 }
+    );
+  }
 }

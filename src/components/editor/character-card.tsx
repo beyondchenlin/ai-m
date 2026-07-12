@@ -93,22 +93,83 @@ export function CharacterCard({
     if (!imageGuard()) return;
     setGenerating(true);
     try {
-      const response = await apiFetch(`/api/projects/${projectId}/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "single_character_image",
-          payload: { characterId: id },
-          modelConfig: { ...getModelConfig(), image: resolveImageRef(imageModelRef) },
-        }),
-      });
-      await response.json();
+      // 检查是否选择了本地生成配置
+      const isLocalGeneration = imageModelRef?.providerId === "local";
+
+      if (isLocalGeneration) {
+        // v2 本地生成流程
+        const response = await apiFetch(`/api/projects/${projectId}/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "single_character_image_v2",
+            payload: { characterId: id },
+            profileRevisionId: imageModelRef?.modelId,
+          }),
+        });
+        const data = await response.json();
+
+        if (data.jobId) {
+          // 开始轮询任务状态
+          await pollJobStatus(data.jobId);
+        } else {
+          toast.error(t("common.generationFailed"));
+        }
+      } else {
+        // v1 云端生成流程
+        const response = await apiFetch(`/api/projects/${projectId}/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "single_character_image",
+            payload: { characterId: id },
+            modelConfig: { ...getModelConfig(), image: resolveImageRef(imageModelRef) },
+          }),
+        });
+        await response.json();
+      }
     } catch (err) {
       console.error("Character image error:", err);
       toast.error(t("common.generationFailed"));
     }
     setGenerating(false);
     onUpdate();
+  }
+
+  /** 轮询 v2 任务状态 */
+  async function pollJobStatus(jobId: string, maxAttempts = 60) {
+    const pollInterval = 2000; // 2秒
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      attempts++;
+
+      try {
+        const response = await apiFetch(`/api/generation/jobs/${jobId}`);
+        const data = await response.json();
+
+        if (data.job) {
+          const status = data.job.status;
+
+          if (status === "SUCCEEDED") {
+            toast.success("图片生成完成");
+            return;
+          } else if (status === "FAILED" || status === "CANCELLED") {
+            toast.error("图片生成失败");
+            return;
+          } else if (status === "NEEDS_ATTENTION") {
+            toast.error("任务需要人工处理");
+            return;
+          }
+          // 继续轮询：QUEUED, RUNNING, CANCEL_REQUESTED
+        }
+      } catch (err) {
+        console.error("Poll job status error:", err);
+      }
+    }
+
+    toast.error("任务超时，请稍后查看结果");
   }
 
   async function handleUploadImage(e: React.ChangeEvent<HTMLInputElement>) {
@@ -255,7 +316,7 @@ export function CharacterCard({
           className="h-8 text-xs text-muted-foreground"
         />
         <div className="space-y-2">
-            <InlineModelPicker capability="image" value={imageModelRef} onChange={setImageModelRef} />
+            <InlineModelPicker capability="image" value={imageModelRef} onChange={setImageModelRef} showLocalProfiles={true} />
             <div className="flex gap-2">
               <Button
                 onClick={handleGenerateImage}

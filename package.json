@@ -10,7 +10,9 @@
     "test:regression": "tsx src/lib/capability/__tests__/regression-baseline.test.ts",
     "test:validate-examples": "python tools/validate_examples.py",
     "worker:dev": "tsx src/worker/index.ts",
-    "worker": "node dist/worker/index.js"
+    "worker": "node dist/worker/index.js",
+    "seed:zimage": "npx tsx scripts/seed-zimage-workflow.ts",
+    "promote:zimage": "npx tsx scripts/promote-zimage-workflow.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.43",
