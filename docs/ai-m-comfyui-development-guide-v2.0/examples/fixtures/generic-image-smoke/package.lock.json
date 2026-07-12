@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "generic-image-smoke",
+  "version": "1.0.0",
+  "files": {
+    "workflow.api.json": "ddd8ad6c686f1f0e809ea409946d535b80ed53ca85d0a045554ffa134c252556",
+    "manifest.json": "583abfa318567c19457a07f0da4ba88ff8d76d9496729142273a03914468d72d",
+    "compiled-bindings.json": "577b038bda0a484b62bda36e517e293522d576ff9c9521b8402d4ec22b359ad8"
+  },
+  "environmentLockDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

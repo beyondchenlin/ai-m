@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-m.local/schemas/workflow-manifest-v1.json",
+  "title": "ai-m Workflow Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "version",
+    "displayName",
+    "capability",
+    "workflowFile",
+    "bindings",
+    "outputs",
+    "requirements",
+    "limits"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "workflowId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 96
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?$"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "capability": {
+      "enum": [
+        "image",
+        "video",
+        "speech",
+        "utility"
+      ]
+    },
+    "workflowFile": {
+      "const": "workflow.api.json"
+    },
+    "bindings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 512,
+      "items": {
+        "$ref": "#/$defs/binding"
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/output"
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeClasses",
+        "models",
+        "referenceModes"
+      ],
+      "properties": {
+        "nodeClasses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "uniqueItems": true
+        },
+        "models": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "folder",
+              "filename"
+            ],
+            "properties": {
+              "folder": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "filename": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          }
+        },
+        "referenceModes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "enum": [
+              "off",
+              "auto",
+              "required"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxPromptChars",
+        "maxPixels",
+        "maxBatch",
+        "maxOutputs",
+        "maxJobMs",
+        "maxOutputBytes"
+      ],
+      "properties": {
+        "maxPromptChars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxPixels": {
+          "type": "integer",
+          "minimum": 65536
+        },
+        "maxBatch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxOutputs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxJobMs": {
+          "type": "integer",
+          "minimum": 10000
+        },
+        "maxOutputBytes": {
+          "type": "integer",
+          "minimum": 1024
+        }
+      }
+    }
+  },
+  "$defs": {
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metaTitle",
+        "classType"
+      ],
+      "properties": {
+        "metaTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "classType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "selector",
+        "inputName",
+        "valueType",
+        "required",
+        "userOverride"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*$"
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "inputName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "valueType": {
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "image-ref",
+            "audio-ref"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "userOverride": {
+          "type": "boolean"
+        },
+        "default": {},
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "enum": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "selector",
+        "field",
+        "mediaKind",
+        "maxItems"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*$"
+        },
+        "selector": {
+          "$ref": "#/$defs/selector"
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "mediaKind": {
+          "enum": [
+            "image",
+            "video",
+            "audio",
+            "text",
+            "archive"
+          ]
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        }
+      }
+    }
+  }
+}

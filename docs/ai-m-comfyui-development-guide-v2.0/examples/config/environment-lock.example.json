@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "engine": {
+    "name": "ComfyUI",
+    "commit": "REPLACE_WITH_PINNED_COMMIT"
+  },
+  "runtime": {
+    "python": "REPLACE_WITH_VERSION",
+    "torch": "REPLACE_WITH_VERSION",
+    "accelerator": "REPLACE_WITH_VERSION"
+  },
+  "customNodes": [],
+  "models": [
+    {
+      "folder": "checkpoints",
+      "filename": "REPLACE_WITH_MODEL.safetensors",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "notes": "示例占位符。正式晋级必须替换为真实摘要。"
+}

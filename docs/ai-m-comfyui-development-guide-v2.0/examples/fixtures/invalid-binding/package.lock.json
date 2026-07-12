@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "invalid-binding",
+  "version": "1.0.0",
+  "files": {
+    "workflow.api.json": "ddd8ad6c686f1f0e809ea409946d535b80ed53ca85d0a045554ffa134c252556",
+    "manifest.json": "6fbb209426c2f2111873905d60118ae641690e025747cb430b6a6f5a5fc38c83",
+    "compiled-bindings.json": "13a5838b965c2054827bccb10b964d09343e4dcceb86c09409173bcae8e10ee2"
+  },
+  "environmentLockDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

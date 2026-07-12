@@ -1,0 +1,23 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", fontname="Noto Sans CJK SC", nodesep=0.55, ranksep=0.8, pad=0.3];
+  node [shape=box, style="rounded,filled", fillcolor="#f7f7f7", color="#555555", fontname="Noto Sans CJK SC", fontsize=13, margin="0.18,0.12"];
+  edge [color="#555555", fontname="Noto Sans CJK SC", fontsize=10, arrowsize=0.8];
+  browser [label="浏览器\n项目编辑 / 选择生成配置 / 状态展示"];
+  api [label="Web/API（网页与接口）\n鉴权 / 冻结快照 / 入队"];
+  db [shape=cylinder, label="数据库\n任务 / 尝试 / 租约 / 审计"];
+  worker [label="Worker（后台工作进程）\n领取 / 提交 / 对账 / 归档", fillcolor="#eeeeee"];
+  registry [label="控制平面\n后端 / 工作流包 / 生成配置 / 密钥引用"];
+  comfy [label="ComfyUI（本地工作流引擎）\n受信工作流执行", fillcolor="#eeeeee"];
+  staging [shape=folder, label="任务暂存区\n受控输入 / 临时输出"];
+  artifacts [shape=folder, label="项目工件存储\n不可变图片 / 音频 / 视频"];
+  browser -> api [label="业务请求"];
+  api -> db [label="短事务"];
+  registry -> api [label="公开配置"];
+  registry -> worker [label="冻结修订版"];
+  worker -> db [dir=both, label="租约与状态"];
+  worker -> staging [dir=both, label="流式暂存"];
+  worker -> comfy [dir=both, label="官方接口 / 实时证据"];
+  worker -> artifacts [label="校验后原子提交"];
+  api -> artifacts [style=dashed, label="鉴权下载"];
+  browser -> comfy [style=dashed, color="#999999", arrowhead=none, label="禁止直连"];
+}

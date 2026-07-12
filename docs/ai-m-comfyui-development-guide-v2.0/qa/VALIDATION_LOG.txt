@@ -1,0 +1,10 @@
+[OK] JSON Schema validation
+[OK] content-addressed workflow package integrity
+[OK] semantic selector compilation and stale-binding detection
+[OK] invalid binding rejection
+[OK] platform-owned workflow security policy
+[OK] execution backend network/auth semantics and negative tests
+[OK] generation profile semantics
+[OK] SQLite schema, foreign keys and immutable revision triggers
+[OK] hardened container topology
+[OK] documentation references, invariants and two-round severity order

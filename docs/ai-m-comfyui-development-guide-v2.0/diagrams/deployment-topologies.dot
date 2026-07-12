@@ -1,0 +1,10 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", fontname="Noto Sans CJK SC", nodesep=0.45, ranksep=0.6, pad=0.25];
+  node [shape=box, style="rounded,filled", fillcolor="#f8f8f8", color="#555555", fontname="Noto Sans CJK SC", fontsize=12];
+  edge [color="#555555", fontname="Noto Sans CJK SC", fontsize=10];
+  subgraph cluster1 { label="同主机"; color="#999999"; web1[label="网页进程"]; worker1[label="工作进程"]; comfy1[label="ComfyUI\n环回地址"]; web1->worker1[label="数据库队列"]; worker1->comfy1[label="受控访问"]; }
+  subgraph cluster2 { label="同主机容器"; color="#999999"; web2[label="网页容器"]; worker2[label="工作器容器"]; comfy2[label="推理容器\n内部网络"]; web2->worker2[label="数据库队列"]; worker2->comfy2[label="内部服务名"]; }
+  subgraph cluster3 { label="局域网远程"; color="#999999"; web3[label="网页进程"]; worker3[label="工作进程"]; gateway3[label="受控网关 / TLS\n认证 + 地址白名单"]; comfy3[label="远程推理主机"]; web3->worker3[label="数据库队列"]; worker3->gateway3[label="HTTPS"]; gateway3->comfy3[label="受控内网"]; }
+  note [shape=note, label="第一阶段禁止：\n浏览器直连、无状态函数、多主机共享 SQLite、任意公网后端", fillcolor="#ffffff"];
+  comfy1 -> note [style=invis]; comfy2 -> note [style=invis]; comfy3 -> note [style=invis];
+}

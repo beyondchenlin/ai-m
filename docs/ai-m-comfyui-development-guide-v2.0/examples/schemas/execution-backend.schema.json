@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-m.local/schemas/execution-backend-v1.json",
+  "title": "ai-m ComfyUI Execution Backend v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "displayName",
+    "adapterKind",
+    "baseUrl",
+    "topology",
+    "sharingMode",
+    "capabilities",
+    "auth",
+    "tls",
+    "networkPolicy",
+    "resourcePoolId",
+    "maxConcurrency",
+    "timeouts",
+    "allowedWorkflowDigests",
+    "enabled"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "#/$defs/slug"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "adapterKind": {
+      "const": "comfyui-http"
+    },
+    "baseUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://",
+      "maxLength": 2048
+    },
+    "topology": {
+      "enum": [
+        "same-host",
+        "container-to-host",
+        "same-host-container",
+        "lan-remote"
+      ]
+    },
+    "sharingMode": {
+      "enum": [
+        "dedicated",
+        "shared"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "enum": [
+          "text",
+          "image",
+          "video",
+          "speech",
+          "utility"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "auth": {
+      "$ref": "#/$defs/auth"
+    },
+    "tls": {
+      "$ref": "#/$defs/tls"
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowRedirects",
+        "allowedCidrs",
+        "allowedHostnames",
+        "resolveAndPin"
+      ],
+      "properties": {
+        "allowRedirects": {
+          "const": false
+        },
+        "allowedCidrs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 64
+          },
+          "uniqueItems": true
+        },
+        "allowedHostnames": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9.-]+$",
+            "maxLength": 253
+          },
+          "uniqueItems": true
+        },
+        "resolveAndPin": {
+          "const": true
+        }
+      }
+    },
+    "resourcePoolId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:[-:][a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 96
+    },
+    "maxConcurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connectMs",
+        "requestMs",
+        "jobMs",
+        "reconcileGraceMs",
+        "outputFirstByteMs",
+        "outputTotalMs"
+      ],
+      "properties": {
+        "connectMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 60000
+        },
+        "requestMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 300000
+        },
+        "jobMs": {
+          "type": "integer",
+          "minimum": 10000,
+          "maximum": 86400000
+        },
+        "reconcileGraceMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 3600000
+        },
+        "outputFirstByteMs": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 300000
+        },
+        "outputTotalMs": {
+          "type": "integer",
+          "minimum": 10000,
+          "maximum": 86400000
+        }
+      }
+    },
+    "allowedWorkflowDigests": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "string",
+        "pattern": "^sha256:[a-f0-9]{64}$"
+      },
+      "uniqueItems": true
+    },
+    "enabled": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "topology": {
+            "const": "lan-remote"
+          }
+        },
+        "required": [
+          "topology"
+        ]
+      },
+      "then": {
+        "properties": {
+          "baseUrl": {
+            "pattern": "^https://"
+          },
+          "tls": {
+            "$ref": "#/$defs/tlsRequired"
+          },
+          "auth": {
+            "not": {
+              "properties": {
+                "type": {
+                  "const": "none"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "enabled": {
+            "const": true
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "then": {
+        "properties": {
+          "allowedWorkflowDigests": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 96
+    },
+    "secretRef": {
+      "type": "string",
+      "pattern": "^(env|file|keyring|vault):[A-Za-z0-9/_:.-]+$",
+      "minLength": 5,
+      "maxLength": 512
+    },
+    "auth": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "secretRef"
+          ],
+          "properties": {
+            "type": {
+              "const": "bearer"
+            },
+            "secretRef": {
+              "$ref": "#/$defs/secretRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "headerName",
+            "secretRef"
+          ],
+          "properties": {
+            "type": {
+              "const": "header-token"
+            },
+            "headerName": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9-]{0,63}$",
+              "not": {
+                "enum": [
+                  "Host",
+                  "Content-Length",
+                  "Connection",
+                  "Transfer-Encoding",
+                  "Cookie",
+                  "Set-Cookie",
+                  "Proxy-Authorization",
+                  "Proxy-Authenticate"
+                ]
+              }
+            },
+            "secretRef": {
+              "$ref": "#/$defs/secretRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "usernameSecretRef",
+            "passwordSecretRef"
+          ],
+          "properties": {
+            "type": {
+              "const": "basic"
+            },
+            "usernameSecretRef": {
+              "$ref": "#/$defs/secretRef"
+            },
+            "passwordSecretRef": {
+              "$ref": "#/$defs/secretRef"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "clientCertSecretRef",
+            "clientKeySecretRef"
+          ],
+          "properties": {
+            "type": {
+              "const": "mtls"
+            },
+            "clientCertSecretRef": {
+              "$ref": "#/$defs/secretRef"
+            },
+            "clientKeySecretRef": {
+              "$ref": "#/$defs/secretRef"
+            }
+          }
+        }
+      ]
+    },
+    "tlsRequired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "verifyPeer",
+        "caSecretRef"
+      ],
+      "properties": {
+        "mode": {
+          "const": "required"
+        },
+        "verifyPeer": {
+          "const": true
+        },
+        "caSecretRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/secretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "verifyPeer",
+            "caSecretRef"
+          ],
+          "properties": {
+            "mode": {
+              "const": "disabled-local-machine-only"
+            },
+            "verifyPeer": {
+              "const": false
+            },
+            "caSecretRef": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/tlsRequired"
+        }
+      ]
+    }
+  }
+}

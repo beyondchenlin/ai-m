@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "gp-z-image-base-r1",
+  "profileKey": "z-image-base",
+  "revision": 1,
+  "displayName": "本地造相质量生成",
+  "capability": "image",
+  "adapterKind": "comfyui-http",
+  "executionBackendId": "local-image",
+  "workflowPackageDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "defaults": {
+    "aspectRatio": "9:16",
+    "steps": 28,
+    "batch": 1
+  },
+  "allowedOverrides": [
+    "prompt",
+    "negativePrompt",
+    "aspectRatio",
+    "seed"
+  ],
+  "outputPolicy": {
+    "maxItems": 1,
+    "maxBytes": 67108864,
+    "allowedMediaKinds": [
+      "image"
+    ]
+  },
+  "retryPolicy": {
+    "connectRetries": 2,
+    "collectRetries": 3,
+    "commitRetries": 5,
+    "externalExecutionRetries": 0
+  }
+}

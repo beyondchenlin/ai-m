@@ -1,0 +1,17 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", fontname="Noto Sans CJK SC", nodesep=0.45, ranksep=0.48, pad=0.25, splines=polyline];
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC", fontsize=15, color="#555555", margin="0.18,0.12", width=4.9];
+  edge [color="#555555", fontname="Noto Sans CJK SC", fontsize=12, arrowsize=0.8];
+
+  untrusted [label="不可信输入\n浏览器参数 / 上传文件 / 工作流包 / 外部元数据", fillcolor="#fafafa"];
+  control [label="控制平面\n鉴权 / 权限 / 地址策略 / 工作流晋级", fillcolor="#eeeeee"];
+  execution [label="隔离执行平面\n工作进程 / 任务暂存 / 推理后端", fillcolor="#eeeeee"];
+  commit [label="校验与提交边界\n限额 / 魔数 / 解码 / 摘要 / 原子提交", fillcolor="#eeeeee"];
+  trusted [label="可信业务工件\n项目授权 / 不可变存储 / 追踪元数据", fillcolor="#fafafa"];
+
+  untrusted -> control [label="严格校验"];
+  control -> execution [label="冻结契约"];
+  execution -> commit [label="外部输出仍不可信"];
+  commit -> trusted [label="提交成功"];
+  trusted -> control [style=dashed, constraint=false, label="下载和管理仍需鉴权"];
+}

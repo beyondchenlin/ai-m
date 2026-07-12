@@ -1,0 +1,63 @@
+services:
+  web:
+    image: ai-m-web:dev
+    read_only: true
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      AI_M_GENERATION_ENABLED: "true"
+      AI_M_DATABASE_PATH: /var/lib/ai-m/app.db
+    volumes:
+      - ai_m_db:/var/lib/ai-m
+      - project_media:/srv/ai-m/media:ro
+    networks: [control]
+    depends_on: [worker]
+
+  worker:
+    image: ai-m-worker:dev
+    read_only: true
+    user: "10001:10001"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      AI_M_DATABASE_PATH: /var/lib/ai-m/app.db
+      COMFY_IMAGE_BASE_URL: http://comfy-image:8188
+    volumes:
+      - ai_m_db:/var/lib/ai-m
+      - task_staging:/srv/ai-m/staging
+      - comfy_image_intake:/srv/comfy-intake
+      - project_media:/srv/ai-m/media
+      - comfy_image_output:/srv/comfy-output:ro
+      - ./secrets:/run/secrets:ro
+    networks: [control, inference]
+
+  comfy-image:
+    image: comfyui-pinned:replace-with-digest
+    read_only: true
+    user: "10002:10002"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - comfy_models:/opt/comfy/models:ro
+      - comfy_custom_nodes:/opt/comfy/custom_nodes:ro
+      - comfy_image_intake:/opt/comfy/input:ro
+      - comfy_image_output:/opt/comfy/output
+    networks: [inference]
+    tmpfs:
+      - /tmp:size=2g,mode=1770
+    # 不发布 8188 端口；只有工作器可访问。摄取卷由工作器保证仅含当前资源槽任务。
+
+networks:
+  control: {}
+  inference:
+    internal: true
+
+volumes:
+  ai_m_db: {}
+  project_media: {}
+  task_staging: {}
+  comfy_image_intake: {}
+  comfy_image_output: {}
+  comfy_models: {}
+  comfy_custom_nodes: {}

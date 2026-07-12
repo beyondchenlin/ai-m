@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "invalid-binding",
+  "version": "1.0.0",
+  "workflowSha256": "ddd8ad6c686f1f0e809ea409946d535b80ed53ca85d0a045554ffa134c252556",
+  "authorContractSha256": "5e22d704f7c0e02fd3752162b4e46ab9deb4dc6e619223fc03b9e481d53e5cbb",
+  "bindings": [
+    {
+      "key": "negativePrompt",
+      "inputName": "text",
+      "valueType": "string",
+      "required": false,
+      "userOverride": true,
+      "nodeId": "7",
+      "classType": "CLIPTextEncode",
+      "default": ""
+    },
+    {
+      "key": "width",
+      "inputName": "width",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "nodeId": "5",
+      "classType": "EmptyLatentImage",
+      "minimum": 256,
+      "maximum": 2048
+    },
+    {
+      "key": "height",
+      "inputName": "height",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "nodeId": "5",
+      "classType": "EmptyLatentImage",
+      "minimum": 256,
+      "maximum": 2048
+    },
+    {
+      "key": "seed",
+      "inputName": "seed",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "nodeId": "3",
+      "classType": "KSampler",
+      "minimum": 0
+    }
+  ],
+  "outputs": [
+    {
+      "key": "image",
+      "nodeId": "9",
+      "classType": "SaveImage",
+      "field": "images",
+      "mediaKind": "image",
+      "maxItems": 1
+    }
+  ]
+}

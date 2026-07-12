@@ -1,0 +1,9 @@
+digraph G {
+  graph [rankdir=LR, bgcolor="white", fontname="Noto Sans CJK SC", nodesep=0.45, ranksep=0.6, pad=0.25];
+  node [shape=box, style="rounded,filled", fillcolor="#f7f7f7", color="#555555", fontname="Noto Sans CJK SC", fontsize=11];
+  edge [color="#555555", fontname="Noto Sans CJK SC", fontsize=9];
+  upload[label="隔离上传"]; unpack[label="限额解包\n路径与链接检查"]; schema[label="结构约束\n拒绝未知字段"]; scan[label="节点与输入策略\n平台安全规则"]; compile[label="语义绑定编译\n唯一匹配"]; env[label="环境能力探测\n模型与节点摘要"]; smoke[label="隔离冒烟测试"]; review[label="双人审查"]; publish[label="内容寻址发布\n只读"]; profile[label="生成配置发布"];
+  upload->unpack->schema->scan->compile->env->smoke->review->publish->profile;
+  reject [shape=octagon, label="拒绝 / 隔离", fillcolor="#ffffff"];
+  unpack->reject[style=dashed]; schema->reject[style=dashed]; scan->reject[style=dashed]; compile->reject[style=dashed]; env->reject[style=dashed]; smoke->reject[style=dashed]; review->reject[style=dashed];
+}

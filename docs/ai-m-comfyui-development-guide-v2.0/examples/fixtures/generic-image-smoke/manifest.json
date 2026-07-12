@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "generic-image-smoke",
+  "version": "1.0.0",
+  "displayName": "通用图片契约冒烟夹具",
+  "capability": "image",
+  "workflowFile": "workflow.api.json",
+  "bindings": [
+    {
+      "key": "prompt",
+      "selector": {
+        "metaTitle": "Positive Prompt",
+        "classType": "CLIPTextEncode"
+      },
+      "inputName": "text",
+      "valueType": "string",
+      "required": true,
+      "userOverride": true
+    },
+    {
+      "key": "negativePrompt",
+      "selector": {
+        "metaTitle": "Negative Prompt",
+        "classType": "CLIPTextEncode"
+      },
+      "inputName": "text",
+      "valueType": "string",
+      "required": false,
+      "userOverride": true,
+      "default": ""
+    },
+    {
+      "key": "width",
+      "selector": {
+        "metaTitle": "Canvas",
+        "classType": "EmptyLatentImage"
+      },
+      "inputName": "width",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "minimum": 256,
+      "maximum": 2048
+    },
+    {
+      "key": "height",
+      "selector": {
+        "metaTitle": "Canvas",
+        "classType": "EmptyLatentImage"
+      },
+      "inputName": "height",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "minimum": 256,
+      "maximum": 2048
+    },
+    {
+      "key": "seed",
+      "selector": {
+        "metaTitle": "Sampler",
+        "classType": "KSampler"
+      },
+      "inputName": "seed",
+      "valueType": "integer",
+      "required": true,
+      "userOverride": true,
+      "minimum": 0
+    }
+  ],
+  "outputs": [
+    {
+      "key": "image",
+      "selector": {
+        "metaTitle": "Output Image",
+        "classType": "SaveImage"
+      },
+      "field": "images",
+      "mediaKind": "image",
+      "maxItems": 1
+    }
+  ],
+  "requirements": {
+    "nodeClasses": [
+      "CheckpointLoaderSimple",
+      "CLIPTextEncode",
+      "EmptyLatentImage",
+      "KSampler",
+      "VAEDecode",
+      "SaveImage"
+    ],
+    "models": [
+      {
+        "folder": "checkpoints",
+        "filename": "example.safetensors",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "referenceModes": [
+      "off"
+    ]
+  },
+  "limits": {
+    "maxPromptChars": 12000,
+    "maxPixels": 4194304,
+    "maxBatch": 1,
+    "maxOutputs": 1,
+    "maxJobMs": 300000,
+    "maxOutputBytes": 67108864
+  }
+}

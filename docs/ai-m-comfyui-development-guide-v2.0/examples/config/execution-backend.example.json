@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "local-image",
+  "displayName": "本地图像工作器",
+  "adapterKind": "comfyui-http",
+  "baseUrl": "http://127.0.0.1:8188",
+  "topology": "same-host",
+  "sharingMode": "dedicated",
+  "capabilities": [
+    "image"
+  ],
+  "auth": {
+    "type": "none"
+  },
+  "tls": {
+    "mode": "disabled-local-machine-only",
+    "verifyPeer": false,
+    "caSecretRef": null
+  },
+  "networkPolicy": {
+    "allowRedirects": false,
+    "allowedCidrs": [
+      "127.0.0.0/8",
+      "::1/128"
+    ],
+    "allowedHostnames": [],
+    "resolveAndPin": true
+  },
+  "resourcePoolId": "gpu:0",
+  "maxConcurrency": 1,
+  "timeouts": {
+    "connectMs": 3000,
+    "requestMs": 30000,
+    "jobMs": 900000,
+    "reconcileGraceMs": 120000,
+    "outputFirstByteMs": 30000,
+    "outputTotalMs": 300000
+  },
+  "allowedWorkflowDigests": [],
+  "enabled": false
+}

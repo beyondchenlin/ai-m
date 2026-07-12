@@ -1,0 +1,41 @@
+digraph G {
+  graph [rankdir=TB, bgcolor="white", fontname="Noto Sans CJK SC", nodesep=0.55, ranksep=0.50, pad=0.25, splines=polyline];
+  node [shape=box, style="rounded,filled", fillcolor="#f7f7f7", color="#555555", fontname="Noto Sans CJK SC", fontsize=12, margin="0.18,0.10", width=2.55];
+  edge [color="#555555", fontname="Noto Sans CJK SC", fontsize=10, arrowsize=0.75];
+
+  created[label="CREATED\n已创建"];
+  leased[label="LEASED\n已领取"];
+  prep[label="PREPARING\n准备输入"];
+  submit[label="SUBMITTING\n提交中"];
+  unknown[label="SUBMISSION_UNKNOWN\n提交不确定", fillcolor="#eeeeee"];
+  queued[label="EXTERNAL_QUEUED\n外部排队"];
+  running[label="EXTERNAL_RUNNING\n外部运行"];
+  collect[label="COLLECTING\n收集输出"];
+  commit[label="COMMITTING\n提交工件"];
+  success[label="SUCCEEDED\n成功", peripheries=2, fillcolor="#eeeeee"];
+  attention[label="NEEDS_ATTENTION\n人工处理", peripheries=2, fillcolor="#eeeeee"];
+  cancel[label="CANCEL_REQUESTED\n请求取消"];
+  cancelled[label="CANCELLED\n已取消", peripheries=2, fillcolor="#eeeeee"];
+  fail[label="FAILED\n失败", peripheries=2, fillcolor="#eeeeee"];
+
+  created -> leased -> prep -> submit;
+  submit -> queued [label="响应确认"];
+  submit -> unknown [label="响应丢失"];
+  unknown -> queued [label="对账确认"];
+  unknown -> attention [label="证据不足"];
+  queued -> running -> collect -> commit -> success;
+  collect -> collect [label="只重试收集"];
+  commit -> commit [label="只重试提交"];
+
+  queued -> cancel [label="取消意图"];
+  running -> cancel [label="取消意图"];
+  cancel -> cancelled [label="确认停止"];
+  cancel -> collect [label="已完成竞态"];
+
+  prep -> fail [style=dashed, label="输入或契约错误"];
+  running -> fail [style=dashed, label="执行失败"];
+
+  {rank=same; unknown; queued; attention}
+  {rank=same; running; cancel; fail}
+  {rank=same; collect; cancelled}
+}

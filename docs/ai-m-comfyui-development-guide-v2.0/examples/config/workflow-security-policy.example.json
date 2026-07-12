@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "policyId": "default-image-policy",
+  "version": 1,
+  "allowedNodeClasses": [
+    "CheckpointLoaderSimple",
+    "CLIPTextEncode",
+    "EmptyLatentImage",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage"
+  ],
+  "deniedNodeClasses": [
+    "ExecuteShell",
+    "PythonExec",
+    "HTTPDownload",
+    "LoadFromURL"
+  ],
+  "deniedInputNameTokens": [
+    "command",
+    "shell",
+    "url",
+    "endpoint",
+    "host",
+    "path",
+    "filename_override"
+  ],
+  "limits": {
+    "maxNodes": 200,
+    "maxEdges": 1000,
+    "maxBindings": 64,
+    "maxOutputs": 8,
+    "maxPromptChars": 12000,
+    "maxPixels": 16777216,
+    "maxBatch": 4,
+    "maxOutputBytes": 268435456,
+    "maxPackageFiles": 64,
+    "maxExpandedBytes": 33554432
+  }
+}
