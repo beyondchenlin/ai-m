@@ -6,7 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:regression": "tsx src/lib/capability/__tests__/regression-baseline.test.ts",
+    "test:validate-examples": "python tools/validate_examples.py",
+    "worker:dev": "tsx src/worker/index.ts",
+    "worker": "node dist/worker/index.js"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.43",
