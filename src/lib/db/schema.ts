@@ -421,3 +421,275 @@ export const agentBindings = sqliteTable("agent_bindings", {
   }).notNull(),
   agentId: text("agent_id").references(() => agents.id, { onDelete: "set null" }),
 });
+
+// ============================================================
+// v2.0: 本地工作流平台 — 执行后端、工作流供应链、任务与资源
+// ============================================================
+
+export const resourcePools = sqliteTable("resource_pools", {
+  id: text("id").primaryKey(),
+  displayName: text("display_name").notNull(),
+  capacity: integer("capacity").notNull().default(1),
+  policyJson: text("policy_json", { mode: "json" }).notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const executionBackends = sqliteTable("execution_backends", {
+  id: text("id").primaryKey(),
+  displayName: text("display_name").notNull(),
+  adapterKind: text("adapter_kind").notNull(),
+  baseUrl: text("base_url").notNull(),
+  topology: text("topology", {
+    enum: ["same-host", "container-to-host", "same-host-container", "lan-remote"],
+  }).notNull(),
+  sharingMode: text("sharing_mode", {
+    enum: ["dedicated", "shared"],
+  }).notNull(),
+  authType: text("auth_type", {
+    enum: ["none", "bearer", "header-token", "basic", "mtls"],
+  }).notNull(),
+  authConfigJson: text("auth_config_json", { mode: "json" }).notNull(),
+  tlsConfigJson: text("tls_config_json", { mode: "json" }).notNull(),
+  networkPolicyJson: text("network_policy_json", { mode: "json" }).notNull(),
+  resourcePoolId: text("resource_pool_id")
+    .notNull()
+    .references(() => resourcePools.id),
+  capabilitiesJson: text("capabilities_json", { mode: "json" }).notNull(),
+  environmentFingerprint: text("environment_fingerprint"),
+  featureSnapshotJson: text("feature_snapshot_json", { mode: "json" }),
+  validatedAtMs: integer("validated_at_ms"),
+  enabled: integer("enabled").notNull().default(0),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const workflowPackageRevisions = sqliteTable("workflow_package_revisions", {
+  digest: text("digest").primaryKey(),
+  workflowId: text("workflow_id").notNull(),
+  version: text("version").notNull(),
+  capability: text("capability", {
+    enum: ["image", "video", "speech", "utility"],
+  }).notNull(),
+  manifestJson: text("manifest_json", { mode: "json" }).notNull(),
+  compiledBindingsJson: text("compiled_bindings_json", { mode: "json" }).notNull(),
+  packageLockJson: text("package_lock_json", { mode: "json" }).notNull(),
+  packagePath: text("package_path").notNull(),
+  workflowSha256: text("workflow_sha256").notNull(),
+  environmentLockDigest: text("environment_lock_digest"),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const workflowPackageStates = sqliteTable("workflow_package_states", {
+  workflowPackageDigest: text("workflow_package_digest")
+    .primaryKey()
+    .references(() => workflowPackageRevisions.digest),
+  state: text("state", {
+    enum: ["installed", "validating", "reviewed", "active", "deprecated", "revoked", "invalid"],
+  }).notNull(),
+  validationReportJson: text("validation_report_json", { mode: "json" }),
+  reviewedBy: text("reviewed_by"),
+  reviewedAtMs: integer("reviewed_at_ms"),
+  revokedAtMs: integer("revoked_at_ms"),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const generationProfileRevisions = sqliteTable("generation_profile_revisions", {
+  id: text("id").primaryKey(),
+  profileKey: text("profile_key").notNull(),
+  revisionNo: integer("revision_no").notNull(),
+  revisionDigest: text("revision_digest").notNull().unique(),
+  displayName: text("display_name").notNull(),
+  capability: text("capability", {
+    enum: ["text", "image", "video", "speech", "utility"],
+  }).notNull(),
+  adapterKind: text("adapter_kind").notNull(),
+  executionBackendId: text("execution_backend_id").references(() => executionBackends.id),
+  workflowPackageDigest: text("workflow_package_digest").references(() => workflowPackageRevisions.digest),
+  configJson: text("config_json", { mode: "json" }).notNull(),
+  createdBy: text("created_by"),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const generationProfileStates = sqliteTable("generation_profile_states", {
+  generationProfileRevisionId: text("generation_profile_revision_id")
+    .primaryKey()
+    .references(() => generationProfileRevisions.id),
+  enabled: integer("enabled").notNull().default(0),
+  visibility: text("visibility", {
+    enum: ["admin", "workspace", "project"],
+  }).notNull().default("admin"),
+  deprecatedAtMs: integer("deprecated_at_ms"),
+  revokedAtMs: integer("revoked_at_ms"),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const defaultGenerationProfilePointers = sqliteTable("default_generation_profile_pointers", {
+  scopeType: text("scope_type", {
+    enum: ["global", "workspace", "project", "user"],
+  }).notNull(),
+  scopeId: text("scope_id").notNull(),
+  capability: text("capability", {
+    enum: ["text", "image", "video", "speech"],
+  }).notNull(),
+  generationProfileRevisionId: text("generation_profile_revision_id")
+    .notNull()
+    .references(() => generationProfileRevisions.id),
+  updatedBy: text("updated_by"),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const generationJobs = sqliteTable("generation_jobs", {
+  id: text("id").primaryKey(),
+  businessTaskId: text("business_task_id"),
+  projectId: text("project_id"),
+  capability: text("capability", {
+    enum: ["text", "image", "video", "speech", "utility"],
+  }).notNull(),
+  status: text("status", {
+    enum: ["QUEUED", "RUNNING", "CANCEL_REQUESTED", "SUCCEEDED", "FAILED", "CANCELLED", "NEEDS_ATTENTION"],
+  }).notNull().default("QUEUED"),
+  executionSnapshotJson: text("execution_snapshot_json", { mode: "json" }).notNull(),
+  inputDigest: text("input_digest").notNull(),
+  dedupeScope: text("dedupe_scope"),
+  currentAttemptId: text("current_attempt_id"),
+  currentArtifactId: text("current_artifact_id"),
+  claimOwner: text("claim_owner"),
+  claimUntilMs: integer("claim_until_ms"),
+  claimFencingToken: integer("claim_fencing_token").notNull().default(0),
+  cancelRequestedAtMs: integer("cancel_requested_at_ms"),
+  needsAttentionReason: text("needs_attention_reason"),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+  completedAtMs: integer("completed_at_ms"),
+});
+
+export const generationAttempts = sqliteTable("generation_attempts", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => generationJobs.id, { onDelete: "cascade" }),
+  attemptNo: integer("attempt_no").notNull(),
+  phase: text("phase", {
+    enum: [
+      "CREATED", "LEASED", "PREPARING", "SUBMITTING",
+      "SUBMISSION_UNKNOWN", "EXTERNAL_QUEUED", "EXTERNAL_RUNNING",
+      "COLLECTING", "COMMITTING", "RETRY_WAIT",
+      "SUCCEEDED", "FAILED", "CANCEL_REQUESTED", "CANCELLED", "ORPHANED",
+    ],
+  }).notNull(),
+  backendId: text("backend_id")
+    .notNull()
+    .references(() => executionBackends.id),
+  backendFeatureSnapshotJson: text("backend_feature_snapshot_json", { mode: "json" }).notNull(),
+  environmentFingerprint: text("environment_fingerprint").notNull(),
+  submissionCorrelationId: text("submission_correlation_id").notNull().unique(),
+  externalIdStrategy: text("external_id_strategy", {
+    enum: ["client-assigned", "server-assigned", "not-applicable"],
+  }).notNull(),
+  externalJobId: text("external_job_id"),
+  externalQueueNumber: integer("external_queue_number"),
+  systemOutputPrefix: text("system_output_prefix").notNull(),
+  progressSnapshotJson: text("progress_snapshot_json", { mode: "json" }),
+  errorClass: text("error_class"),
+  errorCode: text("error_code"),
+  errorMessageSafe: text("error_message_safe"),
+  resourcePoolId: text("resource_pool_id")
+    .notNull()
+    .references(() => resourcePools.id),
+  resourceSlotNo: integer("resource_slot_no").notNull(),
+  resourceLeaseToken: text("resource_lease_token").notNull().unique(),
+  resourceFencingToken: integer("resource_fencing_token").notNull(),
+  submittedAtMs: integer("submitted_at_ms"),
+  startedAtMs: integer("started_at_ms"),
+  finishedAtMs: integer("finished_at_ms"),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const resourcePoolSlots = sqliteTable("resource_pool_slots", {
+  resourcePoolId: text("resource_pool_id")
+    .notNull()
+    .references(() => resourcePools.id),
+  slotNo: integer("slot_no").notNull(),
+  ownerAttemptId: text("owner_attempt_id").references(() => generationAttempts.id),
+  leaseToken: text("lease_token").unique(),
+  fencingToken: integer("fencing_token").notNull().default(0),
+  expiresAtMs: integer("expires_at_ms"),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const generationArtifacts = sqliteTable("generation_artifacts", {
+  id: text("id").primaryKey(),
+  attemptId: text("attempt_id")
+    .notNull()
+    .references(() => generationAttempts.id),
+  logicalName: text("logical_name").notNull(),
+  kind: text("kind", {
+    enum: ["image", "video", "audio", "text", "archive"],
+  }).notNull(),
+  status: text("status", {
+    enum: ["STAGING", "COMMITTED", "QUARANTINED", "DELETED"],
+  }).notNull(),
+  storageKey: text("storage_key").notNull().unique(),
+  visibility: text("visibility", {
+    enum: ["private-original", "project", "export"],
+  }).notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  sha256: text("sha256").notNull(),
+  width: integer("width"),
+  height: integer("height"),
+  durationMs: integer("duration_ms"),
+  metadataJson: text("metadata_json", { mode: "json" }).notNull(),
+  parentArtifactId: text("parent_artifact_id"),
+  committedAtMs: integer("committed_at_ms"),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const generationEvents = sqliteTable("generation_events", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id")
+    .notNull()
+    .references(() => generationJobs.id, { onDelete: "cascade" }),
+  attemptId: text("attempt_id").references(() => generationAttempts.id, { onDelete: "cascade" }),
+  eventType: text("event_type").notNull(),
+  severity: text("severity", {
+    enum: ["debug", "info", "warning", "error", "security"],
+  }).notNull(),
+  safePayloadJson: text("safe_payload_json", { mode: "json" }).notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const businessTaskGenerationJobs = sqliteTable("business_task_generation_jobs", {
+  businessTaskId: text("business_task_id").notNull(),
+  generationJobId: text("generation_job_id")
+    .notNull()
+    .references(() => generationJobs.id, { onDelete: "cascade" }),
+  relationKind: text("relation_kind").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+export const auditEvents = sqliteTable("audit_events", {
+  id: text("id").primaryKey(),
+  actorId: text("actor_id"),
+  action: text("action").notNull(),
+  targetType: text("target_type").notNull(),
+  targetId: text("target_id").notNull(),
+  detailsSafeJson: text("details_safe_json", { mode: "json" }).notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+});
+
+/** 服务端密钥引用：密钥只存服务端，浏览器只传引用 ID */
+export const keyReferences = sqliteTable("key_references", {
+  id: text("id").primaryKey(),
+  label: text("label").notNull(),
+  keyType: text("key_type", {
+    enum: ["bearer", "header-token", "basic", "mtls-key"],
+  }).notNull(),
+  /** 加密存储的密钥值（阶段 B 先用明文，后续接入密钥管理服务） */
+  secretValue: text("secret_value").notNull(),
+  createdBy: text("created_by"),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
