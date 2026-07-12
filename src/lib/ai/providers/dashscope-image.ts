@@ -51,8 +51,10 @@ function resolveSize(
   size?: string,
   aspectRatio?: string,
 ): string | undefined {
-  // If explicit size is given, pass through (caller knows best)
-  if (size) return size;
+  // If explicit size is given, normalize the separator and pass through.
+  // DashScope API requires "W*H" (asterisk), but callers may use "WxH"
+  // (OpenAI convention). Normalize to avoid 400 InvalidParameter.
+  if (size) return size.replace(/(\d+)\s*[xX]\s*(\d+)/, "$1*$2");
 
   if (aspectRatio) {
     switch (family) {

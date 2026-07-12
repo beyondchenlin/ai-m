@@ -63,7 +63,9 @@ import { buildKeyframePromptsRequest } from "@/lib/ai/prompts/keyframe-prompts";
 
 export const maxDuration = 300;
 
-/** Map user-facing ratio string to ImageOptions fields */
+/** Map user-facing ratio string to ImageOptions fields.
+ *  size 使用通用的 "WxH" 格式（OpenAI 惯例），各 provider 在自身边界做格式适配
+ *  （如 DashScope provider 的 resolveSize 会将 x 转换为 *）。 */
 function ratioToImageOpts(ratio?: string): { aspectRatio?: string; size?: string } {
   switch (ratio) {
     case "16:9":  return { aspectRatio: "16:9", size: "2560x1440" };
