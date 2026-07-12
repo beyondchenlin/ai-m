@@ -37,7 +37,7 @@ export async function POST(
     return NextResponse.json({ results: [], message: "Need at least 2 shots with frames" });
   }
 
-  const provider = resolveAIProvider(body.modelConfig);
+  const provider = await resolveAIProvider(body.modelConfig);
 
   const results: {
     shotASequence: number;

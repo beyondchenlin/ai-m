@@ -844,7 +844,7 @@ async function handleSingleCharacterImage(
     return NextResponse.json({ error: "Character not found" }, { status: 404 });
   }
 
-  const ai = resolveImageProvider(modelConfig);
+  const ai = await resolveImageProvider(modelConfig);
   const prompt = buildCharacterTurnaroundPrompt(character.description || character.name, character.name);
 
   try {
@@ -933,7 +933,7 @@ async function handleBatchCharacterImage(
     return NextResponse.json({ results: [], message: "All characters already have images" });
   }
 
-  const ai = resolveImageProvider(modelConfig);
+  const ai = await resolveImageProvider(modelConfig);
 
   const results = await Promise.all(
     needImages.map(async (character) => {
@@ -1534,7 +1534,7 @@ async function handleBatchFrameGenerate(
 
   const charsWithImages = frameCharacters.filter((c) => c.referenceImage);
 
-  const ai = resolveImageProvider(modelConfig, versionedUploadDir);
+  const ai = await resolveImageProvider(modelConfig, versionedUploadDir);
   const results: Array<{ shotId: string; sequence: number; status: string; firstFrame?: string; lastFrame?: string; error?: string }> = [];
 
   const overwrite = payload?.overwrite === true;
@@ -1737,7 +1737,7 @@ async function handleSingleFrameGenerate(
     : projectCharacters.filter((c) => c.referenceImage);
   const shotCharRefImages = filteredChars.map((c) => c.referenceImage as string);
 
-  const ai = resolveImageProvider(modelConfig, versionedUploadDir);
+  const ai = await resolveImageProvider(modelConfig, versionedUploadDir);
   const imageOpts = ratioToImageOpts(payload?.ratio as string | undefined);
 
   const frameFirstSlots = await resolveSlotContents("frame_generate_first", { userId, projectId });
@@ -1843,7 +1843,7 @@ async function handleSingleVideoGenerate(
     .where(eq(dialogues.shotId, shotId))
     .orderBy(asc(dialogues.sequence));
 
-  const videoProvider = resolveVideoProvider(modelConfig, versionedUploadDir);
+  const videoProvider = await resolveVideoProvider(modelConfig, versionedUploadDir);
   const videoSlots = await resolveSlotContents("video_generate", { userId, projectId });
 
   try {
@@ -1953,7 +1953,7 @@ async function handleBatchVideoGenerate(
     .map((c) => `${c.name}: ${c.description}`)
     .join("\n");
 
-  const videoProvider = resolveVideoProvider(modelConfig, versionedUploadDir);
+  const videoProvider = await resolveVideoProvider(modelConfig, versionedUploadDir);
   const ratio = (payload?.ratio as string) || "16:9";
   const videoMaxDuration = getModelMaxDuration(modelConfig?.video?.modelId);
   const videoSlots = await resolveSlotContents("video_generate", { userId, projectId });
@@ -2062,7 +2062,7 @@ async function handleSingleSceneFrame(
   try {
     await db.update(shots).set({ status: "generating" }).where(eq(shots.id, shotId));
 
-    const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
+    const imageProvider = await resolveImageProvider(modelConfig, versionedUploadDir);
     const slotContents = await resolveSlotContents("scene_frame_generate", { userId, projectId });
     const sceneFrameView = await loadShotLegacyView(shot.id);
     const sceneFramePrompt = buildSceneFramePrompt({
@@ -2144,7 +2144,7 @@ async function handleBatchSceneFrame(
     ? await getVersionedUploadDir(batchVersionId)
     : process.env.UPLOAD_DIR || "./uploads";
 
-  const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
+  const imageProvider = await resolveImageProvider(modelConfig, versionedUploadDir);
   const allShotsLegacy = await loadShotLegacyViewsBatch(allShots.map((s) => s.id));
 
   // Mark all eligible shots as generating
@@ -2340,7 +2340,7 @@ async function handleSingleReferenceVideo(
       ...sceneFrameInfos.map((s) => `@图片${s.index}是${s.label}`),
     ].join("，") + "。";
 
-    const videoProvider = resolveVideoProvider(modelConfig, versionedUploadDir);
+    const videoProvider = await resolveVideoProvider(modelConfig, versionedUploadDir);
 
     const videoModelId = modelConfig?.video?.modelId;
     const videoMaxDuration = getModelMaxDuration(videoModelId);
@@ -2354,7 +2354,7 @@ async function handleSingleReferenceVideo(
         ? shot.videoPrompt
         : `图像映射：${fullMapping}。\n\n${shot.videoPrompt}`;
     } else {
-      const textProvider = resolveAIProvider(modelConfig);
+      const textProvider = await resolveAIProvider(modelConfig);
       const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
       try {
         const motionContext = shot.motionScript || shot.videoScript || shot.prompt || "";
@@ -2475,9 +2475,9 @@ async function handleBatchReferenceVideo(
     .map((c) => `${c.name}: ${c.description}`)
     .join("\n");
 
-  const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
-  const videoProvider = resolveVideoProvider(modelConfig, versionedUploadDir);
-  const textProvider = resolveAIProvider(modelConfig);
+  const imageProvider = await resolveImageProvider(modelConfig, versionedUploadDir);
+  const videoProvider = await resolveVideoProvider(modelConfig, versionedUploadDir);
+  const textProvider = await resolveAIProvider(modelConfig);
   const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
   const ratio = (payload?.ratio as string) || "16:9";
   const videoMaxDuration = getModelMaxDuration(modelConfig?.video?.modelId);
@@ -2848,7 +2848,7 @@ async function handleSingleVideoPrompt(
     const videoModelId = modelConfig?.video?.modelId;
     const videoMaxDuration = getModelMaxDuration(videoModelId);
     const effectiveDuration = Math.min(shot.duration ?? 10, videoMaxDuration);
-    const textProvider = resolveAIProvider(modelConfig);
+    const textProvider = await resolveAIProvider(modelConfig);
     const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
     const motionContext = shot.motionScript || shot.videoScript || shot.prompt || "";
     // Filter to characters declared on this shot's reference assets
@@ -2983,7 +2983,7 @@ async function handleBatchVideoPrompt(
     batchGenMode = proj?.generationMode ?? "keyframe";
   }
 
-  const textProvider = resolveAIProvider(modelConfig);
+  const textProvider = await resolveAIProvider(modelConfig);
   const refVideoSystem = await resolvePrompt("ref_video_prompt", { userId, projectId });
   const videoMaxDuration = getModelMaxDuration(modelConfig?.video?.modelId);
 
@@ -3119,7 +3119,7 @@ async function handleAiOptimizeText(
 
   // Use vision-capable text provider when images present
   if (images.length > 0) {
-    const ai = resolveAIProvider(modelConfig);
+    const ai = await resolveAIProvider(modelConfig);
     const result = await ai.generateText(
       `原始文本：\n${originalText}\n\n优化指令：\n${instruction}\n\n请观察上方图片中的问题，结合指令输出优化后的文本：`,
       {
@@ -3175,7 +3175,7 @@ async function handleBatchRefImageGenerate(
     ? await getVersionedUploadDir(batchVersionId)
     : process.env.UPLOAD_DIR || "./uploads";
 
-  const imageProvider = resolveImageProvider(modelConfig, versionedUploadDir);
+  const imageProvider = await resolveImageProvider(modelConfig, versionedUploadDir);
 
   const results: Array<{
     shotId: string;
@@ -3265,7 +3265,7 @@ async function handleSingleRefImageGenerate(
 
   const ratio = (payload?.ratio as string) || "16:9";
   const imgOpts = ratioToImageOpts(ratio);
-  const imageProvider = resolveImageProvider(modelConfig);
+  const imageProvider = await resolveImageProvider(modelConfig);
 
   try {
     // Scene-only: do NOT inject character references here.
@@ -3454,7 +3454,7 @@ async function handleGenerateRefPrompts(
 `;
   }
 
-  const textProvider = resolveAIProvider(modelConfig);
+  const textProvider = await resolveAIProvider(modelConfig);
   const refImageSystem = await resolvePrompt("ref_image_prompts", { userId, projectId });
   const { deleteAssetsByType } = await import("@/lib/shot-asset-utils");
 
@@ -3629,7 +3629,7 @@ async function handleSingleShotRefImageGenerateAll(
 
   const ratio = (payload?.ratio as string) || "16:9";
   const imgOpts = ratioToImageOpts(ratio);
-  const imageProvider = resolveImageProvider(modelConfig);
+  const imageProvider = await resolveImageProvider(modelConfig);
 
   let generated = 0;
   for (const entry of pending) {
@@ -3805,7 +3805,7 @@ async function handleGenerateKeyframePrompts(
 `;
   }
 
-  const textProvider = resolveAIProvider(modelConfig);
+  const textProvider = await resolveAIProvider(modelConfig);
   const keyframeSystemPrompt = await resolvePrompt("shot_split_keyframe_assets", {
     userId,
     projectId,

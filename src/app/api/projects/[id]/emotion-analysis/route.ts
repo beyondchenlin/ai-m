@@ -37,7 +37,7 @@ export async function POST(
     return NextResponse.json({ scores: [] });
   }
 
-  const provider = resolveAIProvider(body.modelConfig);
+  const provider = await resolveAIProvider(body.modelConfig);
 
   const shotsText = allShots
     .map((s) => `Shot ${s.sequence}: ${s.prompt || s.motionScript || ""}`)
