@@ -2,6 +2,7 @@ import type { VideoProvider, VideoGenerateParams, VideoGenerateResult } from "..
 import fs from "node:fs";
 import path from "node:path";
 import { id as genId } from "@/lib/id";
+import { normalizeDashScopeBaseUrl } from "../dashscope-url";
 
 // Convert a local file path to a data: URL; http(s) URLs are returned as-is
 function toImageUrl(imagePathOrUrl: string): string {
@@ -52,11 +53,9 @@ export class WanVideoProvider implements VideoProvider {
     uploadDir?: string;
   }) {
     this.apiKey = params?.apiKey || process.env.WAN_API_KEY || process.env.DASHSCOPE_API_KEY || "";
-    this.baseUrl = (
-      params?.baseUrl ||
-      process.env.WAN_BASE_URL ||
-      "https://dashscope.aliyuncs.com/api/v1"
-    ).replace(/\/+$/, "");
+    this.baseUrl = normalizeDashScopeBaseUrl(
+      params?.baseUrl || process.env.WAN_BASE_URL,
+    );
     this.model = params?.model || process.env.WAN_MODEL || "wan2.1-i2v-plus";
     this.uploadDir = params?.uploadDir || process.env.UPLOAD_DIR || "./uploads";
   }
@@ -84,26 +83,31 @@ export class WanVideoProvider implements VideoProvider {
       body = this.buildTextBody(params);
     }
 
+    const submitEndpoint = `${this.baseUrl}/services/aigc/video-generation/video-synthesis`;
+
     console.log(
       `[WanVideo] Submitting task: model=${this.model}, ratio=${params.ratio}`
     );
+    console.log(`[WanVideo] Endpoint: ${submitEndpoint}`);
 
-    const submitRes = await fetch(
-      `${this.baseUrl}/services/aigc/video-generation/video-synthesis`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-          "X-DashScope-Async": "enable",
-        },
-        body: JSON.stringify(body),
-      }
-    );
+    const submitRes = await fetch(submitEndpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
+        "X-DashScope-Async": "enable",
+      },
+      body: JSON.stringify(body),
+    });
 
     if (!submitRes.ok) {
       const errText = await submitRes.text().catch(() => "");
-      throw new Error(`WanVideo submit failed: ${submitRes.status} ${errText}`);
+      const hint = submitRes.status === 404
+        ? "；请检查 baseUrl 是否包含 /api/v1 路径段（如 https://dashscope.aliyuncs.com/api/v1）"
+        : "";
+      throw new Error(
+        `WanVideo submit failed: ${submitRes.status} ${errText}${hint} [endpoint=${submitEndpoint}]`,
+      );
     }
 
     const submitResult = (await submitRes.json()) as {

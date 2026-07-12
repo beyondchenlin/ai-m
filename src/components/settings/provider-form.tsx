@@ -210,7 +210,11 @@ export function ProviderForm({ provider }: ProviderFormProps) {
               onChange={(e) =>
                 updateProvider(provider.id, { baseUrl: e.target.value })
               }
-              placeholder="https://api.openai.com"
+              placeholder={
+                provider.protocol === "dashscope" || provider.protocol === "wan"
+                  ? "https://dashscope.aliyuncs.com/api/v1（或 VPC 内网域名，可省略 https:// 和 /api/v1）"
+                  : "https://api.openai.com"
+              }
             />
           </div>
           <div className="space-y-1.5">

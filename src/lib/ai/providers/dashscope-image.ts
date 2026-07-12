@@ -2,6 +2,7 @@ import type { AIProvider, TextOptions, ImageOptions } from "../types";
 import fs from "node:fs";
 import path from "node:path";
 import { id as genId } from "@/lib/id";
+import { normalizeDashScopeBaseUrl } from "../dashscope-url";
 
 // ── Model family detection ──────────────────────────────────────────────────
 
@@ -105,11 +106,9 @@ export class DashScopeImageProvider implements AIProvider {
   }) {
     this.apiKey =
       params?.apiKey || process.env.DASHSCOPE_API_KEY || "";
-    this.baseUrl = (
-      params?.baseUrl ||
-      process.env.DASHSCOPE_BASE_URL ||
-      "https://dashscope.aliyuncs.com/api/v1"
-    ).replace(/\/+$/, "");
+    this.baseUrl = normalizeDashScopeBaseUrl(
+      params?.baseUrl || process.env.DASHSCOPE_BASE_URL,
+    );
     this.model =
       params?.model || process.env.DASHSCOPE_IMAGE_MODEL || "qwen-image-2.0-pro";
     this.uploadDir =
@@ -160,26 +159,30 @@ export class DashScopeImageProvider implements AIProvider {
       parameters,
     };
 
+    const endpoint = `${this.baseUrl}/services/aigc/multimodal-generation/generation`;
+
     console.log(
       `[DashScopeImage] Generating: model=${model}, family=${family}, size=${size}`,
     );
+    console.log(`[DashScopeImage] Endpoint: ${endpoint}`);
 
-    const res = await fetch(
-      `${this.baseUrl}/services/aigc/multimodal-generation/generation`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.apiKey}`,
       },
-    );
+      body: JSON.stringify(body),
+    });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
+      // 404 通常是 baseUrl 配置错误（如缺少 /api/v1 路径段），给出可操作的提示
+      const hint = res.status === 404
+        ? "；请检查 baseUrl 是否包含 /api/v1 路径段（如 https://dashscope.aliyuncs.com/api/v1）"
+        : "";
       throw new Error(
-        `DashScope image request failed: ${res.status} ${errText}`,
+        `DashScope image request failed: ${res.status} ${errText}${hint} [endpoint=${endpoint}]`,
       );
     }
 
