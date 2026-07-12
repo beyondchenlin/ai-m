@@ -249,6 +249,7 @@
     "complete": "가져오기 완료!",
     "newImport": "새로 가져오기",
     "retry": "재시도",
+    "reuploadRequired": "파일을 다시 업로드하고 재시도하세요",
     "showAll": "전체 보기",
     "main": "메인",
     "guest": "게스트",

@@ -249,6 +249,7 @@
     "complete": "インポート完了！",
     "newImport": "新規インポート",
     "retry": "再試行",
+    "reuploadRequired": "ファイルを再アップロードして再試行してください",
     "showAll": "すべて表示",
     "main": "メイン",
     "guest": "ゲスト",

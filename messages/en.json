@@ -249,6 +249,7 @@
     "complete": "Import complete!",
     "newImport": "New Import",
     "retry": "Retry",
+    "reuploadRequired": "Please re-upload the file and try again",
     "showAll": "Show All",
     "main": "Main",
     "guest": "Guest",

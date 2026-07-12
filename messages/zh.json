@@ -251,6 +251,7 @@
     "complete": "导入完成！",
     "newImport": "新建导入",
     "retry": "重试",
+    "reuploadRequired": "请重新上传文件后重试",
     "showAll": "显示全部",
     "main": "主角",
     "guest": "配角",

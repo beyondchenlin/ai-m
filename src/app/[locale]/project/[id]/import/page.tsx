@@ -9,12 +9,14 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { apiFetch } from "@/lib/api-fetch";
+import { apiFetch, ApiError } from "@/lib/api-fetch";
 import { useModelStore } from "@/stores/model-store";
 import { useModelGuard } from "@/hooks/use-model-guard";
+import { id as genId } from "@/lib/id";
 import { toast } from "sonner";
 
 const ACCEPTED = ".txt,.docx,.pdf,.md,.markdown";
+const ACCEPTED_EXTS = new Set(["txt", "docx", "pdf", "md", "markdown"]);
 const MAX_SIZE = 20 * 1024 * 1024;
 
 interface ExtractedCharacter {
@@ -33,6 +35,23 @@ interface SplitEpisode {
   characters?: string[];
 }
 
+/** Client-side display character with stable UID for React keys */
+interface DisplayCharacter extends ExtractedCharacter {
+  uid: string;
+}
+
+/** Client-side display episode with stable UID for React keys */
+interface DisplayEpisode extends SplitEpisode {
+  uid: string;
+}
+
+interface CharacterRelation {
+  characterA: string;
+  characterB: string;
+  relationType: string;
+  description?: string;
+}
+
 interface LogEntry {
   id: string;
   step: number;
@@ -43,6 +62,7 @@ interface LogEntry {
 }
 
 type Step = 1 | 2 | 3 | 4;
+type StepState = "idle" | "running" | "done" | "error";
 
 const STEPS = [
   { num: 1 as Step, icon: FileText, label: "importStep.parse" },
@@ -50,6 +70,99 @@ const STEPS = [
   { num: 3 as Step, icon: Layers, label: "importStep.split" },
   { num: 4 as Step, icon: Sparkles, label: "importStep.generate" },
 ] as const;
+
+const INITIAL_STEP_STATUS: Record<Step, StepState> = {
+  1: "idle", 2: "idle", 3: "idle", 4: "idle",
+};
+
+/** Deterministic hue from a name; safe for empty strings (returns 0) */
+function charHue(name: string): number {
+  return name ? (name.charCodeAt(0) * 37) % 360 : 0;
+}
+
+/** Case-insensitive name match (consistent with server-side dedup) */
+function nameEquals(a: string, b: string): boolean {
+  return a.toLowerCase().trim() === b.toLowerCase().trim();
+}
+
+/** Find the last log matching a predicate — avoids stale metadata after retries */
+function findLastLog<T extends LogEntry>(
+  logs: T[],
+  predicate: (l: T) => boolean,
+): T | undefined {
+  for (let i = logs.length - 1; i >= 0; i--) {
+    if (predicate(logs[i])) return logs[i];
+  }
+  return undefined;
+}
+
+// ── CharacterCard (shared between live review and history view) ──
+
+function CharacterCard({
+  char,
+  onToggleScope,
+}: {
+  char: ExtractedCharacter;
+  onToggleScope?: () => void;
+}) {
+  const t = useTranslations("import");
+  const hue = charHue(char.name);
+  const initial = char.name.charAt(0) || "?";
+
+  return (
+    <div className="group relative overflow-hidden rounded-[14px] border border-[--border-subtle] bg-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]">
+      <div className={`h-1 w-full ${char.scope === "main" ? "bg-gradient-to-r from-blue-500 to-blue-400" : "bg-gradient-to-r from-purple-500 to-purple-400"}`} />
+      <div className="p-3.5">
+        <div className="mb-2.5 flex items-center gap-2.5">
+          <div
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-sm font-bold text-white"
+            style={{ background: `linear-gradient(135deg, hsl(${hue}, 45%, 45%), hsl(${hue}, 50%, 55%))` }}
+          >
+            {initial}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[13px] font-bold text-[--text-primary]">{char.name}</div>
+            <div className="flex items-center gap-1.5 text-[10px] text-[--text-muted]">
+              <span>{t("frequency")} {char.frequency}</span>
+              {char.visualHint && (
+                <>
+                  <span className="h-[3px] w-[3px] rounded-full bg-[#ddd]" />
+                  <span className="truncate">{char.visualHint}</span>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+        {char.visualHint && (
+          <div className="mb-2 inline-block rounded-md bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
+            {char.visualHint}
+          </div>
+        )}
+        <p className="line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{char.description}</p>
+      </div>
+      {onToggleScope ? (
+        <button
+          onClick={onToggleScope}
+          className={`absolute right-3 top-3 rounded-[8px] px-2 py-0.5 text-[9px] font-bold tracking-wide transition-colors ${
+            char.scope === "main"
+              ? "bg-blue-50 text-blue-600 hover:bg-blue-100"
+              : "bg-purple-50 text-purple-600 hover:bg-purple-100"
+          }`}
+        >
+          {char.scope === "main" ? t("main") : t("guest")}
+        </button>
+      ) : (
+        <span className={`absolute right-3 top-3 rounded-[8px] px-2 py-0.5 text-[9px] font-bold tracking-wide ${
+          char.scope === "main" ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"
+        }`}>
+          {char.scope === "main" ? t("main") : t("guest")}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ── Main page component ──
 
 export default function ImportPage({
   params,
@@ -60,17 +173,19 @@ export default function ImportPage({
   const locale = useLocale();
   const router = useRouter();
   const t = useTranslations("import");
-  const tc = useTranslations("common");
   const textGuard = useModelGuard("text");
   const getModelConfig = useModelStore((s) => s.getModelConfig);
 
   // Pipeline state
   const [currentStep, setCurrentStep] = useState<Step | 0>(0);
-  const [stepStatus, setStepStatus] = useState<Record<Step, "idle" | "running" | "done" | "error">>({
-    1: "idle", 2: "idle", 3: "idle", 4: "idle",
-  });
+  const [stepStatus, setStepStatus] = useState<Record<Step, StepState>>(INITIAL_STEP_STATUS);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
+
+  // Guards against concurrent pipeline execution and stale timers
+  const isProcessingRef = useRef(false);
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Step 0: Upload
   const [file, setFile] = useState<File | null>(null);
@@ -80,55 +195,90 @@ export default function ImportPage({
   // Step 1 result
   const [fullText, setFullText] = useState("");
 
-  // Step 2 result
-  const [characters, setCharacters] = useState<ExtractedCharacter[]>([]);
-  const [relationships, setRelationships] = useState<Array<{ characterA: string; characterB: string; relationType: string; description?: string }>>([]);
+  // Step 2 result (with stable UIDs for React keys)
+  const [characters, setCharacters] = useState<DisplayCharacter[]>([]);
+  const [relationships, setRelationships] = useState<CharacterRelation[]>([]);
 
-  // Step 3 result
-  const [episodes, setEpisodes] = useState<SplitEpisode[]>([]);
+  // Step 3 result (with stable UIDs for React keys)
+  const [episodes, setEpisodes] = useState<DisplayEpisode[]>([]);
 
   // History mode
   const [historyMode, setHistoryMode] = useState(false);
   const [selectedStep, setSelectedStep] = useState<Step | null>(null);
+
+  // Cleanup redirect timer on unmount
+  useEffect(() => {
+    return () => {
+      if (redirectTimerRef.current) clearTimeout(redirectTimerRef.current);
+    };
+  }, []);
 
   // Load existing logs on mount
   useEffect(() => {
     async function loadLogs() {
       try {
         const res = await apiFetch(`/api/projects/${projectId}/import/logs`);
-        const data = await res.json();
-        if (data.length > 0) {
-          setLogs(data);
-          setHistoryMode(true);
-          // Determine last completed step
-          const doneSteps = data.filter((l: LogEntry) => l.status === "done").map((l: LogEntry) => l.step);
-          const maxDone = Math.max(0, ...doneSteps) as Step | 0;
-          setCurrentStep(maxDone);
-          for (let s = 1; s <= 4; s++) {
-            const stepLogs = data.filter((l: LogEntry) => l.step === s);
-            if (stepLogs.some((l: LogEntry) => l.status === "error")) {
-              setStepStatus((prev) => ({ ...prev, [s]: "error" }));
-            } else if (stepLogs.some((l: LogEntry) => l.status === "done")) {
-              setStepStatus((prev) => ({ ...prev, [s]: "done" }));
-            }
+        const data = (await res.json()) as LogEntry[];
+        if (data.length === 0) return; // fresh import
+
+        setLogs(data);
+        setHistoryMode(true);
+
+        // Determine last completed step
+        const doneSteps = data.filter((l) => l.status === "done").map((l) => l.step);
+        const maxDone = Math.max(0, ...doneSteps) as Step | 0;
+        setCurrentStep(maxDone);
+
+        for (let s = 1; s <= 4; s++) {
+          const stepLogs = data.filter((l) => l.step === s);
+          if (stepLogs.some((l) => l.status === "error")) {
+            setStepStatus((prev) => ({ ...prev, [s]: "error" }));
+          } else if (stepLogs.some((l) => l.status === "done")) {
+            setStepStatus((prev) => ({ ...prev, [s]: "done" }));
           }
         }
-      } catch {
-        // No logs, fresh import
+
+        // Restore characters/relationships from the latest step 2 "done" log
+        // (findLastLog avoids stale metadata after retries)
+        const step2Done = findLastLog(data, (l) => l.step === 2 && l.status === "done" && !!l.metadata);
+        if (step2Done) {
+          const meta = step2Done.metadata as Record<string, unknown> | undefined;
+          const chars = meta?.characters as ExtractedCharacter[] | undefined;
+          const rels = meta?.relationships as CharacterRelation[] | undefined;
+          if (chars) setCharacters(chars.map((c) => ({ ...c, uid: genId() })));
+          if (rels) setRelationships(rels);
+        }
+
+        // Restore episodes from the latest step 3 "done" log
+        const step3Done = findLastLog(data, (l) => l.step === 3 && l.status === "done" && !!l.metadata);
+        if (step3Done) {
+          const meta = step3Done.metadata as Record<string, unknown> | undefined;
+          const eps = meta?.episodes as SplitEpisode[] | undefined;
+          if (eps) setEpisodes(eps.map((e) => ({ ...e, uid: genId() })));
+        }
+      } catch (err) {
+        // Real errors (network, 500, etc.) — show toast so user knows history failed
+        const msg = err instanceof ApiError ? err.message : "Failed to load history";
+        toast.error(msg);
       }
     }
     loadLogs();
   }, [projectId]);
 
-  // Auto-scroll logs
+  // Auto-scroll logs only when user is near the bottom
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = logsContainerRef.current;
+    if (!container) return;
+    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+    if (isNearBottom) {
+      logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [logs]);
 
   const addLog = useCallback((step: Step, status: LogEntry["status"], message: string) => {
     setLogs((prev) => [
       ...prev,
-      { id: Date.now().toString(), step, status, message, createdAt: Date.now() },
+      { id: genId(), step, status, message, createdAt: Date.now() },
     ]);
   }, []);
 
@@ -137,120 +287,141 @@ export default function ImportPage({
       toast.error(t("fileTooLarge"));
       return;
     }
+    const ext = f.name.split(".").pop()?.toLowerCase();
+    if (!ext || !ACCEPTED_EXTS.has(ext)) {
+      toast.error(t("supportedFormats"));
+      return;
+    }
     setFile(f);
   }, [t]);
 
   // ── Step 1 + 2: Auto-run parse → character extraction ──
   async function startPipeline() {
+    if (isProcessingRef.current) return;
     if (!file) return;
     if (!textGuard()) return;
 
-    setHistoryMode(false);
-    setLogs([]);
-
-    // Clear old logs
-    await apiFetch(`/api/projects/${projectId}/import/logs`, { method: "DELETE" });
-
-    // Step 1: Parse
-    setCurrentStep(1);
-    setStepStatus((prev) => ({ ...prev, 1: "running" }));
-    addLog(1, "running", `解析文件: ${file.name}`);
-
-    let text: string;
+    isProcessingRef.current = true;
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await apiFetch(`/api/projects/${projectId}/import/parse`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
-      text = data.text;
-      setFullText(text);
-      addLog(1, "done", `解析完成，共 ${data.charCount} 字`);
-      setStepStatus((prev) => ({ ...prev, 1: "done" }));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Parse failed";
-      addLog(1, "error", `文件解析失败: ${msg}`);
-      setStepStatus((prev) => ({ ...prev, 1: "error" }));
-      return;
-    }
+      setHistoryMode(false);
+      setLogs([]);
+      setCharacters([]);
+      setRelationships([]);
+      setEpisodes([]);
+      setFullText("");
 
-    // Step 2: Character extraction (auto-continue)
-    setCurrentStep(2);
-    setStepStatus((prev) => ({ ...prev, 2: "running" }));
-    addLog(2, "running", "开始角色提取...");
-
-    try {
-      const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, modelConfig: getModelConfig() }),
-      });
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || `HTTP ${res.status}`);
+      // Clear old logs (best-effort; non-fatal if this fails — new logs overwrite old ones)
+      try {
+        await apiFetch(`/api/projects/${projectId}/import/logs`, { method: "DELETE" });
+      } catch {
+        // Non-fatal: server-side logs will be overwritten by new entries
       }
-      const data = await res.json();
-      setCharacters(data.characters);
-      setRelationships(data.relationships || []);
-      const mainCount = data.characters.filter((c: ExtractedCharacter) => c.scope === "main").length;
-      const guestCount = data.characters.length - mainCount;
-      addLog(2, "done", `提取完成: ${mainCount} 个主角, ${guestCount} 个配角`);
-      setStepStatus((prev) => ({ ...prev, 2: "done" }));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Extract failed";
-      addLog(2, "error", `角色提取失败: ${msg}`);
-      setStepStatus((prev) => ({ ...prev, 2: "error" }));
-      return;
+
+      // Step 1: Parse
+      setCurrentStep(1);
+      setStepStatus((prev) => ({ ...prev, 1: "running" }));
+      addLog(1, "running", `解析文件: ${file.name}`);
+
+      let text: string;
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const res = await apiFetch(`/api/projects/${projectId}/import/parse`, {
+          method: "POST",
+          body: form,
+        });
+        const data = await res.json();
+        text = data.text as string;
+        setFullText(text);
+        addLog(1, "done", `解析完成，共 ${data.charCount} 字`);
+        setStepStatus((prev) => ({ ...prev, 1: "done" }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Parse failed";
+        addLog(1, "error", `文件解析失败: ${msg}`);
+        setStepStatus((prev) => ({ ...prev, 1: "error" }));
+        return;
+      }
+
+      // Step 2: Character extraction (auto-continue)
+      setCurrentStep(2);
+      setStepStatus((prev) => ({ ...prev, 2: "running" }));
+      addLog(2, "running", "开始角色提取...");
+
+      try {
+        const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, modelConfig: getModelConfig() }),
+        });
+        const data = await res.json();
+        const chars: ExtractedCharacter[] = data.characters;
+        setCharacters(chars.map((c) => ({ ...c, uid: genId() })));
+        setRelationships(data.relationships || []);
+        const mainCount = chars.filter((c) => c.scope === "main").length;
+        const guestCount = chars.length - mainCount;
+        addLog(2, "done", `提取完成: ${mainCount} 个主角, ${guestCount} 个配角`);
+        setStepStatus((prev) => ({ ...prev, 2: "done" }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Extract failed";
+        addLog(2, "error", `角色提取失败: ${msg}`);
+        setStepStatus((prev) => ({ ...prev, 2: "error" }));
+      }
+    } finally {
+      isProcessingRef.current = false;
     }
   }
 
   // ── Step 2 only: Retry character extraction ──
   async function retryCharacterExtract() {
-    if (!fullText) return;
+    if (isProcessingRef.current) return;
+    if (!fullText) {
+      toast.error(t("reuploadRequired"));
+      return;
+    }
     if (!textGuard()) return;
 
-    setStepStatus((prev) => ({ ...prev, 2: "running" }));
-    addLog(2, "running", "重试角色提取...");
-
+    isProcessingRef.current = true;
     try {
+      setStepStatus((prev) => ({ ...prev, 2: "running" }));
+      addLog(2, "running", "重试角色提取...");
+
       const res = await apiFetch(`/api/projects/${projectId}/import/characters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: fullText, modelConfig: getModelConfig() }),
       });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || `HTTP ${res.status}`);
-      }
       const data = await res.json();
-      setCharacters(data.characters);
+      const chars: ExtractedCharacter[] = data.characters;
+      setCharacters(chars.map((c) => ({ ...c, uid: genId() })));
       setRelationships(data.relationships || []);
-      const mainCount = data.characters.filter((c: ExtractedCharacter) => c.scope === "main").length;
-      const guestCount = data.characters.length - mainCount;
+      const mainCount = chars.filter((c) => c.scope === "main").length;
+      const guestCount = chars.length - mainCount;
       addLog(2, "done", `提取完成: ${mainCount} 个主角, ${guestCount} 个配角`);
       setStepStatus((prev) => ({ ...prev, 2: "done" }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Extract failed";
       addLog(2, "error", `角色提取失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 2: "error" }));
+    } finally {
+      isProcessingRef.current = false;
     }
   }
 
   // ── Step 3: Split (triggered by user after reviewing characters) ──
   async function runSplit() {
+    if (isProcessingRef.current) return;
+    if (!fullText) {
+      toast.error(t("reuploadRequired"));
+      return;
+    }
     if (!textGuard()) return;
 
-    setCurrentStep(3);
-    setStepStatus((prev) => ({ ...prev, 3: "running" }));
-    addLog(3, "running", "开始自动分集...");
-
+    isProcessingRef.current = true;
     try {
+      setCurrentStep(3);
+      setStepStatus((prev) => ({ ...prev, 3: "running" }));
+      addLog(3, "running", "开始自动分集...");
+
       const res = await apiFetch(`/api/projects/${projectId}/import/split`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -260,28 +431,31 @@ export default function ImportPage({
           modelConfig: getModelConfig(),
         }),
       });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || `HTTP ${res.status}`);
-      }
       const data = await res.json();
-      setEpisodes(data.episodes);
-      addLog(3, "done", `分集完成，共 ${data.episodes.length} 集`);
+      const eps: SplitEpisode[] = data.episodes;
+      setEpisodes(eps.map((e) => ({ ...e, uid: genId() })));
+      addLog(3, "done", `分集完成，共 ${eps.length} 集`);
       setStepStatus((prev) => ({ ...prev, 3: "done" }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Split failed";
       addLog(3, "error", `分集失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 3: "error" }));
+    } finally {
+      isProcessingRef.current = false;
     }
   }
 
   // ── Step 4: Generate (triggered by user after reviewing episodes) ──
   async function runGenerate() {
-    setCurrentStep(4);
-    setStepStatus((prev) => ({ ...prev, 4: "running" }));
-    addLog(4, "running", `创建 ${episodes.length} 集和角色...`);
+    if (isProcessingRef.current) return;
+    if (episodes.length === 0 || characters.length === 0) return;
 
+    isProcessingRef.current = true;
     try {
+      setCurrentStep(4);
+      setStepStatus((prev) => ({ ...prev, 4: "running" }));
+      addLog(4, "running", `创建 ${episodes.length} 集和角色...`);
+
       const res = await apiFetch(`/api/projects/${projectId}/import/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -291,21 +465,19 @@ export default function ImportPage({
           relationships,
         }),
       });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || `HTTP ${res.status}`);
-      }
       const data = await res.json();
       addLog(4, "done", `导入完成！创建了 ${data.characterCount} 个角色和 ${data.episodes.length} 集`);
       setStepStatus((prev) => ({ ...prev, 4: "done" }));
       toast.success(t("complete"));
-      setTimeout(() => {
+      redirectTimerRef.current = setTimeout(() => {
         router.push(`/${locale}/project/${projectId}/episodes`);
       }, 1500);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Generate failed";
       addLog(4, "error", `创建失败: ${msg}`);
       setStepStatus((prev) => ({ ...prev, 4: "error" }));
+    } finally {
+      isProcessingRef.current = false;
     }
   }
 
@@ -314,7 +486,7 @@ export default function ImportPage({
     const failedStep = ([1, 2, 3, 4] as Step[]).find((s) => stepStatus[s] === "error");
     if (!failedStep) return;
     switch (failedStep) {
-      case 1: // Re-run full pipeline (need file again)
+      case 1:
         startPipeline();
         break;
       case 2:
@@ -329,25 +501,38 @@ export default function ImportPage({
     }
   }
 
-  function toggleScope(idx: number) {
+  function toggleScope(uid: string) {
     setCharacters((prev) =>
-      prev.map((c, i) =>
-        i === idx ? { ...c, scope: c.scope === "main" ? "guest" : "main" } : c
-      )
+      prev.map((c) =>
+        c.uid === uid ? { ...c, scope: c.scope === "main" ? "guest" : "main" } : c,
+      ),
     );
   }
 
-  function updateEpisode(idx: number, field: keyof SplitEpisode, value: string) {
+  function updateEpisode(uid: string, field: keyof SplitEpisode, value: string) {
     setEpisodes((prev) =>
-      prev.map((ep, i) => (i === idx ? { ...ep, [field]: value } : ep))
+      prev.map((ep) => (ep.uid === uid ? { ...ep, [field]: value } : ep)),
     );
   }
 
-  function removeEpisode(idx: number) {
-    setEpisodes((prev) => prev.filter((_, i) => i !== idx));
+  function removeEpisode(uid: string) {
+    setEpisodes((prev) => prev.filter((ep) => ep.uid !== uid));
   }
 
-  const stepIcon = (status: string) => {
+  function resetAll() {
+    setHistoryMode(false);
+    setSelectedStep(null);
+    setCurrentStep(0);
+    setStepStatus(INITIAL_STEP_STATUS);
+    setLogs([]);
+    setFile(null);
+    setFullText("");
+    setCharacters([]);
+    setRelationships([]);
+    setEpisodes([]);
+  }
+
+  const stepIcon = (status: StepState) => {
     switch (status) {
       case "running": return <Loader2 className="h-4 w-4 animate-spin" />;
       case "done": return <Check className="h-4 w-4" />;
@@ -356,7 +541,7 @@ export default function ImportPage({
     }
   };
 
-  const stepColor = (status: string, selected: boolean) => {
+  const stepColor = (status: StepState, selected: boolean) => {
     const base = (() => {
       switch (status) {
         case "running": return "border-primary/30 bg-primary/5 text-primary";
@@ -373,6 +558,37 @@ export default function ImportPage({
   const showCharReview = stepStatus[2] === "done" && stepStatus[3] === "idle" && !historyMode;
   // Show episodes review after step 3 done + step 4 idle
   const showEpReview = stepStatus[3] === "done" && stepStatus[4] === "idle" && !historyMode;
+
+  // Memoized derived data for the logs panel (avoids recompute on every keystroke)
+  const showLogsPanel = (currentStep > 0 || historyMode) && !showCharReview && !showEpReview;
+
+  const filteredLogs = useMemo(
+    () => (selectedStep ? logs.filter((l) => l.step === selectedStep) : logs),
+    [logs, selectedStep],
+  );
+
+  const metaCharacters = useMemo(() => {
+    if (selectedStep !== 2) return undefined;
+    const log = findLastLog(logs, (l) => l.step === 2 && l.status === "done" && !!l.metadata);
+    const meta = log?.metadata as Record<string, unknown> | undefined;
+    return meta?.characters as ExtractedCharacter[] | undefined;
+  }, [logs, selectedStep]);
+
+  const metaEpisodes = useMemo(() => {
+    if (selectedStep !== 3) return undefined;
+    const log = findLastLog(logs, (l) => l.step === 3 && l.status === "done" && !!l.metadata);
+    const meta = log?.metadata as Record<string, unknown> | undefined;
+    return meta?.episodes as SplitEpisode[] | undefined;
+  }, [logs, selectedStep]);
+
+  const step2CharactersForEpisodes = useMemo(() => {
+    if (selectedStep !== 3) return undefined;
+    const log = findLastLog(logs, (l) => l.step === 2 && l.status === "done" && !!l.metadata);
+    const meta = log?.metadata as Record<string, unknown> | undefined;
+    return meta?.characters as ExtractedCharacter[] | undefined;
+  }, [logs, selectedStep]);
+
+  const hasFailedStep = ([1, 2, 3, 4] as Step[]).some((s) => stepStatus[s] === "error");
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] overflow-hidden">
@@ -401,7 +617,6 @@ export default function ImportPage({
                 onClick={() => isClickable && setSelectedStep(isSelected ? null : num)}
                 className={`relative flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-200 ${stepColor(stepStatus[num], isSelected)} ${isClickable ? "cursor-pointer hover:bg-primary/5" : ""}`}
               >
-                {/* Left accent bar for selected */}
                 {isSelected && (
                   <div className="absolute left-0 top-1/2 h-6 w-[3px] -translate-y-1/2 rounded-r-full bg-primary" />
                 )}
@@ -426,7 +641,6 @@ export default function ImportPage({
         {/* Upload area (only when no step started) */}
         {currentStep === 0 && !historyMode && (
           <div className="mx-auto w-full max-w-xl space-y-6">
-            {/* Drop zone */}
             <div
               className={`relative flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-12 transition-colors ${
                 dragOver
@@ -495,56 +709,12 @@ export default function ImportPage({
             </div>
             <p className="text-sm text-[--text-muted]">{t("reviewCharactersHint")}</p>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
-              {characters.map((char, idx) => (
-                <div
-                  key={idx}
-                  className="group relative overflow-hidden rounded-[14px] border border-[--border-subtle] bg-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
-                >
-                  {/* Top accent strip */}
-                  <div className={`h-1 w-full ${char.scope === "main" ? "bg-gradient-to-r from-blue-500 to-blue-400" : "bg-gradient-to-r from-purple-500 to-purple-400"}`} />
-                  <div className="p-3.5">
-                    {/* Avatar + Name */}
-                    <div className="mb-2.5 flex items-center gap-2.5">
-                      <div
-                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-sm font-bold text-white"
-                        style={{ background: `linear-gradient(135deg, hsl(${(char.name.charCodeAt(0) * 37) % 360}, 45%, 45%), hsl(${(char.name.charCodeAt(0) * 37) % 360}, 50%, 55%))` }}
-                      >
-                        {char.name.charAt(0)}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[13px] font-bold text-[--text-primary]">{char.name}</div>
-                        <div className="flex items-center gap-1.5 text-[10px] text-[--text-muted]">
-                          <span>{t("frequency")} {char.frequency}</span>
-                          {char.visualHint && (
-                            <>
-                              <span className="h-[3px] w-[3px] rounded-full bg-[#ddd]" />
-                              <span className="truncate">{char.visualHint}</span>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    {/* Visual hint tag */}
-                    {char.visualHint && (
-                      <div className="mb-2 inline-block rounded-md bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
-                        {char.visualHint}
-                      </div>
-                    )}
-                    {/* Description */}
-                    <p className="line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{char.description}</p>
-                  </div>
-                  {/* Scope badge (floating, clickable) */}
-                  <button
-                    onClick={() => toggleScope(idx)}
-                    className={`absolute right-3 top-3 rounded-[8px] px-2 py-0.5 text-[9px] font-bold tracking-wide transition-colors ${
-                      char.scope === "main"
-                        ? "bg-blue-50 text-blue-600 hover:bg-blue-100"
-                        : "bg-purple-50 text-purple-600 hover:bg-purple-100"
-                    }`}
-                  >
-                    {char.scope === "main" ? t("main") : t("guest")}
-                  </button>
-                </div>
+              {characters.map((char) => (
+                <CharacterCard
+                  key={char.uid}
+                  char={char}
+                  onToggleScope={() => toggleScope(char.uid)}
+                />
               ))}
             </div>
           </div>
@@ -565,7 +735,7 @@ export default function ImportPage({
             <div className="space-y-3">
               {episodes.map((ep, idx) => (
                 <div
-                  key={idx}
+                  key={ep.uid}
                   className="rounded-xl border border-[--border-subtle] bg-white p-4"
                 >
                   <div className="mb-2 flex items-center gap-3">
@@ -574,11 +744,11 @@ export default function ImportPage({
                     </span>
                     <Input
                       value={ep.title}
-                      onChange={(e) => updateEpisode(idx, "title", e.target.value)}
+                      onChange={(e) => updateEpisode(ep.uid, "title", e.target.value)}
                       className="h-8 text-sm font-semibold"
                     />
                     <button
-                      onClick={() => removeEpisode(idx)}
+                      onClick={() => removeEpisode(ep.uid)}
                       className="shrink-0 text-[--text-muted] hover:text-red-500"
                     >
                       <X className="h-4 w-4" />
@@ -587,10 +757,10 @@ export default function ImportPage({
                   <p className="text-xs text-[--text-muted]">{ep.description}</p>
                   {ep.characters && ep.characters.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1">
-                      {ep.characters.map((name) => {
-                        const isMain = characters.some((c) => c.name === name && c.scope === "main");
+                      {ep.characters.map((name, ci) => {
+                        const isMain = characters.some((c) => nameEquals(c.name, name) && c.scope === "main");
                         return (
-                          <span key={name} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
+                          <span key={`${name}-${ci}`} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
                             {name}
                           </span>
                         );
@@ -599,8 +769,8 @@ export default function ImportPage({
                   )}
                   {ep.keywords && (
                     <div className="mt-2 flex flex-wrap gap-1">
-                      {ep.keywords.split(/[,，]/).map((kw) => kw.trim()).filter(Boolean).map((kw) => (
-                        <span key={kw} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                      {ep.keywords.split(/[,，]/).map((kw) => kw.trim()).filter(Boolean).map((kw, ci) => (
+                        <span key={`${kw}-${ci}`} className="rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                           {kw}
                         </span>
                       ))}
@@ -613,190 +783,126 @@ export default function ImportPage({
         )}
 
         {/* Logs panel */}
-        {(currentStep > 0 || historyMode) && !showCharReview && !showEpReview && (() => {
-          const filteredLogs = selectedStep
-            ? logs.filter((l) => l.step === selectedStep)
-            : logs;
-
-          // Extract metadata from the "done" log of the selected step
-          const stepDoneLog = selectedStep
-            ? logs.find((l) => l.step === selectedStep && l.status === "done" && l.metadata)
-            : null;
-          const meta = stepDoneLog?.metadata as Record<string, unknown> | null;
-          const metaCharacters = meta?.characters as ExtractedCharacter[] | undefined;
-          const metaEpisodes = meta?.episodes as SplitEpisode[] | undefined;
-
-          // For step 3, also show characters from step 2
-          const step2DoneLog = (selectedStep === 3)
-            ? logs.find((l) => l.step === 2 && l.status === "done" && l.metadata)
-            : null;
-          const step2Meta = step2DoneLog?.metadata as Record<string, unknown> | null;
-          const step2Characters = step2Meta?.characters as ExtractedCharacter[] | undefined;
-
-          return (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="font-display text-sm font-semibold text-[--text-secondary]">
-                  {t("processLog")}
-                  {selectedStep && (
-                    <span className="ml-2 text-xs font-normal text-[--text-muted]">
-                      — {t(STEPS[selectedStep - 1].label)}
-                    </span>
-                  )}
-                </h3>
+        {showLogsPanel && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-display text-sm font-semibold text-[--text-secondary]">
+                {t("processLog")}
                 {selectedStep && (
-                  <button
-                    onClick={() => setSelectedStep(null)}
-                    className="text-xs text-primary hover:underline"
-                  >
-                    {t("showAll")}
-                  </button>
+                  <span className="ml-2 text-xs font-normal text-[--text-muted]">
+                    — {t(STEPS[selectedStep - 1].label)}
+                  </span>
                 )}
-              </div>
+              </h3>
+              {selectedStep && (
+                <button
+                  onClick={() => setSelectedStep(null)}
+                  className="text-xs text-primary hover:underline"
+                >
+                  {t("showAll")}
+                </button>
+              )}
+            </div>
 
-              <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
-                <div className="max-h-[30vh] space-y-1.5 overflow-y-auto font-mono text-xs">
-                  {filteredLogs.map((log) => (
-                    <div key={log.id} className="flex items-start gap-2">
-                      <span
-                        className={`mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full ${
-                          log.status === "done"
-                            ? "bg-emerald-500"
-                            : log.status === "error"
-                              ? "bg-red-500"
-                              : "bg-amber-400"
-                        }`}
-                      />
-                      {!selectedStep && (
-                        <span className="shrink-0 text-[--text-muted]">[Step {log.step}]</span>
-                      )}
-                      <span className={log.status === "error" ? "text-red-500" : "text-[--text-primary]"}>
-                        {log.message}
-                      </span>
-                    </div>
+            <div className="rounded-xl border border-[--border-subtle] bg-white p-4">
+              <div ref={logsContainerRef} className="max-h-[30vh] space-y-1.5 overflow-y-auto font-mono text-xs">
+                {filteredLogs.map((log) => (
+                  <div key={log.id} className="flex items-start gap-2">
+                    <span
+                      className={`mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full ${
+                        log.status === "done"
+                          ? "bg-emerald-500"
+                          : log.status === "error"
+                            ? "bg-red-500"
+                            : "bg-amber-400"
+                      }`}
+                    />
+                    {!selectedStep && (
+                      <span className="shrink-0 text-[--text-muted]">[Step {log.step}]</span>
+                    )}
+                    <span className={log.status === "error" ? "text-red-500" : "text-[--text-primary]"}>
+                      {log.message}
+                    </span>
+                  </div>
+                ))}
+                <div ref={logsEndRef} />
+              </div>
+            </div>
+
+            {/* Retry button when a step has failed */}
+            {hasFailedStep && !historyMode && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={retryStep}
+                className="self-start"
+              >
+                <AlertCircle className="mr-1.5 h-3.5 w-3.5" />
+                {t("retry")}
+              </Button>
+            )}
+
+            {/* Step 2 metadata: characters */}
+            {selectedStep === 2 && metaCharacters && metaCharacters.length > 0 && (
+              <div>
+                <h4 className="mb-2 text-sm font-medium text-[--text-secondary]">
+                  {t("reviewCharacters")} ({metaCharacters.length})
+                </h4>
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+                  {metaCharacters.map((char) => (
+                    <CharacterCard key={char.name} char={char} />
                   ))}
-                  <div ref={logsEndRef} />
                 </div>
               </div>
+            )}
 
-              {/* Retry button when a step has failed */}
-              {([1, 2, 3, 4] as Step[]).some((s) => stepStatus[s] === "error") && !historyMode && (
+            {/* Step 3 metadata: episodes */}
+            {selectedStep === 3 && metaEpisodes && metaEpisodes.length > 0 && (
+              <div>
+                <h4 className="mb-2 text-sm font-medium text-[--text-secondary]">
+                  {t("reviewEpisodes")} ({metaEpisodes.length})
+                </h4>
+                <div className="space-y-2">
+                  {metaEpisodes.map((ep, idx) => (
+                    <div key={`${ep.title}-${idx}`} className="rounded-xl border border-[--border-subtle] bg-white p-3">
+                      <div className="mb-1 flex items-center gap-2">
+                        <span className="rounded-md bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary">
+                          EP.{String(idx + 1).padStart(2, "0")}
+                        </span>
+                        <span className="text-sm font-semibold text-[--text-primary]">{ep.title}</span>
+                      </div>
+                      <p className="text-xs text-[--text-muted]">{ep.description}</p>
+                      {ep.characters && ep.characters.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {ep.characters.map((name, ci) => {
+                            const isMain = step2CharactersForEpisodes?.some((c) => nameEquals(c.name, name) && c.scope === "main");
+                            return (
+                              <span key={`${name}-${ci}`} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
+                                {name}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {historyMode && (
+              <div className="flex gap-2 pt-2">
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={retryStep}
-                  className="self-start"
+                  onClick={resetAll}
                 >
-                  <AlertCircle className="mr-1.5 h-3.5 w-3.5" />
-                  {t("retry")}
+                  {t("newImport")}
                 </Button>
-              )}
-
-              {/* Step 2 metadata: characters */}
-              {selectedStep === 2 && metaCharacters && metaCharacters.length > 0 && (
-                <div>
-                  <h4 className="mb-2 text-sm font-medium text-[--text-secondary]">
-                    {t("reviewCharacters")} ({metaCharacters.length})
-                  </h4>
-                  <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
-                    {metaCharacters.map((char, idx) => (
-                      <div
-                        key={idx}
-                        className="group relative overflow-hidden rounded-[14px] border border-[--border-subtle] bg-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/5 hover:border-[--border-hover]"
-                      >
-                        <div className={`h-1 w-full ${char.scope === "main" ? "bg-gradient-to-r from-blue-500 to-blue-400" : "bg-gradient-to-r from-purple-500 to-purple-400"}`} />
-                        <div className="p-3.5">
-                          <div className="mb-2.5 flex items-center gap-2.5">
-                            <div
-                              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-sm font-bold text-white"
-                              style={{ background: `linear-gradient(135deg, hsl(${(char.name.charCodeAt(0) * 37) % 360}, 45%, 45%), hsl(${(char.name.charCodeAt(0) * 37) % 360}, 50%, 55%))` }}
-                            >
-                              {char.name.charAt(0)}
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate text-[13px] font-bold text-[--text-primary]">{char.name}</div>
-                              <div className="flex items-center gap-1.5 text-[10px] text-[--text-muted]">
-                                <span>{t("frequency")} {char.frequency}</span>
-                                {char.visualHint && (
-                                  <>
-                                    <span className="h-[3px] w-[3px] rounded-full bg-[#ddd]" />
-                                    <span className="truncate">{char.visualHint}</span>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                          {char.visualHint && (
-                            <div className="mb-2 inline-block rounded-md bg-[--surface] px-2 py-0.5 text-[10px] font-medium text-[--text-muted]">
-                              {char.visualHint}
-                            </div>
-                          )}
-                          <p className="line-clamp-2 text-[11px] leading-relaxed text-[--text-muted]">{char.description}</p>
-                        </div>
-                        <span className={`absolute right-3 top-3 rounded-[8px] px-2 py-0.5 text-[9px] font-bold tracking-wide ${
-                          char.scope === "main" ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"
-                        }`}>
-                          {char.scope === "main" ? t("main") : t("guest")}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Step 3 metadata: episodes */}
-              {selectedStep === 3 && metaEpisodes && metaEpisodes.length > 0 && (
-                <div>
-                  <h4 className="mb-2 text-sm font-medium text-[--text-secondary]">
-                    {t("reviewEpisodes")} ({metaEpisodes.length})
-                  </h4>
-                  <div className="space-y-2">
-                    {metaEpisodes.map((ep, idx) => (
-                      <div key={idx} className="rounded-xl border border-[--border-subtle] bg-white p-3">
-                        <div className="mb-1 flex items-center gap-2">
-                          <span className="rounded-md bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary">
-                            EP.{String(idx + 1).padStart(2, "0")}
-                          </span>
-                          <span className="text-sm font-semibold text-[--text-primary]">{ep.title}</span>
-                        </div>
-                        <p className="text-xs text-[--text-muted]">{ep.description}</p>
-                        {ep.characters && ep.characters.length > 0 && (
-                          <div className="mt-2 flex flex-wrap gap-1">
-                            {ep.characters.map((name) => {
-                              const isMain = step2Characters?.some((c) => c.name === name && c.scope === "main");
-                              return (
-                                <span key={name} className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${isMain ? "bg-blue-50 text-blue-600" : "bg-purple-50 text-purple-600"}`}>
-                                  {name}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {historyMode && (
-                <div className="flex gap-2 pt-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setHistoryMode(false);
-                      setSelectedStep(null);
-                      setCurrentStep(0);
-                      setStepStatus({ 1: "idle", 2: "idle", 3: "idle", 4: "idle" });
-                    }}
-                  >
-                    {t("newImport")}
-                  </Button>
-                </div>
-              )}
-            </div>
-          );
-        })()}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
