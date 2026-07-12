@@ -12,7 +12,9 @@
     "worker:dev": "tsx src/worker/index.ts",
     "worker": "node dist/worker/index.js",
     "seed:zimage": "npx tsx scripts/seed-zimage-workflow.ts",
-    "promote:zimage": "npx tsx scripts/promote-zimage-workflow.ts"
+    "promote:zimage": "npx tsx scripts/promote-zimage-workflow.ts",
+    "seed:zimage-quality": "npx tsx scripts/seed-zimage-quality-workflow.ts",
+    "promote:zimage-quality": "npx tsx scripts/promote-zimage-quality-workflow.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.43",

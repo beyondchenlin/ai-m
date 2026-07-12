@@ -22,6 +22,8 @@ import { createGenerationJob, getGenerationJob } from "./jobs/service";
 import type { CreateGenerationJobInput } from "./contracts";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { id as genId } from "@/lib/id";
+import { normalizeParameters, type InputParameters } from "./parameter-normalization";
+import { processReferenceImages, type ReferenceImageInput } from "./reference-image-processor";
 
 /** 业务上下文类型 */
 export type BusinessContextKind =
@@ -39,7 +41,10 @@ export async function createCharacterImageJob(
     negativePrompt?: string;
     width?: number;
     height?: number;
+    aspectRatio?: string;
     seed?: string;
+    referenceImages?: ReferenceImageInput[];
+    profileRevisionId?: string;
   } = {}
 ): Promise<{ jobId: string; profileRevisionId: string }> {
   if (!isEnabled(FF.V2_LOCAL_IMAGE)) {
@@ -56,10 +61,10 @@ export async function createCharacterImageJob(
     throw new Error(`Character not found: ${characterId}`);
   }
 
-  // 解析默认生成配置
-  const profileRevisionId = await resolveDefaultProfile("image");
+  // 解析生成配置
+  const profileRevisionId = options.profileRevisionId || await resolveDefaultProfile("image");
   if (!profileRevisionId) {
-    throw new Error("No default image generation profile configured");
+    throw new Error("No image generation profile configured");
   }
 
   // 构建提示词
@@ -68,17 +73,29 @@ export async function createCharacterImageJob(
     throw new Error("No prompt available for character image generation");
   }
 
+  // 规范化参数
+  const inputParams: InputParameters = {
+    prompt,
+    negativePrompt: options.negativePrompt,
+    width: options.width,
+    height: options.height,
+    aspectRatio: options.aspectRatio,
+    seed: options.seed,
+  };
+
+  const normalized = normalizeParameters(inputParams);
+
   // 创建生成任务
   const input: CreateGenerationJobInput = {
     capability: "image",
     profileRevisionId,
     projectId,
     request: {
-      prompt,
-      negativePrompt: options.negativePrompt || "",
-      width: options.width || 1024,
-      height: options.height || 1024,
-      seed: options.seed,
+      prompt: normalized.prompt,
+      negativePrompt: normalized.negativePrompt,
+      width: normalized.width,
+      height: normalized.height,
+      seed: normalized.seed,
     },
     businessContext: {
       kind: "character-image",
@@ -87,6 +104,30 @@ export async function createCharacterImageJob(
   };
 
   const job = await createGenerationJob(input, { userId, roles: ["user"] });
+
+  // 处理参考图（如果有）
+  if (options.referenceImages && options.referenceImages.length > 0) {
+    const processedRefs = await processReferenceImages(
+      options.referenceImages,
+      {},
+      job.id
+    );
+
+    // 将参考图信息附加到任务元数据
+    await db
+      .update(generationJobs)
+      .set({
+        metadataJson: {
+          ...(job.metadataJson as Record<string, unknown> || {}),
+          referenceImages: processedRefs.map(ref => ({
+            artifactId: ref.artifactId,
+            strength: ref.strength,
+            semanticLabel: ref.semanticLabel,
+          })),
+        },
+      })
+      .where(eq(generationJobs.id, job.id));
+  }
 
   return { jobId: job.id, profileRevisionId };
 }
