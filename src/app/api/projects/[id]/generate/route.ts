@@ -3910,6 +3910,12 @@ async function handleSingleCharacterImageV2(
 ) {
   const characterId = payload?.characterId as string | undefined;
   const profileRevisionId = payload?.profileRevisionId as string | undefined;
+  const referenceMode = payload?.referenceMode as "off" | "auto" | "forced" | undefined;
+  const referenceImages = payload?.referenceImages as Array<{
+    source: string;
+    semanticType?: string;
+    strength?: number;
+  }> | undefined;
 
   if (!characterId) {
     return NextResponse.json({ error: "No characterId provided" }, { status: 400 });
@@ -3924,7 +3930,20 @@ async function handleSingleCharacterImageV2(
     const { createCharacterImageJob } = await import("@/lib/generation/business-adapter");
 
     // 创建 v2 生成任务
-    const { jobId } = await createCharacterImageJob(characterId, projectId, userId);
+    const { jobId } = await createCharacterImageJob(
+      characterId,
+      projectId,
+      userId,
+      {
+        profileRevisionId,
+        referenceMode,
+        referenceImages: referenceImages?.map(ref => ({
+          source: ref.source,
+          semanticType: ref.semanticType as any,
+          strength: ref.strength,
+        })),
+      }
+    );
 
     console.log(`[SingleCharacterImageV2] Created job ${jobId} for character ${characterId}`);
 

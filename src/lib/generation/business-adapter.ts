@@ -23,7 +23,13 @@ import type { CreateGenerationJobInput } from "./contracts";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { id as genId } from "@/lib/id";
 import { normalizeParameters, type InputParameters } from "./parameter-normalization";
-import { processReferenceImages, type ReferenceImageInput } from "./reference-image-processor";
+import { 
+  processReferenceImages, 
+  applyReferenceMode,
+  type ReferenceImageInput, 
+  type ReferenceMode,
+  type ReferenceSemanticType 
+} from "./reference-image-processor";
 import { chunkText, type ChunkingConfig } from "./audio-chunking";
 import { getVoiceProfile } from "./voice-profiles";
 
@@ -47,6 +53,7 @@ export async function createCharacterImageJob(
     aspectRatio?: string;
     seed?: string;
     referenceImages?: ReferenceImageInput[];
+    referenceMode?: ReferenceMode;
     profileRevisionId?: string;
   } = {}
 ): Promise<{ jobId: string; profileRevisionId: string }> {
@@ -110,11 +117,16 @@ export async function createCharacterImageJob(
 
   // 处理参考图（如果有）
   if (options.referenceImages && options.referenceImages.length > 0) {
+    // 处理参考图文件
     const processedRefs = await processReferenceImages(
       options.referenceImages,
       {},
       job.id
     );
+
+    // 应用参考图模式（off/auto/forced）
+    const referenceMode = options.referenceMode || "auto";
+    const finalRefs = applyReferenceMode(referenceMode, processedRefs, {});
 
     // 将参考图信息附加到任务元数据
     await db
@@ -122,7 +134,8 @@ export async function createCharacterImageJob(
       .set({
         metadataJson: {
           ...(job.metadataJson as Record<string, unknown> || {}),
-          referenceImages: processedRefs.map(ref => ({
+          referenceMode,
+          referenceImages: finalRefs.map(ref => ({
             artifactId: ref.artifactId,
             strength: ref.strength,
             semanticLabel: ref.semanticLabel,

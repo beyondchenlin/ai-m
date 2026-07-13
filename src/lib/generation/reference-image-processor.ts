@@ -31,6 +31,8 @@ export interface ReferenceImageConfig {
   defaultStrength: number;
   /** 参考图强度范围 */
   strengthRange: { min: number; max: number };
+  /** 是否支持参考图 */
+  supportsReferenceImages: boolean;
 }
 
 /** 默认参考图配置 */
@@ -40,7 +42,24 @@ const DEFAULT_REFERENCE_CONFIG: ReferenceImageConfig = {
   maxFileSizeBytes: 10 * 1024 * 1024, // 10MB
   defaultStrength: 0.7,
   strengthRange: { min: 0.0, max: 1.0 },
+  supportsReferenceImages: true,
 };
+
+/** 参考图语义类型（手册 §28.1） */
+export type ReferenceSemanticType =
+  | "identity"      // 身份
+  | "face"          // 脸部
+  | "body"          // 体型
+  | "clothing"      // 服装
+  | "style"         // 风格
+  | "scene"         // 场景
+  | "prop"          // 道具
+  | "first_frame"   // 首帧
+  | "last_frame"    // 尾帧
+  | "general";      // 通用
+
+/** 参考图模式（手册 §28.1） */
+export type ReferenceMode = "off" | "auto" | "forced";
 
 /** 参考图输入 */
 export interface ReferenceImageInput {
@@ -50,6 +69,8 @@ export interface ReferenceImageInput {
   strength?: number;
   /** 参考图语义标签 */
   semanticLabel?: string;
+  /** 参考图语义类型 */
+  semanticType?: ReferenceSemanticType;
 }
 
 /** 处理后的参考图 */
@@ -219,6 +240,70 @@ export async function processReferenceImages(
   }
 
   return processed;
+}
+
+/**
+ * 检查工作流是否支持参考图注入
+ *
+ * 扫描工作流节点，查找包含 reference_images 输入字段的节点。
+ */
+export function workflowSupportsReferenceImages(
+  workflow: Record<string, unknown>
+): boolean {
+  const nodes = workflow.nodes as Record<string, Record<string, unknown>> | undefined;
+  if (!nodes) return false;
+
+  for (const node of Object.values(nodes)) {
+    const inputs = node.inputs as Record<string, unknown> | undefined;
+    if (inputs && inputs.reference_images !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 根据参考图模式过滤和验证参考图
+ *
+ * 手册 §28.1：参考图模式
+ * - off: 不使用参考图，返回空数组
+ * - auto: 有参考图且工作流支持时注入；工作流不支持时静默跳过
+ * - forced: 必须注入参考图；工作流不支持时阻止生成
+ *
+ * @returns 实际应注入的参考图列表（off 模式返回空，auto 模式可能返回空）
+ * @throws forced 模式下工作流不支持参考图时抛出错误
+ */
+export function applyReferenceMode(
+  mode: ReferenceMode,
+  references: ProcessedReferenceImage[],
+  workflow: Record<string, unknown>
+): ProcessedReferenceImage[] {
+  switch (mode) {
+    case "off":
+      return [];
+
+    case "auto":
+      if (references.length === 0) return [];
+      if (!workflowSupportsReferenceImages(workflow)) {
+        // 工作流不支持参考图，auto 模式静默跳过
+        return [];
+      }
+      return references;
+
+    case "forced":
+      if (references.length === 0) {
+        throw new Error("forced reference mode requires at least one reference image");
+      }
+      if (!workflowSupportsReferenceImages(workflow)) {
+        throw new Error(
+          "forced reference mode but workflow does not support reference images"
+        );
+      }
+      return references;
+
+    default:
+      throw new Error(`Unknown reference mode: ${mode}`);
+  }
 }
 
 /**

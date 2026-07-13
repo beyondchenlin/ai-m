@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "next-intl";
 import { uploadUrl } from "@/lib/utils/upload-url";
 import { useModelStore, type ModelRef } from "@/stores/model-store";
-import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight, Upload } from "lucide-react";
+import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight, Upload, Image as ImageIcon } from "lucide-react";
 import { InlineModelPicker } from "@/components/editor/model-selector";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelGuard } from "@/hooks/use-model-guard";
@@ -67,6 +67,16 @@ export function CharacterCard({
   const imageGuard = useModelGuard("image");
   const isGenerating = generating || (!!batchGenerating && !referenceImage);
 
+  // 参考图配置
+  const [referenceMode, setReferenceMode] = useState<"off" | "auto" | "forced">("auto");
+  const [referenceImages, setReferenceImages] = useState<Array<{
+    id: string;
+    file: File;
+    semanticType: string;
+    strength: number;
+  }>>([]);
+  const referenceInputRef = useRef<HTMLInputElement>(null);
+
   function resolveImageRef(ref: ModelRef | null) {
     if (!ref) return null;
     const provider = providers.find((p) => p.id === ref.providerId);
@@ -98,12 +108,37 @@ export function CharacterCard({
 
       if (isLocalGeneration) {
         // v2 本地生成流程
+        // 先上传参考图（如果有）
+        const uploadedRefs = [];
+        if (referenceMode !== "off" && referenceImages.length > 0) {
+          for (const ref of referenceImages) {
+            const form = new FormData();
+            form.append("file", ref.file);
+            const uploadRes = await apiFetch(`/api/projects/${projectId}/generate/upload`, {
+              method: "POST",
+              body: form,
+            });
+            const uploadData = await uploadRes.json();
+            if (uploadData.path) {
+              uploadedRefs.push({
+                source: uploadData.path,
+                semanticType: ref.semanticType,
+                strength: ref.strength,
+              });
+            }
+          }
+        }
+
         const response = await apiFetch(`/api/projects/${projectId}/generate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "single_character_image_v2",
-            payload: { characterId: id },
+            payload: {
+              characterId: id,
+              referenceMode,
+              referenceImages: uploadedRefs,
+            },
             profileRevisionId: imageModelRef?.modelId,
           }),
         });
@@ -190,6 +225,41 @@ export function CharacterCard({
       toast.error(t("common.uploadFailed"));
     }
     setUploading(false);
+  }
+
+  /** 处理参考图上传 */
+  async function handleReferenceUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    e.target.value = "";
+
+    const newRefs = files.map((file) => ({
+      id: `ref-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      file,
+      semanticType: "general",
+      strength: 0.7,
+    }));
+
+    setReferenceImages((prev) => [...prev, ...newRefs]);
+  }
+
+  /** 删除参考图 */
+  function removeReference(refId: string) {
+    setReferenceImages((prev) => prev.filter((r) => r.id !== refId));
+  }
+
+  /** 更新参考图语义类型 */
+  function updateReferenceSemantic(refId: string, semanticType: string) {
+    setReferenceImages((prev) =>
+      prev.map((r) => (r.id === refId ? { ...r, semanticType } : r))
+    );
+  }
+
+  /** 更新参考图强度 */
+  function updateReferenceStrength(refId: string, strength: number) {
+    setReferenceImages((prev) =>
+      prev.map((r) => (r.id === refId ? { ...r, strength } : r))
+    );
   }
 
   return (
@@ -317,6 +387,90 @@ export function CharacterCard({
         />
         <div className="space-y-2">
             <InlineModelPicker capability="image" value={imageModelRef} onChange={setImageModelRef} showLocalProfiles={true} />
+
+            {/* 参考图配置区域 */}
+            <div className="space-y-2 rounded-lg border border-[--border-subtle] bg-[--surface] p-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-[--text-secondary]">参考图模式</span>
+                <select
+                  value={referenceMode}
+                  onChange={(e) => setReferenceMode(e.target.value as "off" | "auto" | "forced")}
+                  className="rounded border border-[--border-subtle] bg-white px-2 py-1 text-xs"
+                >
+                  <option value="off">关闭</option>
+                  <option value="auto">自动</option>
+                  <option value="forced">强制</option>
+                </select>
+              </div>
+
+              {referenceMode !== "off" && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="flex-1 text-xs"
+                      onClick={() => referenceInputRef.current?.click()}
+                    >
+                      <ImageIcon className="mr-1 h-3 w-3" />
+                      添加参考图
+                    </Button>
+                    <input
+                      ref={referenceInputRef}
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      className="hidden"
+                      onChange={handleReferenceUpload}
+                    />
+                  </div>
+
+                  {referenceImages.length > 0 && (
+                    <div className="space-y-1">
+                      {referenceImages.map((ref) => (
+                        <div key={ref.id} className="flex items-center gap-2 rounded bg-white p-1.5 text-xs">
+                          <span className="flex-1 truncate">{ref.file.name}</span>
+                          <select
+                            value={ref.semanticType}
+                            onChange={(e) => updateReferenceSemantic(ref.id, e.target.value)}
+                            className="rounded border border-[--border-subtle] bg-white px-1 py-0.5 text-xs"
+                          >
+                            <option value="general">通用</option>
+                            <option value="identity">身份</option>
+                            <option value="face">脸部</option>
+                            <option value="body">体型</option>
+                            <option value="clothing">服装</option>
+                            <option value="style">风格</option>
+                            <option value="scene">场景</option>
+                            <option value="prop">道具</option>
+                            <option value="first_frame">首帧</option>
+                            <option value="last_frame">尾帧</option>
+                          </select>
+                          <input
+                            type="number"
+                            min="0"
+                            max="1"
+                            step="0.1"
+                            value={ref.strength}
+                            onChange={(e) => updateReferenceStrength(ref.id, parseFloat(e.target.value))}
+                            className="w-12 rounded border border-[--border-subtle] bg-white px-1 py-0.5 text-xs"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeReference(ref.id)}
+                            className="rounded p-0.5 text-red-500 hover:bg-red-50"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
             <div className="flex gap-2">
               <Button
                 onClick={handleGenerateImage}
