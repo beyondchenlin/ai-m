@@ -10,7 +10,7 @@
  */
 
 import { db } from "@/lib/db";
-import { visualSubjects, visualSubjectVersions } from "@/lib/db/schema";
+import { visualSubjects, visualSubjectVersions, characters } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 
@@ -362,48 +362,100 @@ export async function listVisualSubjects(
   }));
 }
 
-/** 从漫剧角色导入视觉主体 */
+/** 从漫剧角色导入视觉主体（手册 §28.2：原漫剧角色通过快照导入，不双向自动同步） */
 export async function importFromCharacter(
   characterId: string,
   projectId: string,
   userId: string
 ): Promise<ProcessedVisualSubject> {
-  // 查询角色信息
+  // 从 characters 表读取真实角色数据
   const [character] = await db
     .select()
-    .from(visualSubjects)
-    .where(eq(visualSubjects.id, characterId))
+    .from(characters)
+    .where(eq(characters.id, characterId))
     .limit(1);
 
-  // 简化版本：直接使用角色信息创建视觉主体
-  // 实际应该从 characters 表查询
+  if (!character) {
+    throw new Error(`Character not found: ${characterId}`);
+  }
+
+  // 从角色字段构建身份锚点
+  const identityAnchors: Omit<IdentityAnchor, "id">[] = [];
+
+  // 脸部特征（来自 visualHint 或 description）
+  if (character.visualHint || character.description) {
+    identityAnchors.push({
+      name: "脸部与外观特征",
+      description: character.visualHint || character.description || "",
+      referenceArtifactIds: character.referenceImage ? [character.referenceImage] : [],
+      weight: 1.0,
+      required: true,
+    });
+  }
+
+  // 体型特征（来自 heightCm 和 bodyType）
+  if (character.heightCm || character.bodyType) {
+    const bodyDesc = [
+      character.heightCm ? `${character.heightCm}cm` : null,
+      character.bodyType ? `体型: ${character.bodyType}` : null,
+    ].filter(Boolean).join("，");
+    identityAnchors.push({
+      name: "体型特征",
+      description: bodyDesc,
+      referenceArtifactIds: [],
+      weight: 0.8,
+      required: true,
+    });
+  }
+
+  // 如果没有提取到任何锚点，至少保留角色名作为描述
+  if (identityAnchors.length === 0) {
+    identityAnchors.push({
+      name: "整体外观",
+      description: character.name,
+      referenceArtifactIds: character.referenceImage ? [character.referenceImage] : [],
+      weight: 1.0,
+      required: true,
+    });
+  }
+
+  // 从角色参考图历史构建多角度参考
+  const multiAngleReferences: Omit<MultiAngleReference, "id">[] = [];
+  if (character.referenceImage) {
+    multiAngleReferences.push({
+      angle: "front",
+      artifactId: character.referenceImage,
+      filePath: character.referenceImage,
+      isPrimary: true,
+    });
+  }
+
+  // 解析历史参考图
+  try {
+    const history: string[] = JSON.parse(character.referenceImageHistory || "[]");
+    for (let i = 0; i < history.length; i++) {
+      multiAngleReferences.push({
+        angle: i === 0 ? "side" : i === 1 ? "back" : "45-degree",
+        artifactId: history[i],
+        filePath: history[i],
+        isPrimary: false,
+      });
+    }
+  } catch {
+    // 历史解析失败，忽略
+  }
+
   return createVisualSubject({
-    name: `从角色导入`,
+    name: character.name,
     type: "human",
-    description: `从漫剧角色导入的视觉主体`,
+    description: character.description || `从漫剧角色「${character.name}」导入`,
     projectId,
     userId,
     characterId,
-    identityAnchors: [
-      {
-        name: "脸部特征",
-        description: "角色的脸部特征",
-        referenceArtifactIds: [],
-        weight: 1.0,
-        required: true,
-      },
-    ],
-    variableSlots: [
-      {
-        name: "服装",
-        type: "clothing",
-        defaultValue: "默认服装",
-        options: ["默认服装", "正装", "休闲装"],
-        currentValue: "默认服装",
-      },
-    ],
+    identityAnchors,
+    variableSlots: [],
     forbiddenFeatures: [],
-    multiAngleReferences: [],
+    multiAngleReferences,
   });
 }
 

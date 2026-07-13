@@ -1,10 +1,11 @@
 /**
- * PR-08: 视觉主体种子数据脚本
+ * PR-10: 视觉主体种子数据脚本
  * 
  * 创建示例视觉主体，用于测试和演示：
  * - 人类角色（带身份锚点、可变槽位、禁止特征）
  * - 卡通角色（简化版本）
  * - 动物角色（带多角度参考）
+ * - 从漫剧角色导入的视觉主体（PR-10 新增）
  */
 
 import { db } from "@/lib/db";
@@ -290,14 +291,40 @@ async function seedVisualSubjects() {
   console.log(`    Total references: ${refConfig.allReferenceIds.length}`);
   console.log(`    Anchor weights: ${Object.keys(refConfig.anchorWeights).length}\n`);
 
+  // PR-10: 测试从漫剧角色导入
+  console.log("🔄 Testing character import (PR-10 feature)...");
+  const { importFromCharacter } = await import("@/lib/generation/visual-subjects");
+  const { characters } = await import("@/lib/db/schema");
+  
+  // 创建一个测试角色
+  const [testCharacter] = await db
+    .select()
+    .from(characters)
+    .where(eq(characters.projectId, projectId))
+    .limit(1);
+  
+  if (testCharacter) {
+    console.log(`  Found test character: ${testCharacter.name}`);
+    const importedSubject = await importFromCharacter(
+      testCharacter.id,
+      projectId,
+      "test-user-pr10"
+    );
+    console.log(`  ✓ Imported from character: ${importedSubject.id}`);
+    console.log(`    Identity anchors: ${importedSubject.identityAnchors.length}`);
+    console.log(`    Multi-angle references: ${importedSubject.multiAngleReferences.length}\n`);
+  } else {
+    console.log("  No test character found, skipping import test\n");
+  }
+
   console.log("✅ Visual subjects seed completed successfully!\n");
   console.log("📌 Summary:");
   console.log(`   Project: ${projectId}`);
   console.log(`   Human subject: ${humanSubject.id}`);
   console.log(`   Cartoon subject: ${cartoonSubject.id}`);
   console.log(`   Animal subject: ${animalSubject.id}`);
-  console.log(`   Total subjects: 3`);
-  console.log("\n🎉 Visual subject infrastructure is ready for PR-08!\n");
+  console.log(`   Total subjects: 3+`);
+  console.log("\n🎉 Visual subject infrastructure is ready for PR-10!\n");
 }
 
 seedVisualSubjects()

@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "next-intl";
 import { uploadUrl } from "@/lib/utils/upload-url";
 import { useModelStore, type ModelRef } from "@/stores/model-store";
-import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight, Upload, Image as ImageIcon } from "lucide-react";
+import { Sparkles, Loader2, Copy, Check, ArrowUpCircle, Trash2, ChevronLeft, ChevronRight, Upload, Image as ImageIcon, Users } from "lucide-react";
 import { InlineModelPicker } from "@/components/editor/model-selector";
 import { apiFetch } from "@/lib/api-fetch";
 import { useModelGuard } from "@/hooks/use-model-guard";
@@ -63,6 +63,7 @@ export function CharacterCard({
   const [lightbox, setLightbox] = useState(false);
   const [copied, setCopied] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [promotingToSubject, setPromotingToSubject] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const imageGuard = useModelGuard("image");
   const isGenerating = generating || (!!batchGenerating && !referenceImage);
@@ -97,6 +98,31 @@ export function CharacterCard({
       body: JSON.stringify({ name: editName, description: editDesc, visualHint: editVisualHint }),
     });
     onUpdate();
+  }
+
+  async function handlePromoteToVisualSubject() {
+    setPromotingToSubject(true);
+    try {
+      const res = await apiFetch(`/api/projects/${projectId}/visual-subjects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "import_from_character",
+          characterId: id,
+        }),
+      });
+
+      if (res.ok) {
+        toast.success("已升级为视觉主体");
+        onUpdate();
+      } else {
+        toast.error("升级失败");
+      }
+    } catch (err) {
+      console.error("Promote to visual subject error:", err);
+      toast.error("升级失败");
+    }
+    setPromotingToSubject(false);
   }
 
   async function handleGenerateImage() {
@@ -515,6 +541,20 @@ export function CharacterCard({
                   <Check className="h-3.5 w-3.5 text-green-500" />
                 ) : (
                   <Copy className="h-3.5 w-3.5" />
+                )}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0 px-2.5"
+                title="升级为视觉主体"
+                disabled={promotingToSubject}
+                onClick={handlePromoteToVisualSubject}
+              >
+                {promotingToSubject ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Users className="h-3.5 w-3.5" />
                 )}
               </Button>
             </div>

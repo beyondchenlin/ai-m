@@ -6,6 +6,7 @@ import { Users, ArrowLeft, Loader2, Trash2 } from "lucide-react";
 import { apiFetch } from "@/lib/api-fetch";
 import { CharacterCard } from "@/components/editor/character-card";
 import { CharacterRelations } from "@/components/editor/character-relations";
+import { VisualSubjectPanel } from "@/components/editor/visual-subject-panel";
 import Link from "next/link";
 import { toast } from "sonner";
 
@@ -179,6 +180,13 @@ export default function CharactersPage({
             projectId={projectId}
             characters={characters.map((c) => ({ id: c.id, name: c.name }))}
           />
+        </section>
+      )}
+
+      {/* Visual Subjects Panel */}
+      {characters.length > 0 && (
+        <section className="mb-8">
+          <VisualSubjectPanel projectId={projectId} />
         </section>
       )}
 
