@@ -21,7 +21,7 @@ function resolveDbPath() {
   return path.resolve(dbPath);
 }
 
-function getSqlite(): SqliteConnection {
+export function getSqlite(): SqliteConnection {
   if (globalForDb.sqlite) return globalForDb.sqlite;
 
   // Dynamic require to avoid loading native binary at build time

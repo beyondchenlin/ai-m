@@ -693,3 +693,43 @@ export const keyReferences = sqliteTable("key_references", {
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 });
+
+/** 视觉主体（PR-08 §28.2） */
+export const visualSubjects = sqliteTable("visual_subjects", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  type: text("type", {
+    enum: ["human", "animal", "cartoon", "mascot", "robot", "fantasy"],
+  }).notNull(),
+  description: text("description").notNull(),
+  projectId: text("project_id")
+    .notNull()
+    .references(() => projects.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  characterId: text("character_id"),
+  identityAnchorsJson: text("identity_anchors_json", { mode: "json" }).notNull(),
+  variableSlotsJson: text("variable_slots_json", { mode: "json" }).notNull(),
+  forbiddenFeaturesJson: text("forbidden_features_json", { mode: "json" }).notNull(),
+  multiAngleReferencesJson: text("multi_angle_references_json", { mode: "json" }).notNull(),
+  currentVersion: integer("current_version").notNull().default(1),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/** 视觉主体版本快照（PR-08 §28.2） */
+export const visualSubjectVersions = sqliteTable("visual_subject_versions", {
+  id: text("id").primaryKey(),
+  visualSubjectId: text("visual_subject_id")
+    .notNull()
+    .references(() => visualSubjects.id, { onDelete: "cascade" }),
+  version: integer("version").notNull(),
+  snapshotJson: text("snapshot_json", { mode: "json" }).notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
