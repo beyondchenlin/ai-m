@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:regression": "tsx src/lib/capability/__tests__/regression-baseline.test.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:regression": "vitest run src/lib/capability/__tests__/regression-baseline.test.ts",
     "test:validate-examples": "python tools/validate_examples.py",
     "worker:dev": "tsx src/worker/index.ts",
     "worker": "node dist/worker/index.js",
@@ -65,6 +67,8 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vite-tsconfig-paths": "^6.1.1",
+    "vitest": "^4.1.10"
   }
 }

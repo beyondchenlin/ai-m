@@ -1,10 +1,10 @@
 /**
  * PR-05 传输层模块单元测试
  *
- * 使用 tsx 直接运行，不依赖测试框架。
  * 覆盖：连接管理器、取消策略、对账机制、错误分类等纯逻辑模块。
  */
 
+import { describe, it, expect } from "vitest";
 import { ComfyUIConnectionManager } from "@/lib/generation/transports/comfyui-connection-manager";
 import {
   safeCancelJob,
@@ -19,51 +19,36 @@ import {
 import { isProbeFresh } from "@/lib/generation/transports/comfyui-behavior-probe";
 import type { BackendFeatureSnapshot } from "@/lib/generation/transports/comfyui-behavior-probe";
 
-let passed = 0;
-let failed = 0;
-
-function assert(condition: boolean, name: string): void {
-  if (condition) {
-    passed++;
-    console.log(`  ✓ ${name}`);
-  } else {
-    failed++;
-    console.error(`  ✗ ${name}`);
-  }
-}
-
-async function runAllTests(): Promise<void> {
-  console.log("\n=== ComfyUI Connection Manager Tests ===");
-
-{
-  const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
-  assert(mgr.getState() === "disconnected", "initial state is disconnected");
-  assert(mgr.getGeneration() === 0, "initial generation is 0");
-
-  let stateChanges = 0;
-  mgr.addListener((e) => {
-    if (e.type === "state_change") stateChanges++;
+describe("PR-05: ComfyUI 连接管理器", () => {
+  it("初始状态为 disconnected 且 generation 为 0", () => {
+    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    expect(mgr.getState()).toBe("disconnected");
+    expect(mgr.getGeneration()).toBe(0);
   });
 
-  const unregister = mgr.registerTaskHandler("test-prompt-1", () => {});
-  assert(typeof unregister === "function", "registerTaskHandler returns cleanup function");
+  it("registerTaskHandler 返回清理函数并创建进度快照", () => {
+    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const unregister = mgr.registerTaskHandler("test-prompt-1", () => {});
+    expect(typeof unregister).toBe("function");
 
-  const snap = mgr.getProgressSnapshot("test-prompt-1");
-  assert(snap !== undefined, "progress snapshot created for registered task");
-  assert(snap?.promptId === "test-prompt-1", "snapshot has correct promptId");
-  assert(snap?.status === "queued", "initial status is queued");
+    const snap = mgr.getProgressSnapshot("test-prompt-1");
+    expect(snap).toBeDefined();
+    expect(snap?.promptId).toBe("test-prompt-1");
+    expect(snap?.status).toBe("queued");
 
-  mgr.clearTaskSnapshot("test-prompt-1");
-  assert(mgr.getProgressSnapshot("test-prompt-1") === undefined, "snapshot cleared after cleanup");
+    mgr.clearTaskSnapshot("test-prompt-1");
+    expect(mgr.getProgressSnapshot("test-prompt-1")).toBeUndefined();
+  });
 
-  mgr.disconnect();
-  assert(mgr.getState() === "disconnected", "state is disconnected after disconnect");
-  assert(mgr.getGeneration() === 1, "generation increments on disconnect");
-}
+  it("disconnect 后状态为 disconnected 且 generation 递增", () => {
+    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    mgr.disconnect();
+    expect(mgr.getState()).toBe("disconnected");
+    expect(mgr.getGeneration()).toBe(1);
+  });
+});
 
-console.log("\n=== Cancellation Policy Tests ===");
-
-{
+describe("PR-05: 取消策略", () => {
   const mockTransport = {
     post: async (_path: string, _body: unknown) => new Response("{}", { status: 200 }),
     getFile: async () => new Response(),
@@ -92,139 +77,102 @@ console.log("\n=== Cancellation Policy Tests ===");
     validUntilMs: Date.now() + 3600_000,
   };
 
-  const result1 = await safeCancelJob(mockTransport, sharedFeatures, "test-id", {
-    isShared: true,
+  it("共享后端优先使用按任务取消", async () => {
+    const result = await safeCancelJob(mockTransport, sharedFeatures, "test-id", { isShared: true });
+    expect(result.method).toBe("per-task");
+    expect(result.requested).toBe(true);
+    expect(result.needsReconciliation).toBe(true);
   });
-  assert(result1.method === "per-task", "shared backend uses per-task cancel");
-  assert(result1.requested === true, "per-task cancel requested");
-  assert(result1.needsReconciliation === true, "cancel needs reconciliation");
 
-  const dedicatedFeatures: BackendFeatureSnapshot = {
-    ...sharedFeatures,
-    cancellation: {
-      supportsPerTaskCancel: false,
-      hasGlobalInterrupt: true,
-      safeForShared: false,
-    },
-  };
-
-  const result2 = await safeCancelJob(mockTransport, dedicatedFeatures, "test-id", {
-    isShared: false,
+  it("专用后端无按任务取消时尝试全局中断", async () => {
+    const dedicatedFeatures: BackendFeatureSnapshot = {
+      ...sharedFeatures,
+      cancellation: {
+        supportsPerTaskCancel: false,
+        hasGlobalInterrupt: true,
+        safeForShared: false,
+      },
+    };
+    const result = await safeCancelJob(mockTransport, dedicatedFeatures, "test-id", { isShared: false });
+    expect(result.method).not.toBe("none");
   });
-  assert(result2.method !== "none", "dedicated backend without per-task cancel tries global interrupt");
 
-  const sharedNoPerTask: BackendFeatureSnapshot = {
-    ...sharedFeatures,
-    cancellation: {
-      supportsPerTaskCancel: false,
-      hasGlobalInterrupt: true,
-      safeForShared: false,
-    },
-  };
-
-  const result3 = await safeCancelJob(mockTransport, sharedNoPerTask, "test-id", {
-    isShared: true,
+  it("共享后端无按任务取消时禁止取消", async () => {
+    const sharedNoPerTask: BackendFeatureSnapshot = {
+      ...sharedFeatures,
+      cancellation: {
+        supportsPerTaskCancel: false,
+        hasGlobalInterrupt: true,
+        safeForShared: false,
+      },
+    };
+    const result = await safeCancelJob(mockTransport, sharedNoPerTask, "test-id", { isShared: true });
+    expect(result.method).toBe("none");
+    expect(result.requested).toBe(false);
   });
-  assert(result3.method === "none", "shared backend without per-task cancel is blocked");
-  assert(result3.requested === false, "shared backend cancel not requested");
 
-  assert(
-    resolveCancelCompletionRace(true, 1000, 2000) === "completed",
-    "has artifacts -> completed wins",
-  );
-  assert(
-    resolveCancelCompletionRace(false, 1000, 2000) === "cancelled",
-    "no artifacts + cancel first -> cancelled",
-  );
-  assert(
-    resolveCancelCompletionRace(false, 3000, 2000) === "completed",
-    "no artifacts + complete first -> completed",
-  );
+  it("取消与完成竞态按规则裁决", () => {
+    expect(resolveCancelCompletionRace(true, 1000, 2000)).toBe("completed");
+    expect(resolveCancelCompletionRace(false, 1000, 2000)).toBe("cancelled");
+    expect(resolveCancelCompletionRace(false, 3000, 2000)).toBe("completed");
+  });
 
-  const netErr = new Error("Network error: ECONNREFUSED");
-  const netClass = classifyCancellationError(netErr);
-  assert(netClass.retryable === true, "network error is retryable");
+  it("取消错误分类正确", () => {
+    const netErr = new Error("Network error: ECONNREFUSED");
+    expect(classifyCancellationError(netErr)).toEqual({ retryable: true, errorClass: "transient_network" });
 
-  const notFoundErr = new Error("Failed with status 404");
-  const nfClass = classifyCancellationError(notFoundErr);
-  assert(nfClass.retryable === false, "404 error is not retryable");
-  assert(nfClass.errorClass === "not_found", "404 error class is not_found");
-}
+    const notFoundErr = new Error("Failed with status 404");
+    expect(classifyCancellationError(notFoundErr)).toEqual({ retryable: false, errorClass: "not_found" });
+  });
+});
 
-console.log("\n=== Reconciliation Logic Tests ===");
+describe("PR-05: 对账逻辑", () => {
+  it("证据强度不足时不升级，强证据时不升级", () => {
+    const now = Date.now();
+    expect(shouldEscalateToAttention(now - 1000, 2, "weak", { attentionAfterMs: 60000 })).toBe(false);
+    expect(shouldEscalateToAttention(now - 600_000, 5, "weak", { attentionAfterMs: 300_000 })).toBe(true);
+    expect(shouldEscalateToAttention(now - 600_000, 5, "conclusive", { attentionAfterMs: 300_000 })).toBe(false);
+    expect(shouldEscalateToAttention(now - 1000, 20, "moderate", { maxAttempts: 10 })).toBe(true);
+  });
 
-{
-  const now = Date.now();
+  it("下次对账延迟随尝试次数递增", () => {
+    const delay1 = nextReconciliationDelay(1, { intervalMs: 30_000 });
+    const delay5 = nextReconciliationDelay(5, { intervalMs: 30_000 });
+    expect(delay1).toBeGreaterThanOrEqual(30_000);
+    expect(delay5).toBeGreaterThan(delay1);
+  });
 
-  assert(
-    shouldEscalateToAttention(now - 1000, 2, "weak", { attentionAfterMs: 60000 }) === false,
-    "early reconciliation does not escalate",
-  );
-  assert(
-    shouldEscalateToAttention(now - 600_000, 5, "weak", { attentionAfterMs: 300_000 }) === true,
-    "long-running weak evidence escalates to attention",
-  );
-  assert(
-    shouldEscalateToAttention(now - 600_000, 5, "conclusive", { attentionAfterMs: 300_000 }) === false,
-    "conclusive evidence does not escalate",
-  );
-  assert(
-    shouldEscalateToAttention(now - 1000, 20, "moderate", { maxAttempts: 10 }) === true,
-    "exceeding max attempts escalates",
-  );
+  it("提交错误分类正确", () => {
+    const clientErr = new Error("Submission failed (400): bad request");
+    expect(classifySubmissionError(clientErr)).toEqual({ errorClass: "client_error", retryable: false, retryScope: "none" });
 
-  const delay1 = nextReconciliationDelay(1, { intervalMs: 30_000 });
-  const delay5 = nextReconciliationDelay(5, { intervalMs: 30_000 });
-  assert(delay1 >= 30_000 && delay1 <= 70_000, "first delay in expected range with backoff and jitter");
-  assert(delay5 > delay1, "delay increases with attempts (backoff)");
+    const serverErr = new Error("Submission failed (503): service unavailable");
+    expect(classifySubmissionError(serverErr)).toEqual({ errorClass: "server_error", retryable: true, retryScope: "submission_only" });
 
-  const clientErr = new Error("Submission failed (400): bad request");
-  const clientClass = classifySubmissionError(clientErr);
-  assert(clientClass.retryable === false, "4xx error is not retryable");
-  assert(clientClass.retryScope === "none", "4xx error scope is none");
+    const wfErr = new Error("ComfyUI workflow validation errors");
+    expect(classifySubmissionError(wfErr)).toEqual({ errorClass: "workflow_error", retryable: false, retryScope: "none" });
+  });
+});
 
-  const serverErr = new Error("Submission failed (503): service unavailable");
-  const serverClass = classifySubmissionError(serverErr);
-  assert(serverClass.retryable === true, "5xx error is retryable");
-  assert(serverClass.retryScope === "submission_only", "5xx error scope is submission_only");
+describe("PR-05: 行为探测", () => {
+  it("探测结果有效期判断正确", () => {
+    const fresh: BackendFeatureSnapshot = {
+      environmentFingerprint: "env:test",
+      externalIdStrategy: "server-assigned",
+      cancellation: { supportsPerTaskCancel: false, hasGlobalInterrupt: false, safeForShared: false },
+      output: { readMethod: "view", supportsStreaming: false, maxOutputSizeBytesEstimate: 0 },
+      nodeCategories: [],
+      devicesSummary: [],
+      probedAtMs: Date.now() - 1000,
+      validUntilMs: Date.now() + 3600_000,
+    };
+    expect(isProbeFresh(fresh)).toBe(true);
 
-  const wfErr = new Error("ComfyUI workflow validation errors");
-  const wfClass = classifySubmissionError(wfErr);
-  assert(wfClass.retryable === false, "workflow error is not retryable");
-  assert(wfClass.errorClass === "workflow_error", "workflow error class correct");
-}
-
-console.log("\n=== Behavior Probe Tests ===");
-
-{
-  const fresh: BackendFeatureSnapshot = {
-    environmentFingerprint: "env:test",
-    externalIdStrategy: "server-assigned",
-    cancellation: { supportsPerTaskCancel: false, hasGlobalInterrupt: false, safeForShared: false },
-    output: { readMethod: "view", supportsStreaming: false, maxOutputSizeBytesEstimate: 0 },
-    nodeCategories: [],
-    devicesSummary: [],
-    probedAtMs: Date.now() - 1000,
-    validUntilMs: Date.now() + 3600_000,
-  };
-  assert(isProbeFresh(fresh) === true, "recent probe is fresh");
-
-  const expired: BackendFeatureSnapshot = {
-    ...fresh,
-    probedAtMs: Date.now() - 7200_000,
-    validUntilMs: Date.now() - 3600_000,
-  };
-  assert(isProbeFresh(expired) === false, "expired probe is not fresh");
-}
-
-  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
-
-  if (failed > 0) {
-    process.exit(1);
-  }
-}
-
-runAllTests().catch((err) => {
-  console.error("Test suite failed:", err);
-  process.exit(1);
+    const expired: BackendFeatureSnapshot = {
+      ...fresh,
+      probedAtMs: Date.now() - 7200_000,
+      validUntilMs: Date.now() - 3600_000,
+    };
+    expect(isProbeFresh(expired)).toBe(false);
+  });
 });

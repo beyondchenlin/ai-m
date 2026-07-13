@@ -112,9 +112,36 @@ export async function executeGenerationJob(
 
     features = await probeBackendFeatures(transport);
 
+    const attemptNo = await getNextAttemptNo(job.id);
+
+    // 先持久化 attempt 记录，再领取资源槽位。
+    // resource_pool_slots.owner_attempt_id 外键要求 attempt 必须先存在。
+    await db.insert(generationAttempts).values({
+      id: attemptId,
+      jobId: job.id,
+      attemptNo,
+      phase: "PREPARING",
+      backendId: backend.id,
+      backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
+      environmentFingerprint: features.environmentFingerprint,
+      submissionCorrelationId: `corr-${attemptId}`,
+      externalIdStrategy: features.externalIdStrategy,
+      systemOutputPrefix: `job-${job.id}-${attemptNo}`,
+      resourcePoolId: resourcePoolId ?? "default",
+      resourceSlotNo: 0,
+      resourceLeaseToken: `pending-${attemptId}`,
+      resourceFencingToken: 0,
+      createdAtMs: Date.now(),
+      updatedAtMs: Date.now(),
+    });
+
     if (resourcePoolId) {
       const slot = await acquireResourceSlot(resourcePoolId, attemptId, workerId);
       if (!slot) {
+        await db
+          .update(generationAttempts)
+          .set({ phase: "FAILED", errorClass: "resource_exhausted", errorMessageSafe: "No resource slot available", finishedAtMs: Date.now(), updatedAtMs: Date.now() })
+          .where(eq(generationAttempts.id, attemptId));
         return failJob(
           job.id,
           attemptId,
@@ -124,6 +151,17 @@ export async function executeGenerationJob(
         );
       }
       resourceSlot = slot;
+
+      await db
+        .update(generationAttempts)
+        .set({
+          phase: "SUBMITTING",
+          resourceSlotNo: slot.slotNo,
+          resourceLeaseToken: slot.leaseToken,
+          resourceFencingToken: slot.fencingToken,
+          updatedAtMs: Date.now(),
+        })
+        .where(eq(generationAttempts.id, attemptId));
 
       resourceLeaseTimer = setInterval(async () => {
         if (resourceSlot) {
@@ -138,28 +176,12 @@ export async function executeGenerationJob(
           }
         }
       }, 30_000);
+    } else {
+      await db
+        .update(generationAttempts)
+        .set({ phase: "SUBMITTING", updatedAtMs: Date.now() })
+        .where(eq(generationAttempts.id, attemptId));
     }
-
-    const attemptNo = await getNextAttemptNo(job.id);
-
-    await db.insert(generationAttempts).values({
-      id: attemptId,
-      jobId: job.id,
-      attemptNo,
-      phase: "SUBMITTING",
-      backendId: backend.id,
-      backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
-      environmentFingerprint: features.environmentFingerprint,
-      submissionCorrelationId: `corr-${attemptId}`,
-      externalIdStrategy: features.externalIdStrategy,
-      systemOutputPrefix: `job-${job.id}-${attemptNo}`,
-      resourcePoolId: resourcePoolId ?? "default",
-      resourceSlotNo: resourceSlot?.slotNo ?? 0,
-      resourceLeaseToken: resourceSlot?.leaseToken ?? "none",
-      resourceFencingToken: resourceSlot?.fencingToken ?? 0,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
-    });
 
     await db
       .update(generationJobs)
@@ -240,6 +262,8 @@ export async function executeGenerationJob(
       features,
       backend.baseUrl,
       callbacks,
+      {},
+      `corr-${attemptId}`,
     );
 
     const cancelCheckTimer = setInterval(async () => {

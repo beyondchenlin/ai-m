@@ -1,0 +1,195 @@
+/**
+ * PR-11: ComfyUI 执行编排器假后端集成测试
+ *
+ * 使用 FakeComfyUITransport 验证完整执行闭环、
+ * 提交不确定（SUBMISSION_UNKNOWN）与对账、以及取消路径。
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { ComfyUIExecutionOrchestrator } from "../comfyui-execution-orchestrator";
+import { connectionManagerRegistry } from "../comfyui-connection-manager";
+import {
+  FakeComfyUITransport,
+  defaultBackendFeatures,
+  installFakeWebSocket,
+} from "@/lib/test-helpers/fake-comfyui";
+import type { ExecutionConfig } from "../comfyui-execution-orchestrator";
+
+const pngBytes = new Uint8Array([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+  0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+  0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
+  0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+  0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+  0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+  0x44, 0xae, 0x42, 0x60, 0x82,
+]);
+
+const pngArrayBuffer = new Uint8Array(pngBytes).buffer;
+
+const workflow = {
+  nodes: [{ class_type: "KSampler", inputs: {} }],
+  outputs: [{ name: "preview" }],
+};
+
+function fastConfig(): Partial<ExecutionConfig> {
+  return {
+    submitTimeoutMs: 1_000,
+    queuedPollIntervalMs: 50,
+    runningPollIntervalMs: 50,
+    totalExecutionTimeoutMs: 5_000,
+    collectionTimeoutMs: 5_000,
+    firstByteTimeoutMs: 1_000,
+    reconciliationGraceMs: 10,
+    reconciliationIntervalMs: 50,
+    maxReconciliationAttempts: 3,
+  };
+}
+
+function makeCompletedHistory(promptId: string) {
+  return {
+    [promptId]: {
+      promptId,
+      outputs: {
+        "node-1": {
+          images: [{ filename: "preview.png", subfolder: "", type: "output" }],
+        },
+      },
+      status: { statusStr: "success", completed: true },
+    },
+  };
+}
+
+describe("PR-11: 编排器假后端集成", () => {
+  let restoreWebSocket: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreWebSocket = installFakeWebSocket();
+  });
+
+  afterEach(() => {
+    restoreWebSocket?.();
+    connectionManagerRegistry.closeAll();
+  });
+
+  it("成功闭环：提交 → 运行 → 完成 → 收集输出", async () => {
+    const promptId = "closed-loop-ok";
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeCompletedHistory(promptId),
+      fileBytes: pngArrayBuffer,
+    });
+
+    const outputs: ArrayBuffer[] = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onOutputReady: (output) => outputs.push(output.data),
+      },
+      fastConfig(),
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(true);
+    expect(result.phase).toBe("SUCCEEDED");
+    expect(result.externalJobId).toBe(promptId);
+    expect(outputs).toHaveLength(1);
+  });
+
+  it("提交响应丢失后应对账发现任务正在运行并完成", async () => {
+    const promptId = "sub-unknown-running";
+    const correlationId = "corr-sub-unknown-running";
+    const transport = new FakeComfyUITransport({
+      submitError: new Error("timeout"),
+      promptId,
+      queueRunning: [{ prompt_id: promptId, correlation_id: correlationId }],
+      history: makeCompletedHistory(promptId),
+      fileBytes: pngArrayBuffer,
+    });
+
+    const reconciliations: string[] = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onReconciliation: (r) => reconciliations.push(r.evidenceStrength),
+      },
+      fastConfig(),
+      correlationId,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(true);
+    expect(result.phase).toBe("SUCCEEDED");
+    expect(result.externalJobId).toBe(promptId);
+    expect(reconciliations.length).toBeGreaterThan(0);
+    expect(reconciliations[0]).toBe("conclusive");
+  });
+
+  it("提交丢失且始终无证据时应升级人工处理", async () => {
+    const promptId = "sub-unknown-escalate";
+    const transport = new FakeComfyUITransport({
+      submitError: new Error("timeout"),
+      promptId,
+      history: {},
+      queueRunning: [],
+      queuePending: [],
+    });
+
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {},
+      {
+        ...fastConfig(),
+        attentionAfterMs: 0,
+        maxReconciliationAttempts: 1,
+      },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(false);
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+  });
+
+  it("执行中请求取消应进入 CANCELLED 状态", async () => {
+    const promptId = "cancel-during-run";
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeCompletedHistory(promptId),
+      fileBytes: pngArrayBuffer,
+    });
+
+    let orchestrator!: ComfyUIExecutionOrchestrator;
+    orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onPhaseChange: (phase) => {
+          if (phase === "EXTERNAL_RUNNING") {
+            void orchestrator.requestCancel();
+          }
+        },
+      },
+      fastConfig(),
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("CANCELLED");
+    expect(result.cancellationRequested).toBe(true);
+  });
+});

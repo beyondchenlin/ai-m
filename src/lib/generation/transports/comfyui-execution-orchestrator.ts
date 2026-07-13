@@ -132,6 +132,7 @@ export class ComfyUIExecutionOrchestrator {
   private readonly connectionMgr: ComfyUIConnectionManager;
   private readonly baseUrl: string;
   private readonly clientId: string;
+  private readonly correlationId?: string;
 
   private phase: OrchestratorPhase = "CREATED";
   private externalJobId: string | null = null;
@@ -151,6 +152,7 @@ export class ComfyUIExecutionOrchestrator {
     baseUrl: string,
     callbacks: ExecutionCallbacks = {},
     config: Partial<ExecutionConfig> = {},
+    correlationId?: string,
   ) {
     this.transport = transport;
     this.features = features;
@@ -160,6 +162,7 @@ export class ComfyUIExecutionOrchestrator {
     this.clientId =
       (transport as { getClientId?: () => string }).getClientId?.() ??
       `orchestrator-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.correlationId = correlationId;
     this.connectionMgr = connectionManagerRegistry.getOrCreate(baseUrl, this.clientId);
   }
 
@@ -179,13 +182,13 @@ export class ComfyUIExecutionOrchestrator {
 
       const submitResult = await this.submitWithTimeout(workflow);
       if (!submitResult.success) {
-        return this.buildResult();
-      }
-
-      if (submitResult.needsReconciliation) {
-        this.setPhase("SUBMISSION_UNKNOWN");
-        const reconciled = await this.runReconciliationLoop();
-        if (!reconciled) {
+        if (submitResult.needsReconciliation) {
+          this.setPhase("SUBMISSION_UNKNOWN");
+          const reconciled = await this.runReconciliationLoop();
+          if (!reconciled) {
+            return this.buildResult();
+          }
+        } else {
           return this.buildResult();
         }
       }
@@ -257,7 +260,7 @@ export class ComfyUIExecutionOrchestrator {
     const timeout = setTimeout(() => controller.abort(), this.config.submitTimeoutMs);
 
     try {
-      const result = await submitPrompt(this.transport, workflow, this.clientId);
+      const result = await submitPrompt(this.transport, workflow, this.clientId, this.correlationId);
       clearTimeout(timeout);
       this.externalJobId = result.promptId;
       this.submitTimeMs = Date.now();
@@ -295,23 +298,32 @@ export class ComfyUIExecutionOrchestrator {
 
       const result = await reconcileSubmission(
         this.transport,
-        this.externalJobId!,
+        this.externalJobId,
         this.features,
         {
           intervalMs: this.config.reconciliationIntervalMs,
           maxAttempts: this.config.maxReconciliationAttempts,
         },
+        this.correlationId,
       );
+
+      // 对账过程中发现了外部任务编号（提交响应丢失场景）
+      if (result.discoveredExternalJobId && !this.externalJobId) {
+        this.externalJobId = result.discoveredExternalJobId;
+      }
 
       this.callbacks.onReconciliation?.(result);
 
       if (result.exists && result.externalStatus) {
         if (result.externalStatus === "queued" || result.externalStatus === "running") {
-          this.externalJobId = this.externalJobId!;
           return true;
         }
-        if (result.externalStatus === "completed" || result.externalStatus === "failed") {
+        if (result.externalStatus === "completed") {
           return true;
+        }
+        if (result.externalStatus === "failed") {
+          this.phase = "FAILED";
+          return false;
         }
       }
 

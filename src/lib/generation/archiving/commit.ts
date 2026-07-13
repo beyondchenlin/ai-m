@@ -10,6 +10,7 @@ import { promises as fs } from "fs";
 import * as path from "path";
 import { db } from "@/lib/db";
 import { generationArtifacts } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import type { ArtifactKind, ArtifactVisibility } from "@/lib/generation/naming";
@@ -90,6 +91,7 @@ export async function streamCommitArtifact(
   const stagingPath = path.join(stagingDir, `${id}.tmp`);
   const publishedDir = path.resolve(process.cwd(), "data", "artifacts");
   const publishedPath = path.join(publishedDir, id);
+  const storageKey = path.relative(publishedDir, publishedPath).replace(/\\/g, "/");
 
   // 确保目录存在
   await fs.mkdir(stagingDir, { recursive: true });
@@ -116,8 +118,8 @@ export async function streamCommitArtifact(
         throw new Error(`Artifact exceeds max size: ${totalBytes} > ${maxSize}`);
       }
 
-      // 魔数校验（仅第一个块）
-      if (!firstChunk) {
+      // 魔数校验（仅第一个非空块）
+      if (value.length > 0 && !firstChunk) {
         firstChunk = value;
         if (!validateMagicBytes(value, input.mimeType)) {
           throw new Error(`Magic bytes validation failed for ${input.mimeType}`);
@@ -146,8 +148,9 @@ export async function streamCommitArtifact(
   await db.insert(generationArtifacts).values({
     id,
     attemptId: input.attemptId,
+    logicalName: input.logicalName,
     kind: input.kind,
-    storageKey: publishedPath,
+    storageKey,
     mimeType: input.mimeType,
     sizeBytes: totalBytes,
     sha256,
@@ -155,7 +158,10 @@ export async function streamCommitArtifact(
     visibility: input.visibility,
     width: null,
     height: null,
+    durationMs: null,
+    metadataJson: {},
     parentArtifactId: input.parentArtifactId ?? null,
+    committedAtMs: now,
     createdAtMs: now,
   });
 
@@ -174,7 +180,7 @@ export async function streamCommitArtifact(
 
   return {
     id,
-    storageKey: publishedPath,
+    storageKey,
     sha256,
     sizeBytes: totalBytes,
     mimeType: input.mimeType,
@@ -216,7 +222,7 @@ export async function checkArtifactAccess(
     .where(
       // 简化版本：通过 attemptId 关联到 job 再关联到 project
       // 生产环境需要 JOIN
-      generationArtifacts.id.equals(artifactId),
+      eq(generationArtifacts.id, artifactId),
     );
 
   if (!artifact) {
@@ -239,8 +245,13 @@ export async function checkArtifactAccess(
 export async function cleanupStagingDir(attemptId: string): Promise<void> {
   const stagingDir = path.resolve(process.cwd(), "data", "task-staging", attemptId);
   try {
-    await fs.rm(stagingDir, { recursive: true, force: true });
+    // 先清空再删除，避免 Windows 上递归删除非空目录偶发失败
+    const entries = await fs.readdir(stagingDir).catch(() => []);
+    await Promise.all(
+      entries.map((entry) => fs.rm(path.join(stagingDir, entry), { recursive: true, force: true })),
+    );
+    await fs.rmdir(stagingDir);
   } catch {
-    // 目录不存在，忽略
+    // 目录不存在或已被占用，忽略
   }
 }

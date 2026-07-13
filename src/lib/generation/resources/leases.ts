@@ -33,10 +33,10 @@ export async function acquireResourceSlot(
   expiresAtMs: number;
 } | null> {
   const now = Date.now();
-  const leaseToken = `${workerId}_${now}_${Math.random().toString(36).slice(2, 10)}`;
+  const leaseToken = `${workerId}_${attemptId}_${now}_${Math.random().toString(36).slice(2, 10)}`;
   const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
 
-  // 原子领取：找到第一个空闲或过期槽位
+  // 原子领取：通过 rowid 子查询只更新第一个空闲或过期槽位，避免同时更新多个槽位导致 lease_token UNIQUE 冲突。
   const [slot] = await db
     .update(resourcePoolSlots)
     .set({
@@ -49,8 +49,13 @@ export async function acquireResourceSlot(
     .where(
       and(
         eq(resourcePoolSlots.resourcePoolId, resourcePoolId),
-        // 空闲 或 租约已过期
-        sql`(${resourcePoolSlots.ownerAttemptId} IS NULL OR ${resourcePoolSlots.expiresAtMs} < ${now})`,
+        sql`${resourcePoolSlots}."rowid" = (
+          SELECT "rowid" FROM ${resourcePoolSlots}
+          WHERE ${resourcePoolSlots.resourcePoolId} = ${resourcePoolId}
+            AND (${resourcePoolSlots.ownerAttemptId} IS NULL OR ${resourcePoolSlots.expiresAtMs} < ${now})
+          ORDER BY ${resourcePoolSlots.slotNo}
+          LIMIT 1
+        )`,
       ),
     )
     .returning();
@@ -127,8 +132,7 @@ export async function claimJob(
   const now = Date.now();
   const claimUntilMs = now + LEASE_CONFIG.CLAIM_LEASE_MS;
 
-  // 原子领取：找到第一个可领取的任务
-  // 条件：状态为 QUEUED、无未过期租约、无取消请求
+  // 原子领取：通过 rowid 子查询只更新第一个可领取的任务（状态为 QUEUED、无未过期租约）。
   const [job] = await db
     .update(generationJobs)
     .set({
@@ -142,8 +146,14 @@ export async function claimJob(
       and(
         eq(generationJobs.status, "QUEUED"),
         eq(generationJobs.capability, capability),
-        // 无未过期租约 OR 租约已过期
-        sql`(${generationJobs.claimOwner} IS NULL OR ${generationJobs.claimUntilMs} < ${now})`,
+        sql`${generationJobs}."rowid" = (
+          SELECT "rowid" FROM ${generationJobs}
+          WHERE ${generationJobs.status} = 'QUEUED'
+            AND ${generationJobs.capability} = ${capability}
+            AND (${generationJobs.claimOwner} IS NULL OR ${generationJobs.claimUntilMs} < ${now})
+          ORDER BY ${generationJobs.createdAtMs}
+          LIMIT 1
+        )`,
       ),
     )
     .returning();

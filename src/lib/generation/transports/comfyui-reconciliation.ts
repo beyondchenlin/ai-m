@@ -23,6 +23,8 @@ export interface ReconciliationResult {
   externalStatus?: "queued" | "running" | "completed" | "failed";
   /** 历史记录（如找到） */
   executionResult?: ComfyExecutionResult;
+  /** 对账过程中发现的外部任务编号（提交响应丢失时用于恢复） */
+  discoveredExternalJobId?: string;
   /** 收集到的证据列表 */
   evidence: ReconciliationEvidence[];
   /** 是否已完成对账时间戳 */
@@ -63,9 +65,10 @@ const DEFAULT_CONFIG: ReconciliationConfig = {
  */
 export async function reconcileSubmission(
   transport: ComfyUITransport,
-  externalJobId: string,
+  externalJobId: string | null,
   _features: BackendFeatureSnapshot,
   _config: Partial<ReconciliationConfig> = {},
+  correlationId?: string,
 ): Promise<ReconciliationResult> {
   const evidence: ReconciliationEvidence[] = [];
   const now = Date.now();
@@ -74,12 +77,53 @@ export async function reconcileSubmission(
   let foundInQueueRunning = false;
   let foundInQueuePending = false;
   let executionResult: ComfyExecutionResult | undefined;
+  let discoveredExternalJobId: string | undefined;
+
+  // 提交响应丢失时，先通过关联编号发现外部任务编号
+  if (!externalJobId && correlationId) {
+    try {
+      const queue = await probeQueueStatus(transport, correlationId);
+      const running = (queue.queueRunning ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
+      const pending = (queue.queuePending ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
+      const match = running.find((q) => q.correlation_id === correlationId) ??
+        pending.find((q) => q.correlation_id === correlationId) ??
+        running.find((q) => q.prompt_id) ??
+        pending.find((q) => q.prompt_id);
+      if (match?.prompt_id) {
+        discoveredExternalJobId = match.prompt_id;
+        evidence.push({
+          source: "queue_running",
+          strength: "strong",
+          description: `Discovered external job id ${match.prompt_id} via correlation id`,
+          collectedAtMs: now,
+        });
+      }
+    } catch (err) {
+      evidence.push({
+        source: "queue_running",
+        strength: "none",
+        description: `Correlation discovery error: ${(err as Error).message.slice(0, 100)}`,
+        collectedAtMs: now,
+      });
+    }
+  }
+
+  const resolvedExternalJobId = externalJobId ?? discoveredExternalJobId;
+
+  if (!resolvedExternalJobId) {
+    return {
+      exists: false,
+      evidenceStrength: "none",
+      evidence,
+      reconciledAtMs: now,
+    };
+  }
 
   try {
-    const history = await probeHistory(transport, externalJobId);
-    if (history[externalJobId]) {
+    const history = await probeHistory(transport, resolvedExternalJobId, correlationId);
+    if (history[resolvedExternalJobId]) {
       foundInHistory = true;
-      executionResult = history[externalJobId];
+      executionResult = history[resolvedExternalJobId];
       evidence.push({
         source: "history_api",
         strength: "strong",
@@ -104,12 +148,12 @@ export async function reconcileSubmission(
   }
 
   try {
-    const queue = await probeQueueStatus(transport);
-    const running = (queue.queueRunning ?? []) as Array<{ prompt_id?: string }>;
-    const pending = (queue.queuePending ?? []) as Array<{ prompt_id?: string }>;
+    const queue = await probeQueueStatus(transport, correlationId);
+    const running = (queue.queueRunning ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
+    const pending = (queue.queuePending ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
 
-    foundInQueueRunning = running.some((item) => item.prompt_id === externalJobId);
-    foundInQueuePending = pending.some((item) => item.prompt_id === externalJobId);
+    foundInQueueRunning = running.some((item) => item.prompt_id === resolvedExternalJobId);
+    foundInQueuePending = pending.some((item) => item.prompt_id === resolvedExternalJobId);
 
     if (foundInQueueRunning) {
       evidence.push({
@@ -166,6 +210,7 @@ export async function reconcileSubmission(
     evidenceStrength,
     externalStatus,
     executionResult,
+    discoveredExternalJobId,
     evidence,
     reconciledAtMs: now,
   };

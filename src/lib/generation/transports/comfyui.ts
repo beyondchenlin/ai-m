@@ -172,18 +172,42 @@ export async function submitPrompt(
   transport: ComfyUITransport,
   workflow: Record<string, unknown>,
   clientId: string,
+  correlationId?: string,
 ): Promise<ComfyPromptResponse> {
-  const response = await transport.post("/prompt", {
+  const body: Record<string, unknown> = {
     prompt: workflow,
     client_id: clientId,
-  });
+  };
+  if (correlationId) {
+    body.extra_data = { correlation_id: correlationId };
+  }
+  const response = await transport.post("/prompt", body);
 
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`ComfyUI prompt submission failed (${response.status}): ${text}`);
   }
 
-  const result = await response.json() as ComfyPromptResponse;
+  const raw = (await response.json()) as Record<string, unknown>;
+
+  // ComfyUI 原生返回 snake_case，统一映射到本地 camelCase 类型
+  const promptId = (raw.prompt_id as string) ?? (raw.promptId as string);
+  const number = (raw.number as number) ?? (raw.queue_remaining as number);
+  const queueRemaining = (raw.queue_remaining as number) ?? (raw.number as number);
+  const nodeErrorsRaw = (raw.node_errors ?? raw.nodeErrors) as
+    | Record<string, { classType: string; errors: { details: string }[] }>
+    | undefined;
+
+  const result: ComfyPromptResponse = {
+    promptId: promptId ?? "",
+    number,
+    queueRemaining,
+    nodeErrors: nodeErrorsRaw,
+  };
+
+  if (result.promptId === "") {
+    throw new Error("ComfyUI prompt submission returned no prompt_id");
+  }
 
   if (result.nodeErrors && Object.keys(result.nodeErrors).length > 0) {
     const errors = Object.entries(result.nodeErrors)
@@ -214,23 +238,33 @@ export async function probeObjectInfo(transport: ComfyUITransport): Promise<Comf
 }
 
 /** 行为探测：获取队列状态 */
-export async function probeQueueStatus(transport: ComfyUITransport): Promise<{
+export async function probeQueueStatus(
+  transport: ComfyUITransport,
+  correlationId?: string,
+): Promise<{
   queueRunning: Array<unknown>;
   queuePending: Array<unknown>;
 }> {
-  const response = await transport.post("/queue", {});
+  const body = correlationId ? { correlation_id: correlationId } : {};
+  const response = await transport.post("/queue", body);
   if (!response.ok) {
     throw new Error(`ComfyUI queue probe failed (${response.status})`);
   }
-  return response.json();
+  const data = (await response.json()) as Record<string, unknown>;
+  return {
+    queueRunning: (data.queue_running as Array<unknown>) ?? [],
+    queuePending: (data.queue_pending as Array<unknown>) ?? [],
+  };
 }
 
 /** 行为探测：获取历史记录 */
 export async function probeHistory(
   transport: ComfyUITransport,
   promptId: string,
+  correlationId?: string,
 ): Promise<Record<string, ComfyExecutionResult>> {
-  const response = await transport.post(`/history/${promptId}`, {});
+  const body = correlationId ? { correlation_id: correlationId } : {};
+  const response = await transport.post(`/history/${promptId}`, body);
   if (!response.ok) {
     throw new Error(`ComfyUI history probe failed (${response.status})`);
   }
