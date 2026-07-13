@@ -14,7 +14,9 @@
     "seed:zimage": "npx tsx scripts/seed-zimage-workflow.ts",
     "promote:zimage": "npx tsx scripts/promote-zimage-workflow.ts",
     "seed:zimage-quality": "npx tsx scripts/seed-zimage-quality-workflow.ts",
-    "promote:zimage-quality": "npx tsx scripts/promote-zimage-quality-workflow.ts"
+    "promote:zimage-quality": "npx tsx scripts/promote-zimage-quality-workflow.ts",
+    "seed:local-speech": "npx tsx scripts/seed-local-speech-workflow.ts",
+    "promote:local-speech": "npx tsx scripts/promote-local-speech.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.43",

@@ -1,10 +1,11 @@
 /**
- * 声音工作流晋级脚本
- * 
- * 将种子数据创建的配置晋级到生产可用状态：
+ * 本地声音工作流晋级脚本
+ *
+ * 将声音工作流晋级到生产可用状态：
  * - 工作流包：installed → validating → reviewed → active
- * - 生成配置：禁用 → 启用，可见性 admin → workspace
- * - 设为全局默认音频生成配置
+ * - 生成配置：draft → published，禁用 → 启用，可见性 admin → workspace
+ *
+ * 运行方式：npm run promote:local-speech
  */
 
 import { db } from "@/lib/db";
@@ -13,9 +14,8 @@ import {
   workflowPackageStates,
   generationProfileRevisions,
   generationProfileStates,
-  defaultGenerationProfilePointers,
 } from "@/lib/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 
 async function promoteLocalSpeechWorkflow() {
   console.log("🚀 Starting local speech workflow promotion...\n");
@@ -23,15 +23,15 @@ async function promoteLocalSpeechWorkflow() {
   const now = Date.now();
 
   // 1. 查找声音工作流包
-  console.log("📦 Finding local speech workflow package...");
+  console.log("📦 Finding speech workflow package...");
   const [workflow] = await db
     .select()
     .from(workflowPackageRevisions)
-    .where(eq(workflowPackageRevisions.workflowId, "local-speech-v1"))
+    .where(eq(workflowPackageRevisions.workflowId, "local-speech-indextts2"))
     .limit(1);
 
   if (!workflow) {
-    throw new Error("Local speech workflow package not found. Run seed:local-speech first");
+    throw new Error("Speech workflow package not found. Run seed:local-speech first");
   }
 
   console.log(`  ✓ Found workflow: ${workflow.workflowId} v${workflow.version}`);
@@ -45,7 +45,7 @@ async function promoteLocalSpeechWorkflow() {
     .where(eq(workflowPackageStates.workflowPackageDigest, workflow.digest));
 
   if (!workflowState) {
-    throw new Error("Workflow package state not found");
+    throw new Error("Speech workflow package state not found");
   }
 
   console.log(`  Current state: ${workflowState.state}`);
@@ -82,108 +82,64 @@ async function promoteLocalSpeechWorkflow() {
 
       console.log(`    ✓ State updated to: ${nextState}`);
     }
-    console.log("  ✓ Workflow package promoted to active\n");
+    console.log("  ✓ Speech workflow package promoted to active\n");
   }
 
   // 3. 查找声音生成配置
-  console.log("⚙️  Finding local speech generation profile...");
+  console.log("⚙️  Finding speech generation profile...");
   const [profile] = await db
     .select()
     .from(generationProfileRevisions)
-    .where(eq(generationProfileRevisions.profileKey, "local-speech-default"))
+    .where(eq(generationProfileRevisions.adapterKind, "local-speech"))
     .limit(1);
 
   if (!profile) {
-    throw new Error("Local speech generation profile not found. Run seed:local-speech first");
+    throw new Error("Speech generation profile not found");
   }
 
-  console.log(`  ✓ Found profile: ${profile.displayName}`);
+  console.log(`  ✓ Found profile: ${(profile.configJson as any).displayName}`);
   console.log(`    ID: ${profile.id}\n`);
 
-  // 4. 启用生成配置
-  console.log("🔓 Enabling generation profile...");
+  // 4. 晋级生成配置状态
+  console.log("🔓 Enabling speech generation profile...");
   const [profileState] = await db
     .select()
     .from(generationProfileStates)
     .where(eq(generationProfileStates.generationProfileRevisionId, profile.id));
 
   if (!profileState) {
-    throw new Error("Generation profile state not found");
+    throw new Error("Speech generation profile state not found");
   }
 
-  if (profileState.enabled === 1) {
-    console.log("  ✓ Profile already enabled\n");
+  console.log(`  Current state: ${profileState.state}, enabled: ${profileState.enabled}`);
+
+  if (profileState.enabled && profileState.visibility === "workspace") {
+    console.log("  ✓ Profile already enabled and visible\n");
   } else {
     await db
       .update(generationProfileStates)
       .set({
+        state: "published",
         enabled: 1,
         visibility: "workspace",
         updatedAtMs: now,
       })
       .where(eq(generationProfileStates.generationProfileRevisionId, profile.id));
 
-    console.log("  ✓ Profile enabled (visibility: workspace)\n");
-  }
-
-  // 5. 设为全局默认音频生成配置
-  console.log("🎯 Setting as default audio generation profile...");
-  const [existingPointer] = await db
-    .select()
-    .from(defaultGenerationProfilePointers)
-    .where(
-      and(
-        eq(defaultGenerationProfilePointers.scopeType, "global"),
-        eq(defaultGenerationProfilePointers.scopeId, "default"),
-        eq(defaultGenerationProfilePointers.capability, "audio")
-      )
-    );
-
-  if (existingPointer) {
-    if (existingPointer.generationProfileRevisionId === profile.id) {
-      console.log("  ✓ Profile already set as default\n");
-    } else {
-      await db
-        .update(defaultGenerationProfilePointers)
-        .set({
-          generationProfileRevisionId: profile.id,
-          updatedBy: "system",
-          updatedAtMs: now,
-        })
-        .where(
-          and(
-            eq(defaultGenerationProfilePointers.scopeType, "global"),
-            eq(defaultGenerationProfilePointers.scopeId, "default"),
-            eq(defaultGenerationProfilePointers.capability, "audio")
-          )
-        );
-
-      console.log("  ✓ Default pointer updated\n");
-    }
-  } else {
-    await db.insert(defaultGenerationProfilePointers).values({
-      scopeType: "global",
-      scopeId: "default",
-      capability: "audio",
-      generationProfileRevisionId: profile.id,
-      updatedBy: "system",
-      updatedAtMs: now,
-    });
-
-    console.log("  ✓ Default pointer created\n");
+    console.log("  ✓ Profile enabled and visible to workspace\n");
   }
 
   console.log("✅ Local speech workflow promotion completed successfully!\n");
   console.log("📌 Summary:");
   console.log(`   Workflow: ${workflow.workflowId} v${workflow.version} → active`);
-  console.log(`   Profile: ${profile.displayName} → enabled (workspace)`);
-  console.log(`   Default: global audio generation → ${profile.displayName}\n`);
-  console.log("🎉 Users can now select this profile for audio generation!\n");
+  console.log(`   Profile: ${(profile.configJson as any).displayName} → enabled (workspace)`);
+  console.log(`   Features: Voice cloning, Multi-language, Long text support`);
+  console.log("\n🎉 Users can now select speech profile in the model picker!\n");
 }
 
 promoteLocalSpeechWorkflow()
   .then(() => {
-    console.log("🎉 Promotion script completed");
+    console.log("🎉 Local speech promotion script completed");
     process.exit(0);
   })
   .catch((err) => {
