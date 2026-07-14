@@ -1,6 +1,6 @@
 /**
  * PR-10: 视觉主体种子数据脚本
- * 
+ *
  * 创建示例视觉主体，用于测试和演示：
  * - 人类角色（带身份锚点、可变槽位、禁止特征）
  * - 卡通角色（简化版本）
@@ -13,48 +13,17 @@ import { projects } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { createVisualSubject } from "@/lib/generation/visual-subjects";
 import { id as genId } from "@/lib/id";
-import { getSqlite } from "@/lib/db";
 
 async function seedVisualSubjects() {
   console.log("🌱 Starting visual subjects seed...\n");
 
-  // 手动创建表（如果不存在）
-  console.log("📋 Ensuring visual_subjects tables exist...");
-  const sqlite = getSqlite();
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS visual_subjects (
-      id TEXT PRIMARY KEY NOT NULL,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      description TEXT NOT NULL,
-      project_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      character_id TEXT,
-      identity_anchors_json TEXT NOT NULL,
-      variable_slots_json TEXT NOT NULL,
-      forbidden_features_json TEXT NOT NULL,
-      multi_angle_references_json TEXT NOT NULL,
-      current_version INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS visual_subject_versions (
-      id TEXT PRIMARY KEY NOT NULL,
-      visual_subject_id TEXT NOT NULL,
-      version INTEGER NOT NULL,
-      snapshot_json TEXT NOT NULL,
-      created_by TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY (visual_subject_id) REFERENCES visual_subjects(id) ON DELETE CASCADE
-    );
-  `);
-  console.log("  ✓ Tables ready\n");
+  if (process.env.NODE_ENV === "production" || process.env.AI_M_ALLOW_DEV_SEED !== "true") {
+    throw new Error("Set AI_M_ALLOW_DEV_SEED=true in a non-production environment to run this sample seed");
+  }
 
   // 查找或创建测试项目
   console.log("📦 Finding test project...");
-  let [testProject] = await db
+  const [testProject] = await db
     .select()
     .from(projects)
     .where(eq(projects.title, "视觉主体测试项目"))
@@ -71,7 +40,6 @@ async function seedVisualSubjects() {
       userId: "test-user-pr08",
       title: "视觉主体测试项目",
       idea: "用于测试视觉主体功能的项目",
-      description: "PR-08 视觉主体预留功能测试",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -295,14 +263,14 @@ async function seedVisualSubjects() {
   console.log("🔄 Testing character import (PR-10 feature)...");
   const { importFromCharacter } = await import("@/lib/generation/visual-subjects");
   const { characters } = await import("@/lib/db/schema");
-  
+
   // 创建一个测试角色
   const [testCharacter] = await db
     .select()
     .from(characters)
     .where(eq(characters.projectId, projectId))
     .limit(1);
-  
+
   if (testCharacter) {
     console.log(`  Found test character: ${testCharacter.name}`);
     const importedSubject = await importFromCharacter(

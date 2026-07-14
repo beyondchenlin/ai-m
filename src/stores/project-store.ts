@@ -18,6 +18,7 @@ interface Dialogue {
   characterId: string;
   characterName: string;
   sequence: number;
+  audioUrl?: string | null;
 }
 
 /**

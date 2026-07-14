@@ -7,6 +7,7 @@ import { apiFetch } from "@/lib/api-fetch";
 import { CharacterCard } from "@/components/editor/character-card";
 import { CharacterRelations } from "@/components/editor/character-relations";
 import { VisualSubjectPanel } from "@/components/editor/visual-subject-panel";
+import { VoiceProfilePanel } from "@/components/editor/voice-profile-panel";
 import Link from "next/link";
 import { toast } from "sonner";
 
@@ -54,7 +55,7 @@ export default function CharactersPage({
   }, [projectId]);
 
   useEffect(() => {
-    fetchData();
+    queueMicrotask(() => void fetchData());
   }, [fetchData]);
 
   const mainCharacters = useMemo(
@@ -189,6 +190,11 @@ export default function CharactersPage({
           <VisualSubjectPanel projectId={projectId} />
         </section>
       )}
+
+      {/* Project voice profiles */}
+      <section className="mb-8">
+        <VoiceProfilePanel projectId={projectId} />
+      </section>
 
       {/* Guest Characters Section */}
       <section>

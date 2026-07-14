@@ -14,6 +14,22 @@ import { visualSubjects, visualSubjectVersions, characters } from "@/lib/db/sche
 import { eq, and } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 
+/** Decode Drizzle JSON values and the accidentally double-encoded legacy rows. */
+function decodeJsonArray<T>(value: unknown, field: string): T[] {
+  let decoded = value;
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded) as unknown;
+    } catch {
+      throw new Error(`Invalid legacy JSON in ${field}`);
+    }
+  }
+  if (!Array.isArray(decoded)) {
+    throw new Error(`Expected an array in ${field}`);
+  }
+  return decoded as T[];
+}
+
 /** 视觉主体类型 */
 export type VisualSubjectType = 
   | "human"           // 人类
@@ -179,10 +195,10 @@ export async function createVisualSubject(
     projectId: input.projectId,
     userId: input.userId,
     characterId: input.characterId || null,
-    identityAnchorsJson: JSON.stringify(identityAnchors),
-    variableSlotsJson: JSON.stringify(variableSlots),
-    forbiddenFeaturesJson: JSON.stringify(forbiddenFeatures),
-    multiAngleReferencesJson: JSON.stringify(multiAngleReferences),
+    identityAnchorsJson: identityAnchors,
+    variableSlotsJson: variableSlots,
+    forbiddenFeaturesJson: forbiddenFeatures,
+    multiAngleReferencesJson: multiAngleReferences,
     currentVersion: 1,
     createdAt: now,
     updatedAt: now,
@@ -193,7 +209,7 @@ export async function createVisualSubject(
     id: genId(),
     visualSubjectId: subjectId,
     version: 1,
-    snapshotJson: JSON.stringify({
+    snapshotJson: {
       name: input.name,
       type: input.type,
       description: input.description,
@@ -201,7 +217,7 @@ export async function createVisualSubject(
       variableSlots,
       forbiddenFeatures,
       multiAngleReferences,
-    }),
+    },
     createdBy: input.userId,
     createdAt: now,
   });
@@ -246,10 +262,10 @@ export async function getVisualSubject(
     projectId: subject.projectId,
     userId: subject.userId,
     characterId: subject.characterId,
-    identityAnchors: JSON.parse(subject.identityAnchorsJson || "[]"),
-    variableSlots: JSON.parse(subject.variableSlotsJson || "[]"),
-    forbiddenFeatures: JSON.parse(subject.forbiddenFeaturesJson || "[]"),
-    multiAngleReferences: JSON.parse(subject.multiAngleReferencesJson || "[]"),
+    identityAnchors: decodeJsonArray<IdentityAnchor>(subject.identityAnchorsJson, "identity_anchors_json"),
+    variableSlots: decodeJsonArray<VariableSlot>(subject.variableSlotsJson, "variable_slots_json"),
+    forbiddenFeatures: decodeJsonArray<ForbiddenFeature>(subject.forbiddenFeaturesJson, "forbidden_features_json"),
+    multiAngleReferences: decodeJsonArray<MultiAngleReference>(subject.multiAngleReferencesJson, "multi_angle_references_json"),
     currentVersion: subject.currentVersion,
     createdAt: subject.createdAt,
     updatedAt: subject.updatedAt,
@@ -294,10 +310,10 @@ export async function updateVisualSubject(
       name: updates.name || existing.name,
       type: updates.type || existing.type,
       description: updates.description || existing.description,
-      identityAnchorsJson: JSON.stringify(identityAnchors),
-      variableSlotsJson: JSON.stringify(variableSlots),
-      forbiddenFeaturesJson: JSON.stringify(forbiddenFeatures),
-      multiAngleReferencesJson: JSON.stringify(multiAngleReferences),
+      identityAnchorsJson: identityAnchors,
+      variableSlotsJson: variableSlots,
+      forbiddenFeaturesJson: forbiddenFeatures,
+      multiAngleReferencesJson: multiAngleReferences,
       currentVersion: newVersion,
       updatedAt: now,
     })
@@ -308,7 +324,7 @@ export async function updateVisualSubject(
     id: genId(),
     visualSubjectId: subjectId,
     version: newVersion,
-    snapshotJson: JSON.stringify({
+    snapshotJson: {
       name: updates.name || existing.name,
       type: updates.type || existing.type,
       description: updates.description || existing.description,
@@ -316,7 +332,7 @@ export async function updateVisualSubject(
       variableSlots,
       forbiddenFeatures,
       multiAngleReferences,
-    }),
+    },
     createdBy: userId,
     createdAt: now,
   });
@@ -352,10 +368,10 @@ export async function listVisualSubjects(
     projectId: subject.projectId,
     userId: subject.userId,
     characterId: subject.characterId,
-    identityAnchors: JSON.parse(subject.identityAnchorsJson || "[]"),
-    variableSlots: JSON.parse(subject.variableSlotsJson || "[]"),
-    forbiddenFeatures: JSON.parse(subject.forbiddenFeaturesJson || "[]"),
-    multiAngleReferences: JSON.parse(subject.multiAngleReferencesJson || "[]"),
+    identityAnchors: decodeJsonArray<IdentityAnchor>(subject.identityAnchorsJson, "identity_anchors_json"),
+    variableSlots: decodeJsonArray<VariableSlot>(subject.variableSlotsJson, "variable_slots_json"),
+    forbiddenFeatures: decodeJsonArray<ForbiddenFeature>(subject.forbiddenFeaturesJson, "forbidden_features_json"),
+    multiAngleReferences: decodeJsonArray<MultiAngleReference>(subject.multiAngleReferencesJson, "multi_angle_references_json"),
     currentVersion: subject.currentVersion,
     createdAt: subject.createdAt,
     updatedAt: subject.updatedAt,

@@ -7,7 +7,7 @@
  */
 
 import type { ComfyUITransport } from "./comfyui";
-import { probeQueueStatus } from "./comfyui";
+import { probeQueueStatus, readTextLimited } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 
 /** 取消请求结果 */
@@ -80,10 +80,10 @@ async function cancelByTaskId(
   _cfg: CancellationPolicyConfig,
 ): Promise<CancellationResult> {
   try {
-    const response = await transport.post(`/queue/${encodeURIComponent(promptId)}`, {});
+    const response = await transport.post("/queue", { delete: [promptId] });
 
     if (!response.ok && response.status !== 404 && response.status !== 400) {
-      const text = await response.text().catch(() => "");
+      const text = await readTextLimited(response, 16 * 1024).catch(() => "");
       throw new Error(`Queue delete failed (${response.status}): ${text.slice(0, 200)}`);
     }
 
@@ -120,10 +120,10 @@ async function cancelWithGlobalInterruptVerified(
   for (let attempt = 0; attempt < cfg.targetVerifyAttempts; attempt++) {
     try {
       const queueData = await probeQueueStatus(transport);
-      const running = queueData.queueRunning as Array<{ prompt_id?: string }> | undefined;
+      const running = queueData.queueRunning;
 
-      if (running && running.length > 0) {
-        const currentId = running[0]?.prompt_id;
+      if (running.length > 0) {
+        const currentId = running[0]?.promptId;
         if (currentId === targetPromptId) {
           return doGlobalInterrupt(transport);
         } else {

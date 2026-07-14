@@ -48,7 +48,7 @@ export async function handleVideoGenerate(task: Task) {
     .where(eq(characters.projectId, shot.projectId));
 
   const versionedUploadDir = await getVersionedUploadDirFromPipeline(shot.versionId);
-  const videoProvider = resolveVideoProvider(payload.modelConfig, versionedUploadDir);
+  const videoProvider = await resolveVideoProvider(payload.modelConfig, versionedUploadDir);
 
   const videoModelId = payload.modelConfig?.video?.modelId;
   const modelMaxDuration = getModelMaxDuration(videoModelId);
@@ -99,7 +99,7 @@ export async function handleVideoGenerate(task: Task) {
 
   // Best-effort video quality check — does not block or fail generation
   try {
-    const textProvider = resolveAIProvider(payload.modelConfig);
+    const textProvider = await resolveAIProvider(payload.modelConfig);
     if (textProvider) {
       const qualityResult = await checkVideoQuality(
         textProvider,

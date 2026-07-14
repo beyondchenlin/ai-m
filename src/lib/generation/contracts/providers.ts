@@ -73,6 +73,10 @@ export interface SpeechRequest {
   voiceProfileId: string;
   speed?: number;
   pitch?: number;
+  language?: string;
+  referenceText?: string;
+  emotion?: string;
+  emotionStrength?: number;
 }
 
 /** 语音生成结果 */

@@ -12,14 +12,27 @@
     "test:regression": "vitest run src/lib/capability/__tests__/regression-baseline.test.ts",
     "test:validate-examples": "python tools/validate_examples.py",
     "worker:dev": "tsx src/worker/index.ts",
-    "worker": "node dist/worker/index.js",
-    "seed:zimage": "npx tsx scripts/seed-zimage-workflow.ts",
-    "promote:zimage": "npx tsx scripts/promote-zimage-workflow.ts",
-    "seed:zimage-quality": "npx tsx scripts/seed-zimage-quality-workflow.ts",
-    "promote:zimage-quality": "npx tsx scripts/promote-zimage-quality-workflow.ts",
-    "seed:local-speech": "npx tsx scripts/seed-local-speech-workflow.ts",
-    "promote:local-speech": "npx tsx scripts/promote-local-speech.ts",
-    "seed:visual-subjects": "npx tsx scripts/seed-visual-subjects.ts"
+    "worker": "node dist/worker/index.cjs",
+    "seed:visual-subjects": "npx tsx scripts/seed-visual-subjects.ts",
+    "seed:zimage": "tsx scripts/seed-zimage-workflow.ts",
+    "promote:zimage": "tsx scripts/promote-zimage-workflow.ts",
+    "seed:zimage-quality": "tsx scripts/seed-zimage-quality-workflow.ts",
+    "promote:zimage-quality": "tsx scripts/promote-zimage-quality-workflow.ts",
+    "seed:local-speech": "tsx scripts/seed-local-speech-workflow.ts",
+    "promote:local-speech": "tsx scripts/promote-local-speech.ts",
+    "typecheck": "tsc --noEmit",
+    "worker:build": "esbuild src/worker/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/worker/index.cjs --external:better-sqlite3 --external:sharp",
+    "quality:static": "pnpm typecheck && pnpm lint && pnpm test && pnpm test:validate-examples && pnpm test:migrations && pnpm test:pr12-static && pnpm test:pr13-static",
+    "quality": "pnpm quality:static && pnpm worker:build && pnpm build",
+    "test:migrations": "python tools/test_migrations.py",
+    "test:pr12": "vitest run src/lib/security/__tests__ src/lib/generation/workflows/__tests__ src/lib/generation/archiving/__tests__ src/lib/generation/resources/__tests__ src/lib/generation/transports/__tests__ src/worker/__tests__",
+    "workflow:import": "tsx scripts/import-workflow-package.ts",
+    "workflow:promote": "tsx scripts/promote-workflow-package.ts",
+    "test:pr12-static": "python tools/pr12_static_checks.py",
+    "smoke:generation": "tsx scripts/smoke-generation-job.ts",
+    "test:pr13": "vitest run src/stores/__tests__/model-store-migration.test.ts src/lib/generation/__tests__/speech-contract.test.ts src/lib/generation/__tests__/speech-domain.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts src/lib/generation/__tests__/artifact-selection.test.ts src/lib/security/__tests__/model-discovery-policy.test.ts src/lib/security/__tests__/pinned-json-request.test.ts src/lib/security/__tests__/request-origin.test.ts src/lib/security/__tests__/request-validation.test.ts",
+    "test:pr13-static": "python tools/pr13_static_checks.py",
+    "smoke:speech": "tsx scripts/smoke-speech-job.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.43",
@@ -48,6 +61,7 @@
     "tailwind-merge": "^3.5.0",
     "tw-animate-css": "^1.4.0",
     "ulid": "^3.0.2",
+    "undici": "^7.28.0",
     "unpdf": "^1.4.0",
     "zustand": "^5.0.11"
   },
@@ -64,11 +78,17 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "drizzle-kit": "^0.31.9",
+    "esbuild": "0.25.12",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.1.10"
+  },
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22.12.0 <25",
+    "pnpm": ">=10.12.1 <11"
   }
 }

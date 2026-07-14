@@ -8,7 +8,7 @@
 import type { Provider, Protocol, Capability } from "@/stores/model-store";
 
 /** 旧 Protocol → 新 adapter_kind 映射 */
-const PROTOCOL_TO_ADAPTER: Record<Protocol, string> = {
+const PROTOCOL_TO_ADAPTER: Partial<Record<Protocol, string>> = {
   openai: "openai-http",
   gemini: "gemini-http",
   seedance: "seedance-http",
@@ -19,7 +19,7 @@ const PROTOCOL_TO_ADAPTER: Record<Protocol, string> = {
 };
 
 /** 旧 Capability → 新 capability 映射 */
-const CAPABILITY_MAP: Record<Capability, string> = {
+const CAPABILITY_MAP: Partial<Record<Capability, string>> = {
   text: "text",
   image: "image",
   video: "video",
@@ -50,11 +50,19 @@ function inferSharingMode(protocol: Protocol): string {
 
 /** 将旧 Provider 转换为新 ExecutionBackend 插入参数 */
 export function providerToBackendParams(provider: Provider) {
+  const adapterKind = PROTOCOL_TO_ADAPTER[provider.protocol];
+  const capability = CAPABILITY_MAP[provider.capability];
+  if (!adapterKind) {
+    throw new Error(`Legacy provider protocol cannot be migrated to a cloud backend: ${provider.protocol}`);
+  }
+  if (!capability) {
+    throw new Error(`Legacy provider capability cannot be migrated to a cloud backend: ${provider.capability}`);
+  }
   const now = Date.now();
   return {
     id: `legacy-${provider.id}`,
     displayName: provider.name,
-    adapterKind: PROTOCOL_TO_ADAPTER[provider.protocol] ?? "openai-http",
+    adapterKind,
     baseUrl: provider.baseUrl || "",
     topology: inferTopology(provider.protocol),
     sharingMode: inferSharingMode(provider.protocol),
@@ -71,7 +79,7 @@ export function providerToBackendParams(provider: Provider) {
     },
     resourcePoolId: "default",
     capabilitiesJson: {
-      capabilities: [CAPABILITY_MAP[provider.capability]],
+      capabilities: [capability],
     },
     enabled: 1,
     createdAtMs: now,

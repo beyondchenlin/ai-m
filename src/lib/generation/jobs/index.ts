@@ -3,4 +3,5 @@ export {
   getGenerationJob,
   cancelGenerationJob,
   retryGenerationJob,
+  listGenerationJobs,
 } from "./service";

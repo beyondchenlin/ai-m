@@ -7,8 +7,9 @@
  */
 
 import { db } from "@/lib/db";
-import { executionBackends, keyReferences } from "@/lib/db/schema";
+import { executionBackends } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
+import { resolveLegacyProviderSecrets } from "@/lib/security/provider-secrets";
 import { normalizeDashScopeBaseUrl } from "@/lib/ai/dashscope-url";
 import { getAIProvider, getVideoProvider } from "@/lib/ai";
 import { CloudSupplierAdapter } from "./adapters/cloud-supplier";
@@ -24,30 +25,7 @@ const ADAPTER_TO_PROTOCOL: Record<string, string> = {
   "kling-http": "kling",
   "wan-http": "wan",
   "dashscope-http": "dashscope",
-  "comfyui-http": "dashscope",
 };
-
-/** 从 keyRefIds 解析密钥 */
-async function resolveKeys(keyRefIds: string[]): Promise<{ apiKey: string; secretKey?: string }> {
-  if (keyRefIds.length === 0) return { apiKey: "" };
-
-  const refs = await db
-    .select()
-    .from(keyReferences)
-    .where(
-      keyRefIds.length === 1
-        ? eq(keyReferences.id, keyRefIds[0])
-        : undefined
-    );
-
-  const bearerKey = refs.find((r) => r.keyType === "bearer");
-  const basicKey = refs.find((r) => r.keyType === "basic");
-
-  return {
-    apiKey: bearerKey?.secretValue ?? "",
-    secretKey: basicKey?.secretValue,
-  };
-}
 
 /** 从 CapabilityRequest 解析适配器配置 */
 async function resolveAdapterConfig(request: CapabilityRequest) {
@@ -62,9 +40,10 @@ async function resolveAdapterConfig(request: CapabilityRequest) {
       throw new Error(`Execution backend not found: ${request.backendId}`);
     }
 
-    const protocol = ADAPTER_TO_PROTOCOL[backend.adapterKind] ?? "openai";
-    const authConfig = backend.authConfigJson as { keyRefIds?: string[] };
-    const keys = await resolveKeys(authConfig.keyRefIds ?? []);
+    const protocol = ADAPTER_TO_PROTOCOL[backend.adapterKind];
+    if (!protocol) throw new Error(`Backend adapter is not supported by the legacy cloud facade: ${backend.adapterKind}`);
+    if (!backend.enabled) throw new Error(`Execution backend is disabled: ${backend.id}`);
+    const keys = await resolveLegacyProviderSecrets(backend.authConfigJson);
 
     let baseUrl = backend.baseUrl;
     if (backend.adapterKind === "dashscope-http") {

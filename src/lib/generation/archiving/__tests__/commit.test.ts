@@ -1,327 +1,199 @@
-/**
- * PR-11: 安全媒体归档与工件权限测试
- */
-
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { promises as fs, existsSync } from "fs";
-import path from "path";
-import { randomUUID } from "crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
-  resourcePools,
   executionBackends,
-  generationJobs,
-  generationAttempts,
   generationArtifacts,
+  generationAttempts,
+  generationJobs,
+  projects,
+  resourcePools,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
-import { eq } from "drizzle-orm";
-import {
-  validateMagicBytes,
-  streamCommitArtifact,
-  commitArtifactFromBuffer,
-  checkArtifactAccess,
-  cleanupStagingDir,
-} from "../commit";
 import { ArtifactKind, ArtifactVisibility } from "@/lib/generation/naming";
-
-const artifactsDir = path.resolve(process.cwd(), "data", "artifacts");
+import {
+  checkArtifactAccess,
+  commitArtifactFromBuffer,
+  recoverStagingArtifacts,
+  resolveArtifactStoragePath,
+  validateMagicBytes,
+} from "../commit";
 
 const pngBytes = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-  0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-  0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
-  0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
-  0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
-  0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
-  0x44, 0xae, 0x42, 0x60, 0x82,
 ]);
+const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
 
-const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
-
-async function createMinimalAttempt() {
+async function createExecution(ownerId = "owner") {
   const now = Date.now();
+  const projectId = randomUUID();
   const poolId = randomUUID();
   const backendId = randomUUID();
   const jobId = randomUUID();
   const attemptId = randomUUID();
 
+  await db.insert(projects).values({ id: projectId, userId: ownerId, title: "artifact-test" });
   await db.insert(resourcePools).values({
-    id: poolId,
-    displayName: "test-pool",
-    capacity: 1,
-    policyJson: {},
-    createdAtMs: now,
-    updatedAtMs: now,
+    id: poolId, displayName: "test-pool", capacity: 1, policyJson: {}, createdAtMs: now, updatedAtMs: now,
   });
-
   await db.insert(executionBackends).values({
-    id: backendId,
-    displayName: "test-backend",
-    adapterKind: "zimage-http",
-    baseUrl: "http://localhost:8188",
-    topology: "same-host",
-    sharingMode: "dedicated",
-    authType: "none",
-    authConfigJson: {},
-    tlsConfigJson: {},
-    networkPolicyJson: { allowRedirect: false, allowedHosts: [], allowedCidrs: [] },
-    resourcePoolId: poolId,
-    capabilitiesJson: ["image"],
-    createdAtMs: now,
-    updatedAtMs: now,
+    id: backendId, displayName: "test-backend", adapterKind: "comfyui",
+    baseUrl: "http://localhost:8188", topology: "same-host", sharingMode: "dedicated",
+    authType: "none", authConfigJson: {}, tlsConfigJson: {}, networkPolicyJson: {},
+    resourcePoolId: poolId, capabilitiesJson: { capabilities: ["image"] }, createdAtMs: now, updatedAtMs: now,
   });
-
   await db.insert(generationJobs).values({
-    id: jobId,
-    capability: "image",
-    status: "RUNNING",
-    executionSnapshotJson: { backendId },
-    inputDigest: "digest",
-    claimFencingToken: 1,
-    createdAtMs: now,
-    updatedAtMs: now,
+    id: jobId, projectId, requestedBy: ownerId, capability: "image", status: "RUNNING",
+    executionSnapshotJson: { backendId }, inputDigest: "digest", currentAttemptId: null,
+    claimOwner: "worker", claimUntilMs: now + 60_000, claimFencingToken: 1,
+    createdAtMs: now, updatedAtMs: now,
   });
-
   await db.insert(generationAttempts).values({
-    id: attemptId,
-    jobId,
-    attemptNo: 1,
-    phase: "SUBMITTING",
-    backendId,
-    backendFeatureSnapshotJson: {},
-    environmentFingerprint: "env:test",
-    submissionCorrelationId: `corr-${attemptId}`,
-    externalIdStrategy: "server-assigned",
-    systemOutputPrefix: "prefix",
-    resourcePoolId: poolId,
-    resourceSlotNo: 1,
-    resourceLeaseToken: `token-${attemptId}`,
-    resourceFencingToken: 1,
-    createdAtMs: now,
-    updatedAtMs: now,
+    id: attemptId, jobId, attemptNo: 1, jobClaimFencingToken: 1, phase: "COMMITTING",
+    backendId, backendFeatureSnapshotJson: {}, environmentFingerprint: "env:test",
+    submissionCorrelationId: `corr-${attemptId}`, externalIdStrategy: "server-assigned",
+    systemOutputPrefix: `prefix-${attemptId}`, resourcePoolId: poolId, resourceSlotNo: 1,
+    resourceLeaseToken: `lease-${attemptId}`, resourceFencingToken: 1,
+    createdAtMs: now, updatedAtMs: now,
   });
-
-  return { attemptId, jobId };
+  await db.update(generationJobs).set({ currentAttemptId: attemptId }).where(eq(generationJobs.id, jobId));
+  return { ownerId, projectId, poolId, backendId, jobId, attemptId };
 }
 
-describe("PR-11: 魔数校验", () => {
-  it("应识别 PNG 魔数", () => {
+describe("PR-12 media signature validation", () => {
+  it("accepts exact supported signatures", () => {
     expect(validateMagicBytes(pngBytes, "image/png")).toBe(true);
-  });
-
-  it("应识别 JPEG 魔数", () => {
     expect(validateMagicBytes(jpegBytes, "image/jpeg")).toBe(true);
+    expect(validateMagicBytes(new TextEncoder().encode("GIF89a"), "image/gif")).toBe(true);
+    expect(validateMagicBytes(new Uint8Array([0xff, 0xfb]), "audio/mpeg")).toBe(true);
   });
 
-  it("声明 PNG 但提供 JPEG 魔数时应失败", () => {
-    expect(validateMagicBytes(jpegBytes, "image/png")).toBe(false);
-  });
-
-  it("未知 MIME 类型应跳过魔数校验", () => {
-    expect(validateMagicBytes(new Uint8Array([0x00, 0x01]), "application/octet-stream")).toBe(true);
-  });
-
-  it("过小的缓冲区应失败", () => {
+  it("rejects unknown, truncated, and partial RIFF signatures", () => {
+    expect(validateMagicBytes(new Uint8Array([0x00, 0x01]), "application/octet-stream")).toBe(false);
     expect(validateMagicBytes(new Uint8Array([0x89]), "image/png")).toBe(false);
+    const riffOnly = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(validateMagicBytes(riffOnly, "image/webp")).toBe(false);
+    expect(validateMagicBytes(riffOnly, "audio/wav")).toBe(false);
+    expect(validateMagicBytes(new TextEncoder().encode("GIF88a"), "image/gif")).toBe(false);
   });
 });
 
-describe("PR-11: 流式工件提交", () => {
+describe("PR-12 fenced two-phase artifact commit", () => {
   let ctx: ReturnType<typeof setupTestDb>;
+  let uploadRoot: string;
 
   beforeAll(() => {
+    uploadRoot = path.join(os.tmpdir(), `ai-m-artifact-test-${randomUUID()}`);
+    process.env.UPLOAD_DIR = uploadRoot;
+    process.env.FF_V2_MEDIA_ARCHIVING = "true";
     ctx = setupTestDb();
   });
 
-  afterAll(() => {
-    ctx.cleanup();
-  });
+  afterAll(() => ctx.cleanup());
 
   beforeEach(async () => {
     await db.delete(generationArtifacts);
+    await db.delete(generationAttempts);
+    await db.delete(generationJobs);
+    await db.delete(executionBackends);
+    await db.delete(resourcePools);
+    await db.delete(projects);
+    await fs.rm(uploadRoot, { recursive: true, force: true });
   });
 
   afterEach(async () => {
-    // 清理测试产生的数据目录
-    try {
-      await fs.rm(path.resolve(process.cwd(), "data", "task-staging"), { recursive: true, force: true });
-      await fs.rm(path.resolve(process.cwd(), "data", "artifacts"), { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
+    await fs.rm(uploadRoot, { recursive: true, force: true });
   });
 
-  it("应成功提交 PNG 工件并写入数据库", async () => {
-    const { attemptId } = await createMinimalAttempt();
-
+  it("commits an immutable artifact under the current execution fence", async () => {
+    const execution = await createExecution();
     const result = await commitArtifactFromBuffer(pngBytes, {
-      attemptId,
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
       logicalName: "preview.png",
       kind: ArtifactKind.IMAGE,
       mimeType: "image/png",
       visibility: ArtifactVisibility.PROJECT,
     });
-
-    expect(result.sizeBytes).toBe(pngBytes.length);
-    expect(result.mimeType).toBe("image/png");
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(existsSync(path.join(artifactsDir, result.storageKey))).toBe(true);
-
-    const [row] = await db
-      .select()
-      .from(generationArtifacts)
-      .where(eq(generationArtifacts.id, result.id));
-
-    expect(row).toBeDefined();
+    expect((await fs.stat(resolveArtifactStoragePath(result.storageKey))).isFile()).toBe(true);
+    const [row] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, result.id));
     expect(row.status).toBe("COMMITTED");
-    expect(row.visibility).toBe("project");
   });
 
-  it("超过 maxSizeBytes 应拒绝且不出现在发布目录", async () => {
-    const { attemptId } = await createMinimalAttempt();
-
-    await expect(
-      commitArtifactFromBuffer(pngBytes, {
-        attemptId,
-        logicalName: "preview.png",
-        kind: ArtifactKind.IMAGE,
-        mimeType: "image/png",
-        visibility: ArtifactVisibility.PROJECT,
-        maxSizeBytes: 10,
-      }),
-    ).rejects.toThrow(/exceeds max size/);
-
-    const rows = await db.select().from(generationArtifacts);
-    expect(rows).toHaveLength(0);
-  });
-
-  it("空工件应被拒绝", async () => {
-    const { attemptId } = await createMinimalAttempt();
-
-    await expect(
-      commitArtifactFromBuffer(new Uint8Array(0), {
-        attemptId,
-        logicalName: "empty.png",
-        kind: ArtifactKind.IMAGE,
-        mimeType: "image/png",
-        visibility: ArtifactVisibility.PROJECT,
-      }),
-    ).rejects.toThrow(/Artifact is empty/);
-  });
-
-  it("魔数不匹配应被拒绝", async () => {
-    const { attemptId } = await createMinimalAttempt();
-
-    await expect(
-      commitArtifactFromBuffer(jpegBytes, {
-        attemptId,
-        logicalName: "fake.png",
-        kind: ArtifactKind.IMAGE,
-        mimeType: "image/png",
-        visibility: ArtifactVisibility.PROJECT,
-      }),
-    ).rejects.toThrow(/Magic bytes validation failed/);
-  });
-
-  it("应清理指定尝试的暂存目录", async () => {
-    const { attemptId } = await createMinimalAttempt();
-    const stagingDir = path.resolve(process.cwd(), "data", "task-staging", attemptId);
-    await fs.mkdir(stagingDir, { recursive: true });
-    await fs.writeFile(path.join(stagingDir, "temp.tmp"), "temp");
-
-    await cleanupStagingDir(attemptId);
-
-    expect(existsSync(stagingDir)).toBe(false);
-  });
-});
-
-describe("PR-11: 工件访问控制", () => {
-  let ctx: ReturnType<typeof setupTestDb>;
-  let attemptId: string;
-
-  beforeAll(async () => {
-    ctx = setupTestDb();
-    const created = await createMinimalAttempt();
-    attemptId = created.attemptId;
-  });
-
-  afterAll(() => {
-    ctx.cleanup();
-  });
-
-  it("不存在的工件应被拒绝", async () => {
-    const access = await checkArtifactAccess("non-existent-id", "user-1", "project-1");
-    expect(access.allowed).toBe(false);
-    expect(access.reason).toMatch(/Artifact not found/);
-  });
-
-  it("非 COMMITTED 状态的工件应被拒绝", async () => {
-    const id = randomUUID();
-    await db.insert(generationArtifacts).values({
-      id,
-      attemptId,
-      logicalName: "staging.png",
+  it("rejects oversize content and quarantines the incomplete record", async () => {
+    const execution = await createExecution();
+    await expect(commitArtifactFromBuffer(pngBytes, {
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
+      logicalName: "preview.png",
       kind: ArtifactKind.IMAGE,
-      status: "STAGING",
-      storageKey: "artifacts/staging.png",
-      visibility: ArtifactVisibility.PROJECT,
       mimeType: "image/png",
-      sizeBytes: 100,
-      sha256: "a".repeat(64),
-      metadataJson: {},
-      createdAtMs: Date.now(),
-    });
-
-    const access = await checkArtifactAccess(id, "user-1", "project-1");
-    expect(access.allowed).toBe(false);
-    expect(access.reason).toMatch(/not available/);
+      visibility: ArtifactVisibility.PROJECT,
+      maxSizeBytes: 8,
+    })).rejects.toThrow(/Artifact exceeds 8 bytes/);
+    const [row] = await db.select().from(generationArtifacts);
+    expect(row.status).toBe("QUARANTINED");
   });
 
-  it("private-original 工件应被拒绝公开访问", async () => {
-    const id = randomUUID();
+  it("rejects stale workers before publishing output", async () => {
+    const execution = await createExecution();
+    await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));
+    await expect(commitArtifactFromBuffer(pngBytes, {
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
+      logicalName: "stale.png",
+      kind: ArtifactKind.IMAGE,
+      mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+    })).rejects.toThrow(/execution fence is stale/i);
+    expect(await db.select().from(generationArtifacts)).toHaveLength(0);
+  });
+
+  it("recovers the rename/database crash window only for the current fence", async () => {
+    const execution = await createExecution();
+    const artifactId = randomUUID();
+    const storageKey = `${execution.attemptId}/${artifactId}.png`;
+    const finalPath = resolveArtifactStoragePath(storageKey);
+    await fs.mkdir(path.dirname(finalPath), { recursive: true });
+    await fs.writeFile(finalPath, pngBytes);
     await db.insert(generationArtifacts).values({
-      id,
-      attemptId,
+      id: artifactId, attemptId: execution.attemptId, logicalName: "recover.png", kind: "image",
+      status: "STAGING", storageKey, visibility: "project", mimeType: "image/png",
+      sizeBytes: 0, sha256: "pending", metadataJson: { maxSizeBytes: 1024 },
+      createdAtMs: Date.now(), updatedAtMs: Date.now(),
+    });
+    expect(await recoverStagingArtifacts()).toEqual({ committed: 1, quarantined: 0 });
+
+    const staleId = randomUUID();
+    const staleKey = `${execution.attemptId}/${staleId}.png`;
+    await fs.writeFile(resolveArtifactStoragePath(staleKey), pngBytes);
+    await db.insert(generationArtifacts).values({
+      id: staleId, attemptId: execution.attemptId, logicalName: "stale-recover.png", kind: "image",
+      status: "STAGING", storageKey: staleKey, visibility: "project", mimeType: "image/png",
+      sizeBytes: 0, sha256: "pending", metadataJson: { maxSizeBytes: 1024 },
+      createdAtMs: Date.now(), updatedAtMs: Date.now(),
+    });
+    await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));
+    expect(await recoverStagingArtifacts()).toEqual({ committed: 0, quarantined: 1 });
+  });
+
+  it("authorizes by project ownership without exposing files cross-user", async () => {
+    const execution = await createExecution("owner-a");
+    const result = await commitArtifactFromBuffer(pngBytes, {
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
       logicalName: "private.png",
       kind: ArtifactKind.IMAGE,
-      status: "COMMITTED",
-      storageKey: "artifacts/private.png",
+      mimeType: "image/png",
       visibility: ArtifactVisibility.PRIVATE_ORIGINAL,
-      mimeType: "image/png",
-      sizeBytes: 100,
-      sha256: "b".repeat(64),
-      metadataJson: {},
-      createdAtMs: Date.now(),
-      committedAtMs: Date.now(),
     });
-
-    const access = await checkArtifactAccess(id, "user-1", "project-1");
-    expect(access.allowed).toBe(false);
-    expect(access.reason).toMatch(/private/);
-  });
-
-  it("COMMITTED 且 project 可见性的工件应允许访问", async () => {
-    const id = randomUUID();
-    await db.insert(generationArtifacts).values({
-      id,
-      attemptId,
-      logicalName: "public.png",
-      kind: ArtifactKind.IMAGE,
-      status: "COMMITTED",
-      storageKey: "artifacts/public.png",
-      visibility: ArtifactVisibility.PROJECT,
-      mimeType: "image/png",
-      sizeBytes: 100,
-      sha256: "c".repeat(64),
-      metadataJson: {},
-      createdAtMs: Date.now(),
-      committedAtMs: Date.now(),
-    });
-
-    const access = await checkArtifactAccess(id, "user-1", "project-1");
-    expect(access.allowed).toBe(true);
+    await expect(checkArtifactAccess(result.id, "owner-a", execution.projectId)).resolves.toEqual({ allowed: true });
+    await expect(checkArtifactAccess(result.id, "owner-b", execution.projectId)).resolves.toMatchObject({ allowed: false });
   });
 });

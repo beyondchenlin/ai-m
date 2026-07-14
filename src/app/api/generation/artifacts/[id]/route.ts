@@ -1,10 +1,8 @@
-/**
- * v2.0 工件下载 API
- *
- * 手册 §16.5：工件访问
- * GET /api/generation/artifacts/{id} - 下载工件（流式返回）
- */
-
+/** Authorized, range-aware artifact streaming endpoint. */
+import { createReadStream } from "node:fs";
+import { lstat } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { and, eq } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import {
@@ -13,122 +11,113 @@ import {
   generationJobs,
   projects,
 } from "@/lib/db/schema";
-import { eq, and } from "drizzle-orm";
+import { FF, isEnabled } from "@/lib/feature-flags";
+import { resolveArtifactStoragePath } from "@/lib/generation/archiving";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
-import { promises as fs } from "fs";
-import { isEnabled, FF } from "@/lib/feature-flags";
 
-/** GET /api/generation/artifacts/{id} - 下载工件 */
+interface ByteRange {
+  start: number;
+  end: number;
+}
+
+function parseRange(header: string | null, size: number): ByteRange | null {
+  if (!header) return null;
+  if (header.includes(",")) throw new Error("multiple_ranges_not_supported");
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) throw new Error("invalid_range");
+  const [, startText, endText] = match;
+  if (!startText && !endText) throw new Error("invalid_range");
+
+  let start: number;
+  let end: number;
+  if (!startText) {
+    const suffixLength = Number.parseInt(endText, 10);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) throw new Error("invalid_range");
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number.parseInt(startText, 10);
+    end = endText ? Number.parseInt(endText, 10) : size - 1;
+  }
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= size) {
+    throw new Error("range_not_satisfiable");
+  }
+  return { start, end: Math.min(end, size - 1) };
+}
+
+/** GET /api/generation/artifacts/{id} */
 export async function GET(
   req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   if (!isEnabled(FF.V2_MEDIA_ARCHIVING)) {
-    return NextResponse.json(
-      { error: "v2.0 media archiving is not enabled" },
-      { status: 403 }
-    );
+    return NextResponse.json({ error: "Media archiving is not enabled" }, { status: 403 });
   }
-
   const userId = getUserIdFromRequest(req);
-  if (!userId) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
+  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
+  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(id)) {
+    return NextResponse.json({ error: "Artifact not found" }, { status: 404 });
+  }
 
   try {
-    // 查询工件
-    const [artifact] = await db
-      .select()
+    const [authorized] = await db.select({ artifact: generationArtifacts })
       .from(generationArtifacts)
-      .where(eq(generationArtifacts.id, id));
+      .innerJoin(generationAttempts, eq(generationAttempts.id, generationArtifacts.attemptId))
+      .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+      .innerJoin(projects, eq(projects.id, generationJobs.projectId))
+      .where(and(eq(generationArtifacts.id, id), eq(projects.userId, userId)))
+      .limit(1);
+    if (!authorized) return NextResponse.json({ error: "Artifact not found" }, { status: 404 });
 
-    if (!artifact) {
-      return NextResponse.json({ error: "Artifact not found" }, { status: 404 });
-    }
-
-    // 验证工件状态
+    const artifact = authorized.artifact;
     if (artifact.status !== "COMMITTED") {
-      return NextResponse.json(
-        { error: `Artifact not available (status: ${artifact.status})` },
-        { status: 410 }
-      );
+      return NextResponse.json({ error: "Artifact is not available" }, { status: 410 });
     }
 
-    // 通过 attempt -> job -> project 验证权限
-    const [attempt] = await db
-      .select({ jobId: generationAttempts.jobId })
-      .from(generationAttempts)
-      .where(eq(generationAttempts.id, artifact.attemptId));
-
-    if (!attempt) {
-      return NextResponse.json({ error: "Attempt not found" }, { status: 404 });
+    const filePath = resolveArtifactStoragePath(artifact.storageKey);
+    const fileStat = await lstat(filePath);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.size !== artifact.sizeBytes) {
+      console.error("[generation/artifacts] committed artifact failed storage consistency check", {
+        artifactId: artifact.id,
+        expectedSize: artifact.sizeBytes,
+        actualSize: fileStat.size,
+      });
+      return NextResponse.json({ error: "Artifact storage is inconsistent" }, { status: 409 });
     }
 
-    const [job] = await db
-      .select({ projectId: generationJobs.projectId })
-      .from(generationJobs)
-      .where(eq(generationJobs.id, attempt.jobId));
-
-    if (!job?.projectId) {
-      return NextResponse.json({ error: "Job not found" }, { status: 404 });
-    }
-
-    const [project] = await db
-      .select()
-      .from(projects)
-      .where(eq(projects.id, job.projectId));
-
-    if (!project || project.userId !== userId) {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
-
-    // 验证私有工件可见性
-    if (artifact.visibility === "private-original") {
-      // 简化版本：只允许项目所有者访问
-      // 生产环境需要更细粒度的权限控制
-    }
-
-    // 读取文件并流式返回
+    let range: ByteRange | null;
     try {
-      const fileHandle = await fs.open(artifact.storageKey, "r");
-      const stat = await fileHandle.stat();
-
-      const stream = new ReadableStream({
-        async start(controller) {
-          const buffer = new Uint8Array(64 * 1024); // 64KB chunks
-          let bytesRead = 0;
-
-          while (bytesRead < stat.size) {
-            const { bytesRead: chunkSize } = await fileHandle.read(buffer, 0, buffer.length, bytesRead);
-            if (chunkSize === 0) break;
-            controller.enqueue(buffer.slice(0, chunkSize));
-            bytesRead += chunkSize;
-          }
-
-          await fileHandle.close();
-          controller.close();
-        },
+      range = parseRange(req.headers.get("range"), fileStat.size);
+    } catch {
+      return new Response(null, {
+        status: 416,
+        headers: { "Content-Range": `bytes */${fileStat.size}`, "Accept-Ranges": "bytes" },
       });
-
-      return new Response(stream, {
-        headers: {
-          "Content-Type": artifact.mimeType,
-          "Content-Length": stat.size.toString(),
-          "Cache-Control": "private, max-age=3600",
-        },
-      });
-    } catch (err) {
-      console.error("[Artifact API] File read error:", err);
-      return NextResponse.json(
-        { error: "Failed to read artifact file" },
-        { status: 500 }
-      );
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[Artifact API] Get error:", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+
+    const start = range?.start ?? 0;
+    const end = range?.end ?? fileStat.size - 1;
+    const length = end - start + 1;
+    const nodeStream = createReadStream(filePath, { start, end });
+    const body = Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>;
+    const headers = new Headers({
+      "Content-Type": artifact.mimeType,
+      "Content-Length": String(length),
+      "Accept-Ranges": "bytes",
+      "Cache-Control": artifact.visibility === "private-original"
+        ? "private, no-store"
+        : "private, max-age=3600",
+      ETag: `"sha256-${artifact.sha256}"`,
+      "X-Content-Type-Options": "nosniff",
+    });
+    if (range) headers.set("Content-Range", `bytes ${start}-${end}/${fileStat.size}`);
+    return new Response(body, { status: range ? 206 : 200, headers });
+  } catch (error) {
+    console.error("[generation/artifacts] download failed", {
+      artifactId: id,
+      error: error instanceof Error ? error.message : "unknown",
+    });
+    return NextResponse.json({ error: "Artifact download failed" }, { status: 500 });
   }
 }

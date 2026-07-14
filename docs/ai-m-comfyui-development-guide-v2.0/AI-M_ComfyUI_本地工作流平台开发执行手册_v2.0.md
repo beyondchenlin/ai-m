@@ -1416,7 +1416,7 @@ git switch -c dev
   "scripts": {
     "dev": "next dev",
     "worker:dev": "tsx src/worker/index.ts",
-    "worker": "node dist/worker/index.js",
+    "worker": "node dist/worker/index.cjs",
     "validate:workflows": "tsx tools/validate-workflows.ts"
   }
 }

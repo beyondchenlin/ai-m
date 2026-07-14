@@ -321,7 +321,16 @@
     "agentDescription": "Description",
     "agentDescriptionPlaceholder": "Optional: describe the agent",
     "noAgents": "No agents yet. Click the button above to add one.",
-    "defaultAgent": "Default"
+    "defaultAgent": "Default",
+    "notConfiguredSpeech": "Configure a speech model first",
+    "defaultSpeechModel": "Speech model",
+    "speechModels": "Speech models",
+    "serverManagedWorkflow": "Server-managed workflow",
+    "serverManagedWorkflowDesc": "Local workflow backends, secrets, and workflow packages are managed securely on the server. Select only validated and enabled generation profiles here.",
+    "workflowProfiles": "Workflow profiles",
+    "fetchWorkflowProfiles": "Fetch workflows",
+    "noModelsFound": "No models or workflows found",
+    "credentialsSessionOnly": "To reduce credential exposure, cloud API keys are kept only for the current browser-tab session and must be entered again after the tab is closed."
   },
   "promptTemplates": {
     "title": "Prompt Templates",
@@ -517,5 +526,45 @@
       "durationStrategy": "Duration Strategy",
       "durationStrategyDesc": "Description-granularity rules tiered by shot duration"
     }
+  },
+  "voiceProfiles": {
+    "title": "Voice profiles",
+    "description": "Manage authorized voice-cloning reference audio separately from speech models.",
+    "add": "Add voice",
+    "name": "Profile name",
+    "engine": "Speech engine",
+    "language": "Language",
+    "referenceAudio": "Reference audio",
+    "audioRules": "Real WAV or MP3 only, 3–60 seconds, up to 50 MB.",
+    "referenceText": "Transcript of reference audio (recommended)",
+    "consent": "I confirm that I have the right to use this voice and explicit authorization from the voice owner.",
+    "saving": "Saving",
+    "save": "Save voice profile",
+    "empty": "No voice profiles yet",
+    "created": "Voice profile created",
+    "deleted": "Voice profile deleted",
+    "delete": "Delete voice",
+    "deleteConfirm": "Delete this voice profile?",
+    "requiredHint": "Enter a name, select reference audio, and confirm authorization",
+    "loadFailed": "Failed to load voice profiles",
+    "createFailed": "Failed to create voice profile",
+    "deleteFailed": "Failed to delete voice profile",
+    "retry": "Retry"
+  },
+  "speechGeneration": {
+    "title": "Speech generation",
+    "dialogueTitle": "Dialogue",
+    "selectVoice": "Select voice",
+    "selectModel": "Select a speech model",
+    "noVoiceProfiles": "Create a voice profile on the character management page first.",
+    "voiceProfilesFailed": "Failed to load voice profiles",
+    "generate": "Generate speech",
+    "regenerate": "Regenerate",
+    "completed": "Speech generation completed",
+    "failed": "Speech generation failed",
+    "failedStatus": "Job failed",
+    "timeout": "Speech generation timed out",
+    "noAudio": "The job completed without an audio output",
+    "retryLoad": "Reload"
   }
 }

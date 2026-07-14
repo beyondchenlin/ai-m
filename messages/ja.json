@@ -321,7 +321,16 @@
     "agentDescription": "説明",
     "agentDescriptionPlaceholder": "任意：エージェントの目的を説明",
     "noAgents": "エージェントがまだありません。上のボタンをクリックして追加してください。",
-    "defaultAgent": "デフォルト"
+    "defaultAgent": "デフォルト",
+    "notConfiguredSpeech": "音声モデルを設定してください",
+    "defaultSpeechModel": "音声モデル",
+    "speechModels": "音声モデル",
+    "serverManagedWorkflow": "サーバー管理ワークフロー",
+    "serverManagedWorkflowDesc": "ローカルワークフローのバックエンド、シークレット、ワークフローはサーバーで安全に管理されます。検証済みで有効な生成設定のみ選択できます。",
+    "workflowProfiles": "ワークフロー設定",
+    "fetchWorkflowProfiles": "ワークフローを取得",
+    "noModelsFound": "利用可能なモデルまたはワークフローがありません",
+    "credentialsSessionOnly": "認証情報の漏えいリスクを抑えるため、クラウド API キーは現在のブラウザータブのセッション内だけに保持され、タブを閉じた後は再入力が必要です。"
   },
   "promptTemplates": {
     "title": "プロンプト管理",
@@ -517,5 +526,45 @@
       "durationStrategy": "尺戦略",
       "durationStrategyDesc": "ショット尺に応じた記述粒度のルール"
     }
+  },
+  "voiceProfiles": {
+    "title": "音色プロファイル",
+    "description": "許可済みの音声クローン参照音声を音声モデルとは別に管理します。",
+    "add": "音色を追加",
+    "name": "プロファイル名",
+    "engine": "音声エンジン",
+    "language": "言語",
+    "referenceAudio": "参照音声",
+    "audioRules": "実際の WAV または MP3 のみ、3〜60秒、最大50MB。",
+    "referenceText": "参照音声の文字起こし（推奨）",
+    "consent": "この音声を使用する権利と、音声所有者からの明示的な許可があることを確認します。",
+    "saving": "保存中",
+    "save": "音色プロファイルを保存",
+    "empty": "音色プロファイルはありません",
+    "created": "音色プロファイルを作成しました",
+    "deleted": "音色プロファイルを削除しました",
+    "delete": "音色を削除",
+    "deleteConfirm": "この音色プロファイルを削除しますか？",
+    "requiredHint": "名前、参照音声、許可確認が必要です",
+    "loadFailed": "音色プロファイルの読み込みに失敗しました",
+    "createFailed": "音色プロファイルの作成に失敗しました",
+    "deleteFailed": "音色プロファイルの削除に失敗しました",
+    "retry": "再試行"
+  },
+  "speechGeneration": {
+    "title": "音声生成",
+    "dialogueTitle": "セリフ",
+    "selectVoice": "音色を選択",
+    "selectModel": "音声モデルを選択してください",
+    "noVoiceProfiles": "先にキャラクター管理ページで音色プロファイルを作成してください。",
+    "voiceProfilesFailed": "音色プロファイルの読み込みに失敗しました",
+    "generate": "音声を生成",
+    "regenerate": "再生成",
+    "completed": "音声生成が完了しました",
+    "failed": "音声生成に失敗しました",
+    "failedStatus": "ジョブ失敗",
+    "timeout": "音声生成がタイムアウトしました",
+    "noAudio": "ジョブは完了しましたが音声出力がありません",
+    "retryLoad": "再読み込み"
   }
 }

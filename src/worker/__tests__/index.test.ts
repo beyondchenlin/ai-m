@@ -24,7 +24,9 @@ vi.mock("@/lib/generation/resources/leases", () => ({
   claimJob: vi.fn(() => Promise.resolve(null)),
   renewJobClaim: vi.fn(() => Promise.resolve(true)),
   releaseJobClaim: vi.fn(() => Promise.resolve(true)),
-  scanExpiredClaims: vi.fn(() => Promise.resolve({ expiredJobs: [], expiredSlots: [] })),
+  scanExpiredClaims: vi.fn(() => Promise.resolve({
+    requeuedJobs: [], attentionJobs: [], cancelledJobs: [], releasedSlots: [],
+  })),
   LEASE_CONFIG: {
     CLAIM_LEASE_MS: 30_000,
     RESOURCE_LEASE_MS: 120_000,
@@ -38,15 +40,11 @@ vi.mock("@/lib/generation/worker-executor", () => ({
 }));
 
 describe("PR-11: Worker 信号处理", () => {
-  let exitSpy: ReturnType<typeof vi.spyOn>;
-
   beforeEach(() => {
     isEnabledMock.mockImplementation((flag: unknown) => flag === "V2_DURABLE_EXECUTION");
-    exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as (code?: number) => never);
   });
 
   afterEach(() => {
-    exitSpy.mockRestore();
     vi.clearAllMocks();
   });
 
@@ -62,7 +60,7 @@ describe("PR-11: Worker 信号处理", () => {
     // 等待 gracefulShutdown 中的异步清理
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(exitSpy).toHaveBeenCalled();
+    expect(process.exitCode).toBe(0);
   });
 
   it("收到 SIGTERM 应调用 process.exit", async () => {
@@ -72,6 +70,6 @@ describe("PR-11: Worker 信号处理", () => {
     process.emit("SIGTERM");
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(exitSpy).toHaveBeenCalled();
+    expect(process.exitCode).toBe(0);
   });
 });

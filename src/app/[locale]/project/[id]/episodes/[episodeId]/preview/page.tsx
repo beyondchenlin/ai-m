@@ -55,12 +55,12 @@ export default function EpisodePreviewPage() {
 
   // Sync previewMode when project loads
   useEffect(() => {
-    if (project) setPreviewMode(project.generationMode ?? "keyframe");
+    if (project) queueMicrotask(() => setPreviewMode(project.generationMode ?? "keyframe"));
   }, [project?.generationMode]);
 
   // Check if final video file actually exists
   useEffect(() => {
-    if (!finalVideoUrl) { setVideoValid(null); return; }
+    if (!finalVideoUrl) { queueMicrotask(() => setVideoValid(null)); return; }
     if (checkedUrl.current === finalVideoUrl) return;
     checkedUrl.current = finalVideoUrl;
     fetch(uploadUrl(finalVideoUrl), { method: "HEAD" })

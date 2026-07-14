@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "speech-indextts2-clone",
+  "version": "1.0.0",
+  "displayName": "IndexTTS2 声音克隆",
+  "capability": "speech",
+  "workflowFile": "workflow.api.json",
+  "bindings": [
+    {
+      "key": "text",
+      "selector": {
+        "metaTitle": "REPLACE_TEXT_NODE_TITLE",
+        "classType": "REPLACE_INDEXTTS2_NODE_CLASS"
+      },
+      "inputName": "REPLACE_TEXT_INPUT",
+      "valueType": "string",
+      "source": "request",
+      "required": true,
+      "userOverride": true
+    },
+    {
+      "key": "voiceReference",
+      "selector": {
+        "metaTitle": "REPLACE_VOICE_NODE_TITLE",
+        "classType": "REPLACE_AUDIO_LOADER_CLASS"
+      },
+      "inputName": "REPLACE_AUDIO_PATH_INPUT",
+      "valueType": "audio",
+      "source": "voice-reference",
+      "required": true,
+      "userOverride": false
+    },
+    {
+      "key": "referenceText",
+      "selector": {
+        "metaTitle": "REPLACE_TEXT_NODE_TITLE",
+        "classType": "REPLACE_INDEXTTS2_NODE_CLASS"
+      },
+      "inputName": "REPLACE_REFERENCE_TEXT_INPUT",
+      "valueType": "string",
+      "source": "request",
+      "required": false,
+      "userOverride": true,
+      "default": ""
+    },
+    {
+      "key": "speed",
+      "selector": {
+        "metaTitle": "REPLACE_TEXT_NODE_TITLE",
+        "classType": "REPLACE_INDEXTTS2_NODE_CLASS"
+      },
+      "inputName": "REPLACE_SPEED_INPUT",
+      "valueType": "number",
+      "source": "request",
+      "required": false,
+      "userOverride": true,
+      "default": 1,
+      "minimum": 0.5,
+      "maximum": 2
+    },
+    {
+      "key": "emotionStrength",
+      "selector": {
+        "metaTitle": "REPLACE_TEXT_NODE_TITLE",
+        "classType": "REPLACE_INDEXTTS2_NODE_CLASS"
+      },
+      "inputName": "REPLACE_EMOTION_STRENGTH_INPUT",
+      "valueType": "number",
+      "source": "request",
+      "required": false,
+      "userOverride": true,
+      "default": 0,
+      "minimum": 0,
+      "maximum": 1
+    },
+    {
+      "key": "pitch",
+      "selector": {
+        "metaTitle": "REPLACE_TEXT_NODE_TITLE",
+        "classType": "REPLACE_INDEXTTS2_NODE_CLASS"
+      },
+      "inputName": "REPLACE_PITCH_INPUT",
+      "valueType": "number",
+      "source": "request",
+      "required": false,
+      "userOverride": true,
+      "default": 1,
+      "minimum": 0.5,
+      "maximum": 2
+    }
+  ],
+  "outputs": [
+    {
+      "key": "audio",
+      "selector": {
+        "metaTitle": "REPLACE_OUTPUT_NODE_TITLE",
+        "classType": "REPLACE_AUDIO_OUTPUT_CLASS"
+      },
+      "field": "audio",
+      "mediaKind": "audio",
+      "maxItems": 1
+    }
+  ],
+  "requirements": {
+    "nodeClasses": [
+      "REPLACE_INDEXTTS2_NODE_CLASS",
+      "REPLACE_AUDIO_LOADER_CLASS",
+      "REPLACE_AUDIO_OUTPUT_CLASS"
+    ],
+    "models": [
+      {
+        "folder": "REPLACE_MODEL_FOLDER",
+        "filename": "REPLACE_MODEL_FILENAME"
+      }
+    ],
+    "referenceModes": [
+      "required"
+    ]
+  },
+  "limits": {
+    "maxPromptChars": 20000,
+    "maxPixels": 1,
+    "maxBatch": 1,
+    "maxOutputs": 1,
+    "maxJobMs": 600000,
+    "maxOutputBytes": 104857600
+  }
+}

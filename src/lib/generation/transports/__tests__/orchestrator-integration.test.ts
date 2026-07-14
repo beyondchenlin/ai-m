@@ -41,10 +41,11 @@ function fastConfig(): Partial<ExecutionConfig> {
     runningPollIntervalMs: 50,
     totalExecutionTimeoutMs: 5_000,
     collectionTimeoutMs: 5_000,
-    firstByteTimeoutMs: 1_000,
     reconciliationGraceMs: 10,
     reconciliationIntervalMs: 50,
     maxReconciliationAttempts: 3,
+    approvedOutputs: [{ key: "primary", nodeId: "node-1", field: "images", mediaKind: "image", maxItems: 1 }],
+    maxOutputs: 1,
   };
 }
 
@@ -89,7 +90,9 @@ describe("PR-11: 编排器假后端集成", () => {
       defaultBackendFeatures(),
       "http://localhost:8188",
       {
-        onOutputReady: (output) => outputs.push(output.data),
+        onOutputStream: async (output) => {
+          outputs.push(await output.response.arrayBuffer());
+        },
       },
       fastConfig(),
     );
@@ -119,7 +122,8 @@ describe("PR-11: 编排器假后端集成", () => {
       defaultBackendFeatures(),
       "http://localhost:8188",
       {
-        onReconciliation: (r) => reconciliations.push(r.evidenceStrength),
+        onReconciliation: (r) => { reconciliations.push(r.evidenceStrength); },
+        onOutputStream: async (output) => { await output.response.arrayBuffer(); },
       },
       fastConfig(),
       correlationId,
@@ -151,7 +155,6 @@ describe("PR-11: 编排器假后端集成", () => {
       {},
       {
         ...fastConfig(),
-        attentionAfterMs: 0,
         maxReconciliationAttempts: 1,
       },
     );
@@ -163,17 +166,40 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.needsAttention).toBe(true);
   });
 
-  it("执行中请求取消应进入 CANCELLED 状态", async () => {
-    const promptId = "cancel-during-run";
+
+  it("取消与完成竞态中已完成输出应优先提交", async () => {
+    const promptId = "cancel-race-completed";
     const transport = new FakeComfyUITransport({
       promptId,
       queueRunning: [{ prompt_id: promptId }],
       history: makeCompletedHistory(promptId),
       fileBytes: pngArrayBuffer,
     });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onPhaseChange: (phase) => { if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel(); },
+        onOutputStream: async (output) => { await output.response.arrayBuffer(); },
+      },
+      fastConfig(),
+    );
+    const result = await orchestrator.execute(workflow);
+    expect(result.phase).toBe("SUCCEEDED");
+    expect(result.cancellationRequested).toBe(true);
+  });
 
-    let orchestrator!: ComfyUIExecutionOrchestrator;
-    orchestrator = new ComfyUIExecutionOrchestrator(
+  it("执行中请求取消应进入 CANCELLED 状态", async () => {
+    const promptId = "cancel-during-run";
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: {},
+      fileBytes: pngArrayBuffer,
+    });
+
+    const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
       "http://localhost:8188",

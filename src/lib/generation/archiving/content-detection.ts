@@ -97,6 +97,14 @@ export function detectMimeType(buffer: Uint8Array): string | null {
     }
   }
 
+  // 检查 MP3（既支持 ID3 标签，也支持 MPEG 音频帧同步）
+  if (buffer.length >= 3 && buffer[0] === 0x49 && buffer[1] === 0x44 && buffer[2] === 0x33) {
+    return 'audio/mpeg';
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xFF && (buffer[1] & 0xE0) === 0xE0) {
+    return 'audio/mpeg';
+  }
+
   // 检查其他格式
   for (const [mimeType, { offset, bytes }] of Object.entries(MAGIC_NUMBERS)) {
     // 跳过已特殊处理的格式

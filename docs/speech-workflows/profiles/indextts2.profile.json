@@ -1,0 +1,8 @@
+{
+  "speechEngine": "indextts2",
+  "defaultParameters": {
+    "speed": 1,
+    "pitch": 1,
+    "emotionStrength": 0
+  }
+}

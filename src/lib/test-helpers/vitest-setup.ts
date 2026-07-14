@@ -1,3 +1,5 @@
+import { beforeAll, expect } from "vitest";
+
 /**
  * PR-11 vitest 全局 setup
  *

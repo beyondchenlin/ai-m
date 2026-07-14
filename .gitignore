@@ -52,3 +52,6 @@ run_kling.sh
 
 # scratchpad clones (not part of project)
 /tmp/
+# Python cache
+__pycache__/
+*.py[cod]

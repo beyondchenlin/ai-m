@@ -18,7 +18,7 @@ export async function handleCharacterImage(task: Task) {
     throw new Error("Character not found");
   }
 
-  const ai = resolveImageProvider(payload.modelConfig);
+  const ai = await resolveImageProvider(payload.modelConfig);
   const prompt = buildCharacterTurnaroundPrompt(character.description || character.name, character.name);
 
   const imagePath = await ai.generateImage(prompt, {

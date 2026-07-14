@@ -12,6 +12,11 @@ export {
   validateMagicBytes,
   checkArtifactAccess,
   cleanupStagingDir,
+  recoverStagingArtifacts,
+  getArtifactRoot,
+  resolveArtifactStoragePath,
+  isArtifactStorageKeySafe,
+  ContentType,
   ContenType,
 } from "./commit";
 export type { ArtifactStreamInput, ArtifactCommitResult } from "./commit";
@@ -24,16 +29,6 @@ export {
   detectImageDimensions,
   detectAudioDuration,
 } from "./content-detection";
-
-// PR-06 新增：原子提交
-export {
-  commitArtifact,
-  commitArtifactFromBuffer as commitArtifactFromBufferV2,
-  validateStorageKey,
-  generateStorageKey,
-  DEFAULT_OUTPUT_POLICY,
-} from "./atomic-commit";
-export type { OutputPolicy, CommitResult } from "./atomic-commit";
 
 // PR-06 新增：磁盘清理
 export {

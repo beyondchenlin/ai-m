@@ -393,6 +393,34 @@
       "when": 1783854021421,
       "tag": "0055_v2_0_key_references",
       "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1783854500000,
+      "tag": "0056_add_visual_subjects",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1783950000000,
+      "tag": "0057_pr12_platform_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1784036400000,
+      "tag": "0058_pr13_speech_first_class",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1784122800000,
+      "tag": "0059_pr13_review2_hardening",
+      "breakpoints": true
     }
   ]
 }

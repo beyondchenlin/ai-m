@@ -1144,7 +1144,7 @@ const shotSplitDef: PromptDefinition = {
     // Unified metadata-only output format. Image prompts (first/last frame, ref images)
     // are produced by independent downstream prompts and stored in shot_assets table
     // discriminated by type, so both modes can coexist on the same shots.
-    let outputFormat = replaceDuration(r("output_format"));
+    const outputFormat = replaceDuration(r("output_format"));
 
     // Replace dynamic placeholders in cinematography_principles
     let cinematography = r("cinematography_principles");

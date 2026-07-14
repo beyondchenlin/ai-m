@@ -7,7 +7,7 @@
 
 import { db } from "@/lib/db";
 import { resourcePoolSlots, generationJobs, generationAttempts } from "@/lib/db/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, inArray, sql } from "drizzle-orm";
 
 /** 租约配置 */
 export const LEASE_CONFIG = {
@@ -52,7 +52,7 @@ export async function acquireResourceSlot(
         sql`${resourcePoolSlots}."rowid" = (
           SELECT "rowid" FROM ${resourcePoolSlots}
           WHERE ${resourcePoolSlots.resourcePoolId} = ${resourcePoolId}
-            AND (${resourcePoolSlots.ownerAttemptId} IS NULL OR ${resourcePoolSlots.expiresAtMs} < ${now})
+            AND ${resourcePoolSlots.ownerAttemptId} IS NULL
           ORDER BY ${resourcePoolSlots.slotNo}
           LIMIT 1
         )`,
@@ -127,7 +127,7 @@ export async function releaseResourceSlot(
 /** 原子领取任务（含防旧写令牌递增） */
 export async function claimJob(
   workerId: string,
-  capability: string,
+  capability: typeof generationJobs.$inferSelect.capability,
 ): Promise<typeof generationJobs.$inferSelect | null> {
   const now = Date.now();
   const claimUntilMs = now + LEASE_CONFIG.CLAIM_LEASE_MS;
@@ -210,52 +210,124 @@ export async function releaseJobClaim(
   return !!updated;
 }
 
-/** 扫描过期租约并恢复（恢复扫描器） */
+/**
+ * Scan expired ownership safely.
+ *
+ * Only pre-submission attempts may be requeued automatically. Once an external
+ * execution might exist, the job is escalated for reconciliation and the GPU
+ * slot remains reserved. This deliberately prefers a blocked slot over duplicate
+ * inference.
+ */
 export async function scanExpiredClaims(): Promise<{
-  expiredJobs: string[];
-  expiredSlots: { poolId: string; slotNo: number }[];
+  requeuedJobs: string[];
+  attentionJobs: string[];
+  cancelledJobs: string[];
+  releasedSlots: { poolId: string; slotNo: number }[];
 }> {
   const now = Date.now();
+  const expired = await db.select().from(generationJobs).where(and(
+    inArray(generationJobs.status, ["RUNNING", "CANCEL_REQUESTED"]),
+    sql`${generationJobs.claimUntilMs} < ${now}`,
+  ));
+  const requeuedJobs: string[] = [];
+  const attentionJobs: string[] = [];
+  const cancelledJobs: string[] = [];
+  const safePreSubmission = new Set(["CREATED", "LEASED", "PREPARING"]);
+  const terminalAttemptPhases = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "ORPHANED"]);
 
-  // 过期工作领取 → 重置为 QUEUED（允许其他 Worker 领取）
-  const expiredJobs = await db
-    .update(generationJobs)
-    .set({
-      status: "QUEUED",
+  for (const job of expired) {
+    const attempt = job.currentAttemptId
+      ? (await db.select().from(generationAttempts).where(eq(generationAttempts.id, job.currentAttemptId)))[0]
+      : undefined;
+    if (job.status === "CANCEL_REQUESTED" && (!attempt || (safePreSubmission.has(attempt.phase) && !attempt.externalJobId))) {
+      const cancelled = await db.update(generationJobs).set({
+        status: "CANCELLED",
+        claimOwner: null,
+        claimUntilMs: null,
+        claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
+        completedAtMs: now,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationJobs.id, job.id),
+        eq(generationJobs.status, "CANCEL_REQUESTED"),
+        eq(generationJobs.claimOwner, job.claimOwner!),
+        eq(generationJobs.claimFencingToken, job.claimFencingToken),
+        sql`${generationJobs.claimUntilMs} < ${now}`,
+      )).returning({ id: generationJobs.id });
+      if (cancelled[0]) {
+        if (attempt) await db.update(generationAttempts).set({
+          phase: "CANCELLED", finishedAtMs: now, updatedAtMs: now,
+        }).where(and(eq(generationAttempts.id, attempt.id), eq(generationAttempts.jobClaimFencingToken, job.claimFencingToken)));
+        cancelledJobs.push(job.id);
+      }
+      continue;
+    }
+
+    if (!attempt || (safePreSubmission.has(attempt.phase) && !attempt.externalJobId)) {
+      const updated = await db.update(generationJobs).set({
+        status: "QUEUED",
+        claimOwner: null,
+        claimUntilMs: null,
+        claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationJobs.id, job.id),
+        eq(generationJobs.status, "RUNNING"),
+        eq(generationJobs.claimOwner, job.claimOwner!),
+        eq(generationJobs.claimFencingToken, job.claimFencingToken),
+        sql`${generationJobs.claimUntilMs} < ${now}`,
+      )).returning({ id: generationJobs.id });
+      if (updated[0]) {
+        if (attempt) await db.update(generationAttempts).set({
+          phase: "ORPHANED", errorClass: "expired_pre_submission_claim",
+          errorCode: "expired_pre_submission_claim",
+          errorMessageSafe: "The previous worker lost ownership before external submission",
+          finishedAtMs: now, updatedAtMs: now,
+        }).where(and(eq(generationAttempts.id, attempt.id), eq(generationAttempts.jobClaimFencingToken, job.claimFencingToken)));
+        requeuedJobs.push(job.id);
+      }
+      continue;
+    }
+
+    const updated = await db.update(generationJobs).set({
+      status: "NEEDS_ATTENTION",
       claimOwner: null,
       claimUntilMs: null,
+      claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
+      needsAttentionReason: `expired_claim:${attempt.phase}:external=${attempt.externalJobId ?? "unknown"}`,
       updatedAtMs: now,
-    })
-    .where(
-      and(
-        eq(generationJobs.status, "RUNNING"),
-        sql`${generationJobs.claimUntilMs} < ${now}`,
-      ),
-    )
-    .returning({ id: generationJobs.id });
+    }).where(and(
+      eq(generationJobs.id, job.id),
+      eq(generationJobs.status, job.status),
+      eq(generationJobs.claimOwner, job.claimOwner!),
+      eq(generationJobs.claimFencingToken, job.claimFencingToken),
+      sql`${generationJobs.claimUntilMs} < ${now}`,
+    )).returning({ id: generationJobs.id });
+    if (updated[0]) attentionJobs.push(job.id);
+  }
 
-  // 过期资源槽位 → 释放
-  const expiredSlots = await db
-    .update(resourcePoolSlots)
-    .set({
-      ownerAttemptId: null,
-      leaseToken: null,
-      expiresAtMs: null,
-      updatedAtMs: now,
-    })
-    .where(
-      sql`${resourcePoolSlots.expiresAtMs} < ${now} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`,
-    )
-    .returning({
-      poolId: resourcePoolSlots.resourcePoolId,
-      slotNo: resourcePoolSlots.slotNo,
-    });
-
-  return {
-    expiredJobs: expiredJobs.map((j) => j.id),
-    expiredSlots: expiredSlots.map((s) => ({
-      poolId: s.poolId,
-      slotNo: s.slotNo,
-    })),
-  };
+  const expiredSlots = await db.select().from(resourcePoolSlots).where(
+    sql`${resourcePoolSlots.expiresAtMs} < ${now} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`,
+  );
+  const releasedSlots: { poolId: string; slotNo: number }[] = [];
+  for (const slot of expiredSlots) {
+    const attempt = slot.ownerAttemptId
+      ? (await db.select({ phase: generationAttempts.phase }).from(generationAttempts).where(eq(generationAttempts.id, slot.ownerAttemptId)))[0]
+      : undefined;
+    if (!attempt || terminalAttemptPhases.has(attempt.phase)) {
+      const released = await db.update(resourcePoolSlots).set({
+        ownerAttemptId: null,
+        leaseToken: null,
+        expiresAtMs: null,
+        fencingToken: sql`${resourcePoolSlots.fencingToken} + 1`,
+        updatedAtMs: now,
+      }).where(and(
+        eq(resourcePoolSlots.resourcePoolId, slot.resourcePoolId),
+        eq(resourcePoolSlots.slotNo, slot.slotNo),
+        eq(resourcePoolSlots.fencingToken, slot.fencingToken),
+      )).returning();
+      if (released[0]) releasedSlots.push({ poolId: slot.resourcePoolId, slotNo: slot.slotNo });
+    }
+  }
+  return { requeuedJobs, attentionJobs, cancelledJobs, releasedSlots };
 }

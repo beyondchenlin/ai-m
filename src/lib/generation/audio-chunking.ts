@@ -1,319 +1,128 @@
-/**
- * 音频分块处理模块
- * 
- * 负责长文本的分块、时长计算和合并
- */
-
-/** 分块配置 */
+/** Deterministic narration chunking with exact source offsets. */
 export interface ChunkingConfig {
-  /** 最大文本长度（字符） */
   maxTextLength: number;
-  /** 最大时长（秒） */
   maxDurationSeconds: number;
-  /** 分块策略 */
   strategy: "sentence" | "paragraph" | "fixed";
-  /** 重叠字符数（用于平滑过渡） */
+  /** Audio chunks must not overlap: overlap would repeat spoken words. */
   overlapChars: number;
-  /** 预估语速（字符/秒） */
   estimatedCharsPerSecond: number;
 }
 
-/** 默认分块配置 */
 const DEFAULT_CHUNKING_CONFIG: ChunkingConfig = {
   maxTextLength: 1000,
   maxDurationSeconds: 30,
   strategy: "sentence",
-  overlapChars: 50,
-  estimatedCharsPerSecond: 15, // 中文约 15 字/秒
+  overlapChars: 0,
+  estimatedCharsPerSecond: 15,
 };
 
-/** 文本块 */
 export interface TextChunk {
-  /** 块索引 */
   index: number;
-  /** 文本内容 */
   text: string;
-  /** 预估时长（秒） */
   estimatedDuration: number;
-  /** 起始位置（字符） */
   startOffset: number;
-  /** 结束位置（字符） */
   endOffset: number;
 }
 
-/** 分块结果 */
 export interface ChunkingResult {
-  /** 文本块列表 */
   chunks: TextChunk[];
-  /** 总预估时长（秒） */
   totalEstimatedDuration: number;
-  /** 原始文本长度 */
   originalTextLength: number;
-  /** 分块数量 */
   chunkCount: number;
 }
 
-/**
- * 按句子分块
- */
-function chunkBySentence(
-  text: string,
-  config: ChunkingConfig
-): TextChunk[] {
-  const chunks: TextChunk[] = [];
-  
-  // 中文句子分隔符
-  const sentenceDelimiters = /[。！？；\n]+/;
-  const sentences = text.split(sentenceDelimiters).filter(s => s.trim().length > 0);
-  
-  let currentChunk = "";
-  let currentOffset = 0;
-  let chunkIndex = 0;
-  
-  for (const sentence of sentences) {
-    const testChunk = currentChunk + sentence;
-    const testLength = testChunk.length;
-    const testDuration = testLength / config.estimatedCharsPerSecond;
-    
-    // 如果添加当前句子会超限，先保存当前块
-    if (testLength > config.maxTextLength || testDuration > config.maxDurationSeconds) {
-      if (currentChunk.length > 0) {
-        chunks.push({
-          index: chunkIndex++,
-          text: currentChunk.trim(),
-          estimatedDuration: currentChunk.length / config.estimatedCharsPerSecond,
-          startOffset: currentOffset,
-          endOffset: currentOffset + currentChunk.length,
-        });
-        
-        currentOffset += currentChunk.length - config.overlapChars;
-        currentChunk = currentChunk.slice(-config.overlapChars); // 保留重叠部分
-      }
-    }
-    
-    currentChunk += sentence;
-  }
-  
-  // 保存最后一块
-  if (currentChunk.length > 0) {
-    chunks.push({
-      index: chunkIndex,
-      text: currentChunk.trim(),
-      estimatedDuration: currentChunk.length / config.estimatedCharsPerSecond,
-      startOffset: currentOffset,
-      endOffset: currentOffset + currentChunk.length,
-    });
-  }
-  
-  return chunks;
+function isSentenceBoundary(text: string, index: number): boolean {
+  const char = text[index];
+  if ("。！？!?；;\n".includes(char)) return true;
+  if (char !== ".") return false;
+  if (index > 0 && index + 1 < text.length && /\d/.test(text[index - 1]) && /\d/.test(text[index + 1])) return false;
+  let start = index;
+  while (start > 0 && /[A-Za-z]/.test(text[start - 1])) start--;
+  return !new Set(["mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc"]).has(text.slice(start, index).toLowerCase());
 }
 
-/**
- * 按段落分块
- */
-function chunkByParagraph(
-  text: string,
-  config: ChunkingConfig
-): TextChunk[] {
-  const chunks: TextChunk[] = [];
-  
-  // 段落分隔符
-  const paragraphDelimiters = /\n\n+/;
-  const paragraphs = text.split(paragraphDelimiters).filter(p => p.trim().length > 0);
-  
-  let currentChunk = "";
-  let currentOffset = 0;
-  let chunkIndex = 0;
-  
-  for (const paragraph of paragraphs) {
-    const testChunk = currentChunk + "\n\n" + paragraph;
-    const testLength = testChunk.length;
-    const testDuration = testLength / config.estimatedCharsPerSecond;
-    
-    // 如果添加当前段落会超限，先保存当前块
-    if (testLength > config.maxTextLength || testDuration > config.maxDurationSeconds) {
-      if (currentChunk.length > 0) {
-        chunks.push({
-          index: chunkIndex++,
-          text: currentChunk.trim(),
-          estimatedDuration: currentChunk.length / config.estimatedCharsPerSecond,
-          startOffset: currentOffset,
-          endOffset: currentOffset + currentChunk.length,
-        });
-        
-        currentOffset += currentChunk.length - config.overlapChars;
-        currentChunk = currentChunk.slice(-config.overlapChars);
-      }
-    }
-    
-    currentChunk += (currentChunk.length > 0 ? "\n\n" : "") + paragraph;
-  }
-  
-  // 保存最后一块
-  if (currentChunk.length > 0) {
-    chunks.push({
-      index: chunkIndex,
-      text: currentChunk.trim(),
-      estimatedDuration: currentChunk.length / config.estimatedCharsPerSecond,
-      startOffset: currentOffset,
-      endOffset: currentOffset + currentChunk.length,
-    });
-  }
-  
-  return chunks;
+function consumeClosers(text: string, index: number, limit: number): number {
+  let cursor = index;
+  while (cursor < limit && /["'”’）)\]} \t\r\n]/.test(text[cursor])) cursor++;
+  return cursor;
 }
 
-/**
- * 按固定长度分块
- */
-function chunkByFixedLength(
-  text: string,
-  config: ChunkingConfig
-): TextChunk[] {
-  const chunks: TextChunk[] = [];
-  const chunkSize = config.maxTextLength;
-  
-  for (let i = 0; i < text.length; i += chunkSize - config.overlapChars) {
-    const chunkText = text.slice(i, i + chunkSize);
-    if (chunkText.trim().length === 0) continue;
-    
-    chunks.push({
-      index: chunks.length,
-      text: chunkText.trim(),
-      estimatedDuration: chunkText.length / config.estimatedCharsPerSecond,
-      startOffset: i,
-      endOffset: i + chunkText.length,
-    });
+function findBoundary(text: string, start: number, target: number, hardEnd: number, strategy: ChunkingConfig["strategy"]): number {
+  if (strategy === "fixed") return hardEnd;
+  if (strategy === "paragraph") {
+    const paragraph = text.lastIndexOf("\n\n", hardEnd - 1);
+    if (paragraph >= start && paragraph + 2 <= hardEnd) return paragraph + 2;
   }
-  
-  return chunks;
+  for (let i = hardEnd - 1; i >= target - 1; i--) if (isSentenceBoundary(text, i)) return consumeClosers(text, i + 1, hardEnd);
+  for (let i = target - 2; i >= start; i--) if (isSentenceBoundary(text, i)) return consumeClosers(text, i + 1, hardEnd);
+  return hardEnd;
 }
 
-/**
- * 对文本进行分块
- */
-export function chunkText(
-  text: string,
-  config: Partial<ChunkingConfig> = {}
-): ChunkingResult {
+export function validateChunkingConfig(config: Partial<ChunkingConfig>): { valid: boolean; errors: string[] } {
   const cfg = { ...DEFAULT_CHUNKING_CONFIG, ...config };
-  
-  // 根据策略选择分块方法
-  let chunks: TextChunk[];
-  switch (cfg.strategy) {
-    case "sentence":
-      chunks = chunkBySentence(text, cfg);
-      break;
-    case "paragraph":
-      chunks = chunkByParagraph(text, cfg);
-      break;
-    case "fixed":
-      chunks = chunkByFixedLength(text, cfg);
-      break;
-    default:
-      chunks = chunkBySentence(text, cfg);
+  const errors: string[] = [];
+  if (!Number.isInteger(cfg.maxTextLength) || cfg.maxTextLength <= 0 || cfg.maxTextLength > 100_000) errors.push("maxTextLength must be an integer between 1 and 100000");
+  if (!Number.isFinite(cfg.maxDurationSeconds) || cfg.maxDurationSeconds <= 0 || cfg.maxDurationSeconds > 3600) errors.push("maxDurationSeconds must be between 0 and 3600");
+  if (cfg.overlapChars !== 0) errors.push("overlapChars must be 0 for audio narration to prevent repeated speech");
+  if (!Number.isFinite(cfg.estimatedCharsPerSecond) || cfg.estimatedCharsPerSecond <= 0 || cfg.estimatedCharsPerSecond > 100) errors.push("estimatedCharsPerSecond must be between 0 and 100");
+  if (!["sentence", "paragraph", "fixed"].includes(cfg.strategy)) errors.push(`Unsupported chunking strategy: ${cfg.strategy}`);
+  return { valid: errors.length === 0, errors };
+}
+
+export function chunkText(text: string, config: Partial<ChunkingConfig> = {}): ChunkingResult {
+  if (typeof text !== "string") throw new Error("Narration text must be a string");
+  const cfg = { ...DEFAULT_CHUNKING_CONFIG, ...config };
+  const validation = validateChunkingConfig(cfg);
+  if (!validation.valid) throw new Error(validation.errors.join("; "));
+  const source = text;
+  if (!source.trim()) return { chunks: [], totalEstimatedDuration: 0, originalTextLength: source.length, chunkCount: 0 };
+  const durationLimit = Math.max(1, Math.floor(cfg.maxDurationSeconds * cfg.estimatedCharsPerSecond));
+  const hardLimit = Math.min(cfg.maxTextLength, durationLimit);
+  const chunks: TextChunk[] = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const hardEnd = Math.min(cursor + hardLimit, source.length);
+    const target = Math.min(cursor + Math.max(1, Math.floor(hardLimit * 0.7)), hardEnd);
+    const end = hardEnd === source.length ? source.length : findBoundary(source, cursor, target, hardEnd, cfg.strategy);
+    if (end <= cursor) throw new Error("Narration chunker made no forward progress");
+    const raw = source.slice(cursor, end);
+    if (raw.trim()) {
+      chunks.push({
+        index: chunks.length,
+        text: raw.trim(),
+        estimatedDuration: raw.trim().length / cfg.estimatedCharsPerSecond,
+        startOffset: cursor,
+        endOffset: end,
+      });
+    }
+    cursor = end;
   }
-  
-  // 重新编号
-  chunks = chunks.map((chunk, idx) => ({
-    ...chunk,
-    index: idx,
-  }));
-  
-  const totalEstimatedDuration = chunks.reduce(
-    (sum, chunk) => sum + chunk.estimatedDuration,
-    0
-  );
-  
   return {
     chunks,
-    totalEstimatedDuration,
-    originalTextLength: text.length,
+    totalEstimatedDuration: chunks.reduce((sum, chunk) => sum + chunk.estimatedDuration, 0),
+    originalTextLength: source.length,
     chunkCount: chunks.length,
   };
 }
 
-/**
- * 计算文本预估时长
- */
-export function estimateTextDuration(
-  text: string,
-  charsPerSecond: number = 15
-): number {
+export function estimateTextDuration(text: string, charsPerSecond = 15): number {
+  if (!Number.isFinite(charsPerSecond) || charsPerSecond <= 0) throw new Error("charsPerSecond must be positive");
   return text.length / charsPerSecond;
 }
 
-/**
- * 验证分块配置
- */
-export function validateChunkingConfig(
-  config: Partial<ChunkingConfig>
-): { valid: boolean; errors: string[] } {
-  const cfg = { ...DEFAULT_CHUNKING_CONFIG, ...config };
-  const errors: string[] = [];
-  
-  if (cfg.maxTextLength <= 0) {
-    errors.push("maxTextLength 必须大于 0");
-  }
-  
-  if (cfg.maxDurationSeconds <= 0) {
-    errors.push("maxDurationSeconds 必须大于 0");
-  }
-  
-  if (cfg.overlapChars < 0) {
-    errors.push("overlapChars 必须 >= 0");
-  }
-  
-  if (cfg.overlapChars >= cfg.maxTextLength) {
-    errors.push("overlapChars 必须小于 maxTextLength");
-  }
-  
-  if (cfg.estimatedCharsPerSecond <= 0) {
-    errors.push("estimatedCharsPerSecond 必须大于 0");
-  }
-  
-  if (!["sentence", "paragraph", "fixed"].includes(cfg.strategy)) {
-    errors.push(`不支持的分块策略: ${cfg.strategy}`);
-  }
-  
-  return {
-    valid: errors.length === 0,
-    errors,
-  };
-}
-
-/**
- * 合并音频块（生成合并指令）
- */
-export function generateMergeInstructions(
-  chunks: TextChunk[],
-  outputFormat: "wav" | "mp3" = "wav"
-): {
+export function generateMergeInstructions(chunks: TextChunk[], outputFormat: "wav" | "mp3" = "wav"): {
   chunkFiles: string[];
   mergeCommand: string;
+  argv: string[];
   totalDuration: number;
 } {
-  const chunkFiles = chunks.map(
-    (chunk, idx) => `chunk_${idx}.${outputFormat}`
-  );
-  
-  // 生成 ffmpeg 合并命令
-  const inputArgs = chunkFiles.map(f => `-i ${f}`).join(" ");
-  const filterComplex = chunkFiles
-    .map((_, idx) => `[${idx}:a]`)
-    .join("");
-  const filter = `${filterComplex}concat=n=${chunkFiles.length}:v=0:a=1[out]`;
-  
-  const mergeCommand = `ffmpeg ${inputArgs} -filter_complex "${filter}" -map "[out]" output.${outputFormat}`;
-  
-  const totalDuration = chunks.reduce(
-    (sum, chunk) => sum + chunk.estimatedDuration,
-    0
-  );
-  
+  const chunkFiles = chunks.map((_, index) => `chunk_${index}.${outputFormat}`);
+  const filter = `${chunkFiles.map((_, index) => `[${index}:a]`).join("")}concat=n=${chunkFiles.length}:v=0:a=1[out]`;
+  const argv = chunkFiles.flatMap((file) => ["-i", file]).concat(["-filter_complex", filter, "-map", "[out]", `output.${outputFormat}`]);
   return {
     chunkFiles,
-    mergeCommand,
-    totalDuration,
+    mergeCommand: ["ffmpeg", ...argv.map((arg) => JSON.stringify(arg))].join(" "),
+    argv,
+    totalDuration: chunks.reduce((sum, chunk) => sum + chunk.estimatedDuration, 0),
   };
 }

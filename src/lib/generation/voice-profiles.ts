@@ -1,363 +1,301 @@
-/**
- * 音色档案管理模块
- * 
- * 负责音色样本的上传、存储、查询和验证
- */
-
+/** Voice profiles reference immutable user-owned source audio or a legacy generated artifact. */
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { voiceProfiles } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
-import { promises as fs } from "fs";
-import * as path from "path";
-import { createHash } from "crypto";
-import { genId } from "@/lib/utils/id";
+import {
+  generationArtifacts,
+  generationAttempts,
+  generationJobs,
+  projects,
+  sourceMediaAssets,
+  voiceProfiles,
+} from "@/lib/db/schema";
+import { id as genId } from "@/lib/id";
+import { deleteOwnedSourceAsset } from "./source-assets";
 
-/** 音色档案配置 */
-export interface VoiceProfileConfig {
-  /** 最大文件大小（字节） */
-  maxFileSizeBytes: number;
-  /** 允许的音频格式 */
-  allowedMimeTypes: string[];
-  /** 最小时长（秒） */
-  minDurationSeconds: number;
-  /** 最大时长（秒） */
-  maxDurationSeconds: number;
-  /** 允许的采样率 */
-  allowedSampleRates: number[];
+export const VOICE_CONSENT_VERSION = "voice-clone-consent-v1";
+export type VoiceProvider = "indextts2" | "omnivoice";
+
+export class VoiceProfileError extends Error {
+  constructor(
+    message: string,
+    readonly status: 400 | 404 | 409,
+    readonly code: string,
+  ) {
+    super(message);
+    this.name = "VoiceProfileError";
+  }
 }
 
-/** 默认音色档案配置 */
-const DEFAULT_VOICE_CONFIG: VoiceProfileConfig = {
-  maxFileSizeBytes: 50 * 1024 * 1024, // 50MB
-  allowedMimeTypes: ["audio/wav", "audio/mp3", "audio/mpeg", "audio/ogg"],
-  minDurationSeconds: 3,
-  maxDurationSeconds: 60,
-  allowedSampleRates: [16000, 22050, 44100],
-};
-
-/** 音色档案输入 */
 export interface VoiceProfileInput {
-  /** 档案名称 */
-  name: string;
-  /** 档案描述 */
-  description?: string;
-  /** 音频文件路径 */
-  audioFilePath: string;
-  /** 用户 ID */
+  projectId: string;
   userId: string;
-  /** 语言代码 */
+  name: string;
+  provider: VoiceProvider;
+  referenceSourceAssetId?: string;
+  /** Legacy generated audio can still be used as a source. */
+  referenceArtifactId?: string;
+  referenceText?: string;
   language?: string;
+  defaultSpeed?: number;
+  defaultPitch?: number;
+  consentConfirmed: boolean;
+  consentStatementVersion: string;
 }
 
-/** 处理后的音色档案 */
 export interface ProcessedVoiceProfile {
-  /** 档案 ID */
   id: string;
-  /** 档案名称 */
-  name: string;
-  /** 档案描述 */
-  description: string | null;
-  /** 存储路径 */
-  storagePath: string;
-  /** SHA256 摘要 */
-  sha256: string;
-  /** 文件大小 */
-  sizeBytes: number;
-  /** MIME 类型 */
-  mimeType: string;
-  /** 时长（秒） */
-  durationSeconds: number;
-  /** 采样率 */
-  sampleRate: number;
-  /** 语言代码 */
-  language: string | null;
-  /** 用户 ID */
+  projectId: string;
   userId: string;
-  /** 创建时间 */
-  createdAt: Date;
+  name: string;
+  provider: VoiceProvider;
+  referenceSourceAssetId: string | null;
+  referenceArtifactId: string | null;
+  referenceUrl: string;
+  referenceText: string | null;
+  language: string;
+  defaultSpeed: number;
+  defaultPitch: number;
+  durationMs: number | null;
+  createdAtMs: number;
 }
 
-/**
- * 校验音色档案文件
- */
-async function validateVoiceProfileFile(
-  filePath: string,
-  config: VoiceProfileConfig
-): Promise<{ valid: boolean; error?: string }> {
-  try {
-    const stats = await fs.stat(filePath);
+async function assertOwnedProject(projectId: string, userId: string): Promise<void> {
+  const [project] = await db.select({ userId: projects.userId }).from(projects).where(eq(projects.id, projectId));
+  if (!project || project.userId !== userId) throw new VoiceProfileError("Project not found", 404, "project_not_found");
+}
 
-    // 检查文件大小
-    if (stats.size > config.maxFileSizeBytes) {
-      return {
-        valid: false,
-        error: `文件大小 ${stats.size} 超过限制 ${config.maxFileSizeBytes}`,
-      };
+async function loadOwnedSourceAudio(projectId: string, userId: string, sourceAssetId: string) {
+  const [asset] = await db.select().from(sourceMediaAssets).where(and(
+    eq(sourceMediaAssets.id, sourceAssetId),
+    eq(sourceMediaAssets.projectId, projectId),
+    eq(sourceMediaAssets.userId, userId),
+    eq(sourceMediaAssets.status, "COMMITTED"),
+  ));
+  if (!asset || asset.kind !== "audio" || !asset.mimeType.startsWith("audio/")) throw new VoiceProfileError("Reference source audio is not accessible", 404, "source_audio_unavailable");
+  if (asset.sizeBytes <= 0 || asset.sizeBytes > 50 * 1024 * 1024) throw new VoiceProfileError("Reference audio exceeds 50 MB", 400, "source_audio_size_invalid");
+  if (asset.durationMs === null || asset.durationMs < 3_000 || asset.durationMs > 60_000) throw new VoiceProfileError("Reference audio must be between 3 and 60 seconds", 400, "source_audio_duration_invalid");
+  return asset;
+}
+
+async function loadOwnedGeneratedAudio(projectId: string, userId: string, artifactId: string) {
+  const [row] = await db.select({
+    artifact: generationArtifacts,
+    projectUserId: projects.userId,
+    jobProjectId: generationJobs.projectId,
+  }).from(generationArtifacts)
+    .innerJoin(generationAttempts, eq(generationAttempts.id, generationArtifacts.attemptId))
+    .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+    .innerJoin(projects, eq(projects.id, generationJobs.projectId))
+    .where(and(eq(generationArtifacts.id, artifactId), eq(projects.id, projectId)));
+  if (!row || row.projectUserId !== userId || row.jobProjectId !== projectId) throw new VoiceProfileError("Reference audio artifact is not accessible", 404, "artifact_audio_unavailable");
+  if (row.artifact.status !== "COMMITTED" || row.artifact.kind !== "audio") throw new VoiceProfileError("Reference artifact must be committed audio", 400, "artifact_audio_invalid");
+  if (!["private-original", "project"].includes(row.artifact.visibility)) throw new VoiceProfileError("Reference audio visibility is invalid", 404, "artifact_audio_unavailable");
+  if (row.artifact.sizeBytes <= 0 || row.artifact.sizeBytes > 50 * 1024 * 1024) throw new VoiceProfileError("Reference audio exceeds 50 MB", 400, "artifact_audio_size_invalid");
+  if (row.artifact.durationMs === null || row.artifact.durationMs < 3_000 || row.artifact.durationMs > 60_000) throw new VoiceProfileError("Reference audio must be between 3 and 60 seconds", 400, "artifact_audio_duration_invalid");
+  return row.artifact;
+}
+
+function validateInput(input: VoiceProfileInput): void {
+  if (!input.consentConfirmed) throw new VoiceProfileError("Voice usage consent must be confirmed", 400, "consent_required");
+  if (input.consentStatementVersion !== VOICE_CONSENT_VERSION) throw new VoiceProfileError("Voice consent statement version is invalid", 400, "consent_version_invalid");
+  if (!input.name.trim() || input.name.trim().length > 120) throw new VoiceProfileError("Voice profile name is invalid", 400, "profile_name_invalid");
+  if (!(["indextts2", "omnivoice"] as string[]).includes(input.provider)) throw new VoiceProfileError("Voice provider is unsupported", 400, "provider_unsupported");
+  if (Boolean(input.referenceSourceAssetId) === Boolean(input.referenceArtifactId)) throw new VoiceProfileError("Exactly one voice reference must be provided", 400, "reference_count_invalid");
+  if (input.referenceText && input.referenceText.length > 20_000) throw new VoiceProfileError("referenceText is too long", 400, "reference_text_too_long");
+  if (input.language && !/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(input.language)) throw new VoiceProfileError("language tag is invalid", 400, "language_invalid");
+  if (!Number.isFinite(input.defaultSpeed ?? 1) || (input.defaultSpeed ?? 1) < 0.5 || (input.defaultSpeed ?? 1) > 2) throw new VoiceProfileError("defaultSpeed must be between 0.5 and 2.0", 400, "speed_invalid");
+  if (!Number.isFinite(input.defaultPitch ?? 1) || (input.defaultPitch ?? 1) < 0.5 || (input.defaultPitch ?? 1) > 2) throw new VoiceProfileError("defaultPitch must be between 0.5 and 2.0", 400, "pitch_invalid");
+}
+
+export async function processVoiceProfile(input: VoiceProfileInput): Promise<ProcessedVoiceProfile> {
+  validateInput(input);
+  await assertOwnedProject(input.projectId, input.userId);
+  if (input.referenceSourceAssetId) await loadOwnedSourceAudio(input.projectId, input.userId, input.referenceSourceAssetId);
+  if (input.referenceArtifactId) await loadOwnedGeneratedAudio(input.projectId, input.userId, input.referenceArtifactId);
+  const id = genId();
+  const now = Date.now();
+  db.transaction((tx) => {
+    const [ownedProject] = tx.select({ userId: projects.userId }).from(projects)
+      .where(eq(projects.id, input.projectId)).all();
+    if (!ownedProject || ownedProject.userId !== input.userId) throw new VoiceProfileError("Project not found", 404, "project_not_found");
+
+    if (input.referenceSourceAssetId) {
+      const [source] = tx.select({ id: sourceMediaAssets.id }).from(sourceMediaAssets).where(and(
+        eq(sourceMediaAssets.id, input.referenceSourceAssetId),
+        eq(sourceMediaAssets.projectId, input.projectId),
+        eq(sourceMediaAssets.userId, input.userId),
+        eq(sourceMediaAssets.status, "COMMITTED"),
+        eq(sourceMediaAssets.kind, "audio"),
+      )).all();
+      if (!source) throw new VoiceProfileError("Reference source audio is not accessible", 404, "source_audio_unavailable");
+    }
+    if (input.referenceArtifactId) {
+      const [artifact] = tx.select({ id: generationArtifacts.id }).from(generationArtifacts)
+        .innerJoin(generationAttempts, eq(generationAttempts.id, generationArtifacts.attemptId))
+        .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+        .where(and(
+          eq(generationArtifacts.id, input.referenceArtifactId),
+          eq(generationArtifacts.status, "COMMITTED"),
+          eq(generationArtifacts.kind, "audio"),
+          eq(generationJobs.projectId, input.projectId),
+        )).all();
+      if (!artifact) throw new VoiceProfileError("Reference audio artifact is not accessible", 404, "artifact_audio_unavailable");
     }
 
-    // 检查文件是否存在
-    if (!stats.isFile()) {
-      return { valid: false, error: "路径不是文件" };
-    }
-
-    // 检查文件扩展名
-    const ext = path.extname(filePath).toLowerCase();
-    const allowedExts = [".wav", ".mp3", ".ogg"];
-    if (!allowedExts.includes(ext)) {
-      return {
-        valid: false,
-        error: `不支持的文件格式: ${ext}，支持: ${allowedExts.join(", ")}`,
-      };
-    }
-
-    return { valid: true };
-  } catch (err) {
-    return { valid: false, error: `文件不存在: ${filePath}` };
-  }
-}
-
-/**
- * 计算文件 SHA256
- */
-async function calculateFileSha256(filePath: string): Promise<string> {
-  const buffer = await fs.readFile(filePath);
-  return createHash("sha256").update(buffer).digest("hex");
-}
-
-/**
- * 推断 MIME 类型
- */
-function inferMimeType(filePath: string): string {
-  const ext = path.extname(filePath).toLowerCase();
-  const mimeMap: Record<string, string> = {
-    ".wav": "audio/wav",
-    ".mp3": "audio/mpeg",
-    ".ogg": "audio/ogg",
-  };
-  return mimeMap[ext] || "application/octet-stream";
-}
-
-/**
- * 估算音频时长（简化版本）
- * 实际生产环境应该使用 ffprobe 或类似工具
- */
-async function estimateAudioDuration(
-  filePath: string,
-  mimeType: string
-): Promise<number> {
-  // 简化估算：基于文件大小和比特率
-  const stats = await fs.stat(filePath);
-  
-  // 假设比特率
-  let bitrate = 128000; // 128 kbps
-  if (mimeType === "audio/wav") {
-    bitrate = 1411200; // 16-bit, 44.1kHz, stereo
-  } else if (mimeType === "audio/mpeg") {
-    bitrate = 128000; // 128 kbps
-  }
-  
-  // 估算时长（秒）
-  const durationSeconds = (stats.size * 8) / bitrate;
-  return Math.round(durationSeconds * 10) / 10; // 保留一位小数
-}
-
-/**
- * 处理音色档案
- */
-export async function processVoiceProfile(
-  input: VoiceProfileInput,
-  config: Partial<VoiceProfileConfig> = {}
-): Promise<ProcessedVoiceProfile> {
-  const cfg = { ...DEFAULT_VOICE_CONFIG, ...config };
-
-  // 1. 校验文件
-  const validation = await validateVoiceProfileFile(input.audioFilePath, cfg);
-  if (!validation.valid) {
-    throw new Error(`音色档案校验失败: ${validation.error}`);
-  }
-
-  // 2. 计算文件摘要
-  const sha256 = await calculateFileSha256(input.audioFilePath);
-
-  // 3. 获取文件信息
-  const stats = await fs.stat(input.audioFilePath);
-  const mimeType = inferMimeType(input.audioFilePath);
-
-  // 4. 检查 MIME 类型
-  if (!cfg.allowedMimeTypes.includes(mimeType)) {
-    throw new Error(
-      `不支持的音频格式: ${mimeType}，支持: ${cfg.allowedMimeTypes.join(", ")}`
-    );
-  }
-
-  // 5. 估算时长
-  const durationSeconds = await estimateAudioDuration(input.audioFilePath, mimeType);
-
-  // 6. 检查时长限制
-  if (durationSeconds < cfg.minDurationSeconds) {
-    throw new Error(
-      `音频时长 ${durationSeconds}秒 小于最小限制 ${cfg.minDurationSeconds}秒`
-    );
-  }
-
-  if (durationSeconds > cfg.maxDurationSeconds) {
-    throw new Error(
-      `音频时长 ${durationSeconds}秒 超过最大限制 ${cfg.maxDurationSeconds}秒`
-    );
-  }
-
-  // 7. 复制文件到音色档案目录
-  const profileId = genId();
-  const voiceProfileDir = path.resolve(process.cwd(), "data", "voice-profiles");
-  await fs.mkdir(voiceProfileDir, { recursive: true });
-  const ext = path.extname(input.audioFilePath);
-  const storagePath = path.join(voiceProfileDir, `${profileId}${ext}`);
-  await fs.copyFile(input.audioFilePath, storagePath);
-
-  // 8. 写入数据库记录
-  const now = new Date();
-  await db.insert(voiceProfiles).values({
-    id: profileId,
-    name: input.name,
-    description: input.description || null,
-    storagePath,
-    sha256,
-    sizeBytes: stats.size,
-    mimeType,
-    durationSeconds,
-    sampleRate: 22050, // 默认采样率
-    language: input.language || null,
-    userId: input.userId,
-    createdAt: now,
-    updatedAt: now,
+    tx.insert(voiceProfiles).values({
+      id,
+      projectId: input.projectId,
+      userId: input.userId,
+      name: input.name.trim(),
+      provider: input.provider,
+      referenceArtifactId: input.referenceArtifactId ?? null,
+      referenceSourceAssetId: input.referenceSourceAssetId ?? null,
+      referenceText: input.referenceText?.trim() || null,
+      language: input.language?.trim() || "zh-CN",
+      defaultSpeed: Math.round((input.defaultSpeed ?? 1) * 1000),
+      defaultPitch: Math.round((input.defaultPitch ?? 1) * 1000),
+      consentConfirmedAtMs: now,
+      consentStatementVersion: VOICE_CONSENT_VERSION,
+      createdAtMs: now,
+      updatedAtMs: now,
+    }).run();
   });
-
-  return {
-    id: profileId,
-    name: input.name,
-    description: input.description || null,
-    storagePath,
-    sha256,
-    sizeBytes: stats.size,
-    mimeType,
-    durationSeconds,
-    sampleRate: 22050,
-    language: input.language || null,
-    userId: input.userId,
-    createdAt: now,
-  };
+  const created = await getVoiceProfile(id, input.userId);
+  if (!created) throw new Error("Voice profile was created but could not be reloaded");
+  return created;
 }
 
-/**
- * 查询音色档案
- */
-export async function getVoiceProfile(
-  profileId: string
-): Promise<ProcessedVoiceProfile | null> {
-  const [profile] = await db
-    .select()
-    .from(voiceProfiles)
-    .where(eq(voiceProfiles.id, profileId))
-    .limit(1);
+export async function getVoiceProfile(profileId: string, userId: string): Promise<ProcessedVoiceProfile | null> {
+  const [row] = await db.select({ profile: voiceProfiles }).from(voiceProfiles).where(and(
+    eq(voiceProfiles.id, profileId),
+    eq(voiceProfiles.userId, userId),
+  ));
+  if (!row) return null;
 
-  if (!profile) {
+  let durationMs: number | null = null;
+  let referenceUrl = "";
+  const ownerId = row.profile.userId;
+  if (row.profile.referenceSourceAssetId) {
+    const source = await loadOwnedSourceAudio(row.profile.projectId, ownerId, row.profile.referenceSourceAssetId).catch(() => null);
+    if (!source) return null;
+    durationMs = source.durationMs;
+    referenceUrl = `/api/source-assets/${encodeURIComponent(row.profile.referenceSourceAssetId)}`;
+  } else if (row.profile.referenceArtifactId) {
+    const artifact = await loadOwnedGeneratedAudio(row.profile.projectId, ownerId, row.profile.referenceArtifactId).catch(() => null);
+    if (!artifact) return null;
+    durationMs = artifact.durationMs;
+    referenceUrl = `/api/generation/artifacts/${encodeURIComponent(row.profile.referenceArtifactId)}`;
+  } else {
     return null;
   }
 
   return {
-    id: profile.id,
-    name: profile.name,
-    description: profile.description,
-    storagePath: profile.storagePath,
-    sha256: profile.sha256,
-    sizeBytes: profile.sizeBytes,
-    mimeType: profile.mimeType,
-    durationSeconds: profile.durationSeconds,
-    sampleRate: profile.sampleRate,
-    language: profile.language,
-    userId: profile.userId,
-    createdAt: profile.createdAt,
+    id: row.profile.id,
+    projectId: row.profile.projectId,
+    userId: row.profile.userId,
+    name: row.profile.name,
+    provider: row.profile.provider as VoiceProvider,
+    referenceSourceAssetId: row.profile.referenceSourceAssetId,
+    referenceArtifactId: row.profile.referenceArtifactId,
+    referenceUrl,
+    referenceText: row.profile.referenceText,
+    language: row.profile.language,
+    defaultSpeed: row.profile.defaultSpeed / 1000,
+    defaultPitch: row.profile.defaultPitch / 1000,
+    durationMs,
+    createdAtMs: row.profile.createdAtMs,
   };
 }
 
-/**
- * 查询用户的所有音色档案
- */
-export async function listVoiceProfiles(
-  userId: string
-): Promise<ProcessedVoiceProfile[]> {
-  const profiles = await db
-    .select()
-    .from(voiceProfiles)
-    .where(eq(voiceProfiles.userId, userId));
+export async function listVoiceProfiles(userId: string, projectId?: string): Promise<ProcessedVoiceProfile[]> {
+  const rows = await db.select({ profile: voiceProfiles }).from(voiceProfiles)
+    .where(projectId ? and(eq(voiceProfiles.userId, userId), eq(voiceProfiles.projectId, projectId)) : eq(voiceProfiles.userId, userId))
+    .orderBy(desc(voiceProfiles.createdAtMs))
+    .limit(500);
+  if (!rows.length) return [];
 
-  return profiles.map((profile) => ({
-    id: profile.id,
-    name: profile.name,
-    description: profile.description,
-    storagePath: profile.storagePath,
-    sha256: profile.sha256,
-    sizeBytes: profile.sizeBytes,
-    mimeType: profile.mimeType,
-    durationSeconds: profile.durationSeconds,
-    sampleRate: profile.sampleRate,
-    language: profile.language,
-    userId: profile.userId,
-    createdAt: profile.createdAt,
-  }));
+  const sourceIds = rows.map((row) => row.profile.referenceSourceAssetId).filter((id): id is string => Boolean(id));
+  const artifactIds = rows.map((row) => row.profile.referenceArtifactId).filter((id): id is string => Boolean(id));
+  const sources = sourceIds.length
+    ? await db.select().from(sourceMediaAssets).where(inArray(sourceMediaAssets.id, sourceIds))
+    : [];
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  const artifacts = artifactIds.length
+    ? await db.select({
+        artifact: generationArtifacts,
+        projectUserId: projects.userId,
+        jobProjectId: generationJobs.projectId,
+      }).from(generationArtifacts)
+        .innerJoin(generationAttempts, eq(generationAttempts.id, generationArtifacts.attemptId))
+        .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+        .innerJoin(projects, eq(projects.id, generationJobs.projectId))
+        .where(inArray(generationArtifacts.id, artifactIds))
+    : [];
+  const artifactById = new Map(artifacts.map((row) => [row.artifact.id, row]));
+
+  return rows.flatMap(({ profile }) => {
+    let durationMs: number | null = null;
+    let referenceUrl = "";
+    if (profile.referenceSourceAssetId) {
+      const source = sourceById.get(profile.referenceSourceAssetId);
+      if (!source
+        || source.projectId !== profile.projectId
+        || source.userId !== profile.userId
+        || source.kind !== "audio"
+        || source.status !== "COMMITTED"
+        || !source.mimeType.startsWith("audio/")
+        || source.sizeBytes <= 0
+        || source.sizeBytes > 50 * 1024 * 1024
+        || source.durationMs === null
+        || source.durationMs < 3_000
+        || source.durationMs > 60_000) return [];
+      durationMs = source.durationMs;
+      referenceUrl = `/api/source-assets/${encodeURIComponent(source.id)}`;
+    } else if (profile.referenceArtifactId) {
+      const row = artifactById.get(profile.referenceArtifactId);
+      if (!row
+        || row.projectUserId !== profile.userId
+        || row.jobProjectId !== profile.projectId
+        || row.artifact.status !== "COMMITTED"
+        || row.artifact.kind !== "audio"
+        || !["private-original", "project"].includes(row.artifact.visibility)
+        || row.artifact.sizeBytes <= 0
+        || row.artifact.sizeBytes > 50 * 1024 * 1024
+        || row.artifact.durationMs === null
+        || row.artifact.durationMs < 3_000
+        || row.artifact.durationMs > 60_000) return [];
+      durationMs = row.artifact.durationMs;
+      referenceUrl = `/api/generation/artifacts/${encodeURIComponent(row.artifact.id)}`;
+    } else {
+      return [];
+    }
+    return [{
+      id: profile.id,
+      projectId: profile.projectId,
+      userId: profile.userId,
+      name: profile.name,
+      provider: profile.provider as VoiceProvider,
+      referenceSourceAssetId: profile.referenceSourceAssetId,
+      referenceArtifactId: profile.referenceArtifactId,
+      referenceUrl,
+      referenceText: profile.referenceText,
+      language: profile.language,
+      defaultSpeed: profile.defaultSpeed / 1000,
+      defaultPitch: profile.defaultPitch / 1000,
+      durationMs,
+      createdAtMs: profile.createdAtMs,
+    }];
+  });
 }
 
-/**
- * 删除音色档案
- */
-export async function deleteVoiceProfile(profileId: string): Promise<void> {
-  const profile = await getVoiceProfile(profileId);
-  if (!profile) {
-    throw new Error(`音色档案不存在: ${profileId}`);
+export async function deleteVoiceProfile(profileId: string, userId: string): Promise<void> {
+  const profile = await getVoiceProfile(profileId, userId);
+  if (!profile) throw new VoiceProfileError("Voice profile not found", 404, "profile_not_found");
+  await db.delete(voiceProfiles).where(and(eq(voiceProfiles.id, profileId), eq(voiceProfiles.userId, userId)));
+  if (profile.referenceSourceAssetId) {
+    await deleteOwnedSourceAsset(profile.referenceSourceAssetId, userId, {
+      requireUnreferenced: true,
+      retainIfInUse: true,
+    });
   }
-
-  // 删除文件
-  try {
-    await fs.unlink(profile.storagePath);
-  } catch (err) {
-    console.warn(`删除音色文件失败: ${profile.storagePath}`, err);
-  }
-
-  // 删除数据库记录
-  await db.delete(voiceProfiles).where(eq(voiceProfiles.id, profileId));
-}
-
-/**
- * 验证音色档案配置
- */
-export function validateVoiceConfig(
-  config: Partial<VoiceProfileConfig>
-): { valid: boolean; errors: string[] } {
-  const cfg = { ...DEFAULT_VOICE_CONFIG, ...config };
-  const errors: string[] = [];
-
-  if (cfg.maxFileSizeBytes <= 0) {
-    errors.push("maxFileSizeBytes 必须大于 0");
-  }
-
-  if (cfg.minDurationSeconds < 0) {
-    errors.push("minDurationSeconds 必须 >= 0");
-  }
-
-  if (cfg.maxDurationSeconds <= cfg.minDurationSeconds) {
-    errors.push("maxDurationSeconds 必须大于 minDurationSeconds");
-  }
-
-  if (cfg.allowedMimeTypes.length === 0) {
-    errors.push("allowedMimeTypes 不能为空");
-  }
-
-  if (cfg.allowedSampleRates.length === 0) {
-    errors.push("allowedSampleRates 不能为空");
-  }
-
-  return {
-    valid: errors.length === 0,
-    errors,
-  };
 }

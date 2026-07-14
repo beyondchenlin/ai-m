@@ -1,9 +1,9 @@
 "use client";
 
 import { Label } from "@/components/ui/label";
-import { useModelStore, type ModelRef } from "@/stores/model-store";
+import { useModelStore, type Capability, type ModelRef } from "@/stores/model-store";
 import { useTranslations } from "next-intl";
-import { Type, ImageIcon, VideoIcon } from "lucide-react";
+import { Type, ImageIcon, VideoIcon, AudioLines } from "lucide-react";
 
 interface PickerRowProps {
   label: string;
@@ -19,21 +19,12 @@ interface PickerRowProps {
   onChange: (ref: ModelRef | null) => void;
 }
 
-function PickerRow({
-  label,
-  icon,
-  color,
-  options,
-  value,
-  onChange,
-}: PickerRowProps) {
+function PickerRow({ label, icon, color, options, value, onChange }: PickerRowProps) {
   const currentValue = value ? `${value.providerId}:${value.modelId}` : "";
 
   return (
     <div className="flex items-center gap-3 rounded-xl border border-[--border-subtle] bg-[--surface]/50 px-3 py-2.5">
-      <div
-        className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${color}`}
-      >
+      <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${color}`}>
         {icon}
       </div>
       <div className="min-w-0 flex-1">
@@ -42,24 +33,20 @@ function PickerRow({
         </Label>
         <select
           value={currentValue}
-          onChange={(e) => {
-            if (!e.target.value) {
+          onChange={(event) => {
+            if (!event.target.value) {
               onChange(null);
               return;
             }
-            const [providerId, ...rest] = e.target.value.split(":");
-            const modelId = rest.join(":");
-            onChange({ providerId, modelId });
+            const [providerId, ...rest] = event.target.value.split(":");
+            onChange({ providerId, modelId: rest.join(":") });
           }}
           className="mt-0.5 block w-full rounded-lg border-0 bg-transparent py-0 text-sm font-medium text-[--text-primary] outline-none"
         >
           <option value="">--</option>
-          {options.map((opt) => (
-            <option
-              key={`${opt.providerId}:${opt.modelId}`}
-              value={`${opt.providerId}:${opt.modelId}`}
-            >
-              {opt.providerName} / {opt.modelName}
+          {options.map((option) => (
+            <option key={`${option.providerId}:${option.modelId}`} value={`${option.providerId}:${option.modelId}`}>
+              {option.providerName} / {option.modelName}
             </option>
           ))}
         </select>
@@ -75,35 +62,28 @@ export function DefaultModelPicker() {
     defaultTextModel,
     defaultImageModel,
     defaultVideoModel,
+    defaultSpeechModel,
     setDefaultTextModel,
     setDefaultImageModel,
     setDefaultVideoModel,
+    setDefaultSpeechModel,
   } = useModelStore();
 
-  function getOptions(capability: string) {
-    const result: {
-      providerId: string;
-      providerName: string;
-      modelId: string;
-      modelName: string;
-    }[] = [];
-    for (const p of providers) {
-      if (p.capability !== capability) continue;
-      for (const m of p.models) {
-        if (!m.checked) continue;
-        result.push({
-          providerId: p.id,
-          providerName: p.name,
-          modelId: m.id,
-          modelName: m.name,
-        });
-      }
-    }
-    return result;
+  function getOptions(capability: Capability) {
+    return providers
+      .filter((provider) => provider.capability === capability)
+      .flatMap((provider) => provider.models
+        .filter((model) => model.checked)
+        .map((model) => ({
+          providerId: provider.id,
+          providerName: provider.name,
+          modelId: model.id,
+          modelName: model.name,
+        })));
   }
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
       <PickerRow
         label={t("defaultTextModel")}
         icon={<Type className="h-4 w-4" />}
@@ -127,6 +107,14 @@ export function DefaultModelPicker() {
         options={getOptions("video")}
         value={defaultVideoModel}
         onChange={setDefaultVideoModel}
+      />
+      <PickerRow
+        label={t("defaultSpeechModel")}
+        icon={<AudioLines className="h-4 w-4" />}
+        color="bg-amber-500/10 text-amber-700"
+        options={getOptions("speech")}
+        value={defaultSpeechModel}
+        onChange={setDefaultSpeechModel}
       />
     </div>
   );

@@ -23,7 +23,7 @@ export async function handleScriptParse(task: Task) {
     projectId: payload.projectId,
   });
 
-  const ai = resolveAIProvider(payload.modelConfig);
+  const ai = await resolveAIProvider(payload.modelConfig);
   const result = await ai.generateText(buildScriptParsePrompt(project.script), {
     systemPrompt,
     temperature: 0.7,

@@ -22,7 +22,7 @@ export async function handleScriptOutline(task: Task) {
     projectId,
   });
 
-  const ai = resolveAIProvider(payload.modelConfig);
+  const ai = await resolveAIProvider(payload.modelConfig);
   const result = await ai.generateText(`创意构想：${idea}`, {
     systemPrompt,
     temperature: 0.7,

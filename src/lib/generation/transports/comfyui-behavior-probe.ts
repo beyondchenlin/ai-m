@@ -6,7 +6,7 @@
  */
 
 import type { ComfyUITransport, ComfySystemInfo, ComfyObjectInfo } from "./comfyui";
-import { probeSystemInfo, probeObjectInfo, probeQueueStatus, probeHistory } from "./comfyui";
+import { probeSystemInfo, probeObjectInfo, probeQueueStatus } from "./comfyui";
 import { createHash } from "crypto";
 
 /** 外部任务 ID 策略 */
@@ -91,81 +91,32 @@ function computeEnvironmentFingerprint(
   return `env:${hash.digest("hex").slice(0, 32)}`;
 }
 
-/** 探测外部任务 ID 策略 */
-async function probeExternalIdStrategy(
-  transport: ComfyUITransport,
-): Promise<ExternalIdStrategy> {
-  try {
-    const testClientId = `probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-
-    try {
-      const response = await transport.post("/prompt", {
-        prompt: {
-          "probe_node": {
-            inputs: {
-              text: "probe",
-              seed: 0,
-            },
-            class_type: "CheckpointLoaderSimple",
-          },
-        },
-        client_id: testClientId,
-      });
-      clearTimeout(timeout);
-
-      if (response.ok) {
-        const data = (await response.json()) as { prompt_id?: string; number?: number };
-        if (data.prompt_id) {
-          try {
-            await transport.post(`/queue`, {});
-            return "server-assigned";
-          } catch {
-            return "server-assigned";
-          }
-        }
-      }
-      return "server-assigned";
-    } finally {
-      clearTimeout(timeout);
-    }
-  } catch {
-    return "server-assigned";
-  }
+/**
+ * Determine protocol behaviour without submitting or interrupting user work.
+ * Health probes must be observational: a configuration screen must never enqueue
+ * an inference job or interrupt another tenant's execution.
+ */
+async function probeExternalIdStrategy(): Promise<ExternalIdStrategy> {
+  return "server-assigned";
 }
 
-/** 探测取消能力 */
+/** Passive cancellation capability detection. */
 async function probeCancellationCapabilities(
   transport: ComfyUITransport,
 ): Promise<CancellationCapabilities> {
-  const result: CancellationCapabilities = {
-    supportsPerTaskCancel: false,
-    hasGlobalInterrupt: false,
-    safeForShared: false,
-  };
-
   try {
-    const intResponse = await transport.post("/interrupt", {});
-    result.hasGlobalInterrupt = intResponse.ok || intResponse.status === 400;
+    const queue = await probeQueueStatus(transport);
+    const standardQueueShape = Array.isArray(queue.queueRunning) && Array.isArray(queue.queuePending);
+    return {
+      // Standard ComfyUI accepts POST /queue { delete: [promptId] }. The actual
+      // cancellation result is still reconciled before a local terminal state.
+      supportsPerTaskCancel: standardQueueShape,
+      hasGlobalInterrupt: true,
+      safeForShared: standardQueueShape,
+    };
   } catch {
-    result.hasGlobalInterrupt = false;
+    return { supportsPerTaskCancel: false, hasGlobalInterrupt: false, safeForShared: false };
   }
-
-  try {
-    const queueResponse = await transport.post("/queue", {});
-    if (queueResponse.ok) {
-      const data = (await queueResponse.json()) as { queue_running?: unknown[]; queue_pending?: unknown[] };
-      result.supportsPerTaskCancel = Array.isArray(data.queue_running) || Array.isArray(data.queue_pending);
-    }
-  } catch {
-    result.supportsPerTaskCancel = false;
-  }
-
-  result.safeForShared = result.supportsPerTaskCancel;
-
-  return result;
 }
 
 /** 探测输出能力 */
@@ -207,7 +158,7 @@ export async function probeBackendFeatures(
   ]);
 
   const environmentFingerprint = computeEnvironmentFingerprint(systemInfo, objectInfo);
-  const externalIdStrategy = await probeExternalIdStrategy(transport);
+  const externalIdStrategy = await probeExternalIdStrategy();
 
   const nodeCategories = new Set<string>();
   for (const info of Object.values(objectInfo)) {

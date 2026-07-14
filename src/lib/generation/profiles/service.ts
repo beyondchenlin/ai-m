@@ -11,10 +11,16 @@ import {
   generationProfileStates,
   defaultGenerationProfilePointers,
   executionBackends,
+  workflowBackendValidations,
+  workflowPackageRevisions,
+  workflowPackageStates,
 } from "@/lib/db/schema";
-import { eq, and, desc } from "drizzle-orm";
-import type { Capability } from "../naming";
+import { eq, and, desc, inArray } from "drizzle-orm";
 import { isEnabled, FF } from "@/lib/feature-flags";
+
+type ProfileCapability = typeof generationProfileRevisions.$inferSelect.capability;
+type DefaultProfileCapability = typeof defaultGenerationProfilePointers.$inferSelect.capability;
+type ProfileScope = typeof defaultGenerationProfilePointers.$inferSelect.scopeType;
 
 /** 生成配置摘要（用户可见） */
 export interface GenerationProfileSummary {
@@ -40,7 +46,7 @@ export interface GenerationProfileDetail extends GenerationProfileSummary {
 
 /** 获取所有已启用的生成配置 */
 export async function getEnabledProfiles(
-  capability?: Capability,
+  capability?: ProfileCapability,
 ): Promise<GenerationProfileSummary[]> {
   if (!isEnabled(FF.V2_GENERATION_PROFILES)) {
     return [];
@@ -54,6 +60,8 @@ export async function getEnabledProfiles(
       displayName: generationProfileRevisions.displayName,
       capability: generationProfileRevisions.capability,
       adapterKind: generationProfileRevisions.adapterKind,
+      executionBackendId: generationProfileRevisions.executionBackendId,
+      workflowPackageDigest: generationProfileRevisions.workflowPackageDigest,
       enabled: generationProfileStates.enabled,
       visibility: generationProfileStates.visibility,
       createdAtMs: generationProfileRevisions.createdAtMs,
@@ -73,10 +81,73 @@ export async function getEnabledProfiles(
     )
     .orderBy(desc(generationProfileRevisions.createdAtMs));
 
-  return rows.map((r) => ({
-    ...r,
-    enabled: r.enabled === 1,
+  const comfyRows = rows.filter((row) => row.adapterKind === "comfyui");
+  if (!comfyRows.length) {
+    return rows.map(({ executionBackendId: _backend, workflowPackageDigest: _workflow, ...row }) => ({
+      ...row, enabled: row.enabled === 1,
+    }));
+  }
+
+  const backendIds = [...new Set(comfyRows.map((row) => row.executionBackendId).filter((id): id is string => Boolean(id)))];
+  const workflowDigests = [...new Set(comfyRows.map((row) => row.workflowPackageDigest).filter((id): id is string => Boolean(id)))];
+  type BackendState = { id: string; enabled: number; fingerprint: string | null };
+  type WorkflowState = { digest: string; lockDigest: string | null; state: string };
+  type BackendValidation = typeof workflowBackendValidations.$inferSelect;
+  const backends: BackendState[] = backendIds.length
+    ? await db.select({
+        id: executionBackends.id,
+        enabled: executionBackends.enabled,
+        fingerprint: executionBackends.environmentFingerprint,
+      }).from(executionBackends).where(inArray(executionBackends.id, backendIds))
+    : [];
+  const workflows: WorkflowState[] = workflowDigests.length
+    ? await db.select({
+        digest: workflowPackageRevisions.digest,
+        lockDigest: workflowPackageRevisions.environmentLockDigest,
+        state: workflowPackageStates.state,
+      }).from(workflowPackageRevisions)
+        .innerJoin(
+          workflowPackageStates,
+          eq(workflowPackageStates.workflowPackageDigest, workflowPackageRevisions.digest),
+        )
+        .where(inArray(workflowPackageRevisions.digest, workflowDigests))
+    : [];
+  const validations: BackendValidation[] = workflowDigests.length
+    ? await db.select().from(workflowBackendValidations)
+        .where(inArray(workflowBackendValidations.workflowPackageDigest, workflowDigests))
+    : [];
+  const backendById = new Map(backends.map((backend) => [backend.id, backend]));
+  const workflowByDigest = new Map(workflows.map((workflow) => [workflow.digest, workflow]));
+  const validationByPair = new Map(validations.map((validation) => [
+    `${validation.executionBackendId}:${validation.workflowPackageDigest}`, validation,
+  ]));
+
+  return rows.filter((row) => {
+    if (row.adapterKind !== "comfyui") return true;
+    if (!row.executionBackendId || !row.workflowPackageDigest) return false;
+    const backend = backendById.get(row.executionBackendId);
+    const workflow = workflowByDigest.get(row.workflowPackageDigest);
+    const validation = validationByPair.get(`${row.executionBackendId}:${row.workflowPackageDigest}`);
+    return Boolean(
+      backend?.enabled
+      && backend.fingerprint
+      && workflow?.state === "active"
+      && validation
+      && validation.environmentFingerprint === backend.fingerprint
+      && validation.environmentLockDigest === workflow.lockDigest,
+    );
+  }).map(({ executionBackendId: _backend, workflowPackageDigest: _workflow, ...row }) => ({
+    ...row, enabled: row.enabled === 1,
   }));
+}
+
+
+/** Return only workspace-scoped profiles that may be exposed in ordinary model selectors. */
+export async function getSelectableProfiles(
+  capability?: ProfileCapability,
+): Promise<GenerationProfileSummary[]> {
+  const profiles = await getEnabledProfiles(capability);
+  return profiles.filter((profile) => profile.visibility === "workspace");
 }
 
 /** 获取单个生成配置详情 */
@@ -113,11 +184,18 @@ export async function getProfileDetail(
   };
 }
 
+export async function resolveRunnableProfile(profileRevisionId: string): Promise<GenerationProfileDetail | null> {
+  const profile = await getProfileDetail(profileRevisionId);
+  if (!profile?.enabled) return null;
+  const runnable = await getEnabledProfiles(profile.capability as ProfileCapability);
+  return runnable.some((candidate) => candidate.id === profileRevisionId) ? profile : null;
+}
+
 /** 获取默认生成配置 */
 export async function getDefaultProfile(
-  scopeType: string,
+  scopeType: ProfileScope,
   scopeId: string,
-  capability: Capability,
+  capability: DefaultProfileCapability,
 ): Promise<GenerationProfileDetail | null> {
   const [pointer] = await db
     .select()
@@ -144,24 +222,24 @@ export async function getDefaultProfile(
       );
 
     if (!globalPointer) return null;
-    return getProfileDetail(globalPointer.generationProfileRevisionId);
+    return resolveRunnableProfile(globalPointer.generationProfileRevisionId);
   }
 
-  return getProfileDetail(pointer.generationProfileRevisionId);
+  return resolveRunnableProfile(pointer.generationProfileRevisionId);
 }
 
 /** 获取与生成配置关联的后端地址 */
 export async function resolveBackendForProfile(
   profileRevisionId: string,
 ): Promise<{ baseUrl: string; adapterKind: string } | null> {
-  const profile = await getProfileDetail(profileRevisionId);
+  const profile = await resolveRunnableProfile(profileRevisionId);
   if (!profile?.executionBackendId) return null;
 
   const [backend] = await db
-    .select({ baseUrl: executionBackends.baseUrl, adapterKind: executionBackends.adapterKind })
+    .select({ baseUrl: executionBackends.baseUrl, adapterKind: executionBackends.adapterKind, enabled: executionBackends.enabled })
     .from(executionBackends)
     .where(eq(executionBackends.id, profile.executionBackendId));
 
-  if (!backend) return null;
+  if (!backend || !backend.enabled) return null;
   return { baseUrl: backend.baseUrl, adapterKind: backend.adapterKind };
 }

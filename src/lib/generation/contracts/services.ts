@@ -5,18 +5,24 @@
  */
 
 import type { Capability } from "../naming";
-import type { ImageRequest, TextRequest, VideoRequest } from "./providers";
+import type { ImageRequest, TextRequest, VideoRequest, SpeechRequest } from "./providers";
 
 /** 生成任务创建输入 */
 export interface CreateGenerationJobInput {
   capability: Capability;
   profileRevisionId: string;
   projectId: string;
-  request: ImageRequest | TextRequest | VideoRequest;
+  request: ImageRequest | TextRequest | VideoRequest | SpeechRequest;
+  /** Caller-generated operation key. Reusing it returns the existing job. */
+  idempotencyKey?: string;
   businessContext?: {
     kind: string;
     id: string;
   };
+  /** Immutable safe metadata required by the worker before external submission. */
+  metadata?: Record<string, unknown>;
+  /** Immutable user-owned source inputs captured as durable job references. */
+  sourceAssets?: Array<{ id: string; role: string }>;
 }
 
 /** 生成任务视图（安全字段，不返回密钥和内部地址） */
@@ -38,15 +44,17 @@ export interface GenerationJobView {
 export interface ArtifactRef {
   id: string;
   kind: string;
-  storageKey: string;
+  /** Same-origin authorized download URL. Internal storage keys are never exposed. */
+  url: string;
   mimeType: string;
   width?: number;
   height?: number;
+  durationMs?: number;
   sizeBytes: number;
 }
 
 /** 重试模式 */
-export type RetryMode = "retry_collection" | "retry_submission" | "retry_full";
+export type RetryMode = "retry_full";
 
 /** 生成任务服务 */
 export interface GenerationJobService {

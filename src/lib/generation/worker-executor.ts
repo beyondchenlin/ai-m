@@ -1,52 +1,33 @@
-/**
- * v2.0 Worker 任务执行器
- *
- * 手册 §12、§14：Worker 领取任务后，执行器负责完整的生命周期：
- * - 创建执行尝试
- * - 选择并探测执行后端
- * - 分配资源槽位
- * - 提交工作流并跟踪
- * - 收集输出并原子提交工件
- * - 处理取消、失败和对账
- */
-
+/** Durable ComfyUI execution worker with fenced writes and immutable workflows. */
+import { and, desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
-  generationAttempts,
-  generationJobs,
-  generationArtifacts,
-  generationEvents,
   executionBackends,
-  resourcePoolSlots,
+  generationArtifacts,
+  generationAttempts,
+  generationEvents,
+  generationJobs,
+  workflowBackendValidations,
 } from "@/lib/db/schema";
-import { eq, and, desc } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
-import type {
-  ComfyUITransport,
-  BackendFeatureSnapshot,
-  OrchestratorPhase,
-  ExecutionCallbacks,
-} from "@/lib/generation";
 import {
-  createComfyUITransport,
-  probeBackendFeatures,
   ComfyUIExecutionOrchestrator,
   acquireResourceSlot,
-  renewResourceSlot,
+  createComfyUITransport,
+  probeBackendFeatures,
+  probeModelFolder,
   releaseResourceSlot,
-  commitArtifactFromBuffer,
+  renewResourceSlot,
+  streamCommitArtifact,
+  materializeWorkflowInputs,
 } from "@/lib/generation";
-import {
-  buildZImageWorkflow,
-  createZImageAdapter,
-} from "@/lib/generation/adapters/zimage";
-import {
-  buildSpeechWorkflow,
-  createLocalSpeechAdapter,
-} from "@/lib/generation/adapters/local-speech";
+import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
+import { bindWorkflow, loadActiveWorkflowPackage } from "@/lib/generation/workflows";
+import { resolveBackendAuthHeaders } from "@/lib/security";
+import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
+import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
 
-/** 执行结果 */
 export interface JobExecutionResult {
   success: boolean;
   finalPhase: string;
@@ -55,446 +36,427 @@ export interface JobExecutionResult {
   needsAttention: boolean;
 }
 
-/**
- * 执行单个生成任务
- *
- * 这是 Worker processJob 的核心实现，处理完整的生命周期。
- */
+function mimeForOutput(
+  filename: string,
+  expectedKind: "image" | "video" | "audio",
+): { mimeType: string; kind: "image" | "video" | "audio" } {
+  const lower = filename.toLowerCase();
+  const detected = lower.endsWith(".png") ? { mimeType: "image/png", kind: "image" as const }
+    : lower.endsWith(".jpg") || lower.endsWith(".jpeg") ? { mimeType: "image/jpeg", kind: "image" as const }
+    : lower.endsWith(".webp") ? { mimeType: "image/webp", kind: "image" as const }
+    : lower.endsWith(".gif") ? { mimeType: "image/gif", kind: "image" as const }
+    : lower.endsWith(".wav") ? { mimeType: "audio/wav", kind: "audio" as const }
+    : lower.endsWith(".mp3") ? { mimeType: "audio/mpeg", kind: "audio" as const }
+    : lower.endsWith(".mp4") ? { mimeType: "video/mp4", kind: "video" as const }
+    : null;
+  if (!detected) throw new Error(`Unsupported output filename: ${filename}`);
+  if (detected.kind !== expectedKind) {
+    throw new Error(`Output media contract mismatch: expected ${expectedKind}, received ${detected.kind}`);
+  }
+  return detected;
+}
+
+async function updateAttemptFenced(
+  attemptId: string,
+  jobFencingToken: number,
+  values: Partial<typeof generationAttempts.$inferInsert>,
+): Promise<boolean> {
+  const rows = await db.update(generationAttempts).set({ ...values, updatedAtMs: Date.now() }).where(and(
+    eq(generationAttempts.id, attemptId),
+    eq(generationAttempts.jobClaimFencingToken, jobFencingToken),
+  )).returning({ id: generationAttempts.id });
+  return Boolean(rows[0]);
+}
+
+async function updateJobFenced(
+  jobId: string,
+  workerId: string,
+  jobFencingToken: number,
+  values: Partial<typeof generationJobs.$inferInsert>,
+): Promise<boolean> {
+  const rows = await db.update(generationJobs).set({ ...values, updatedAtMs: Date.now() }).where(and(
+    eq(generationJobs.id, jobId),
+    eq(generationJobs.claimOwner, workerId),
+    eq(generationJobs.claimFencingToken, jobFencingToken),
+  )).returning({ id: generationJobs.id });
+  return Boolean(rows[0]);
+}
+
 export async function executeGenerationJob(
   job: typeof generationJobs.$inferSelect,
   workerId: string,
   jobFencingToken: number,
+  abortSignal?: AbortSignal,
 ): Promise<JobExecutionResult> {
+  if (job.cancelRequestedAtMs) {
+    await cancelQueuedJob(job.id, workerId, jobFencingToken);
+    return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+  }
   if (!isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
-    return {
-      success: false,
-      finalPhase: "FAILED",
-      errorMessage: "ComfyUI transport not enabled",
-      needsAttention: false,
-    };
+    return failJob(job.id, "", workerId, jobFencingToken, "ComfyUI transport is not enabled", "config_error");
   }
 
   const attemptId = genId();
+  let attemptPersisted = false;
+  let resourceSlot: { slotNo: number; leaseToken: string; fencingToken: number } | null = null;
+  let resourceTimer: ReturnType<typeof setInterval> | null = null;
+  let retainResource = false;
+  let orchestrator: ComfyUIExecutionOrchestrator | null = null;
   let transport: ComfyUITransport | null = null;
-  let features: BackendFeatureSnapshot | null = null;
-  let resourceSlot: {
-    slotNo: number;
-    leaseToken: string;
-    fencingToken: number;
-  } | null = null;
-  let resourceLeaseTimer: ReturnType<typeof setInterval> | null = null;
+  let resourceRenewalInFlight = false;
+  let inputCleanup: (() => Promise<void>) | null = null;
+  const committedArtifacts: CollectedArtifactCandidate[] = [];
+  let outputSequence = 0;
 
   try {
+    if (abortSignal?.aborted) throw new Error("execution_aborted_before_start");
     const snapshot = job.executionSnapshotJson as Record<string, unknown>;
-    const backendId = snapshot.executionBackendId as string;
-    const adapterKind = snapshot.adapterKind as string;
-    const configJson = snapshot.configJson as Record<string, unknown>;
-    const request = snapshot.request as Record<string, unknown>;
-    const resourcePoolId = snapshot.resourcePoolId as string | undefined;
+    const backendId = typeof snapshot.executionBackendId === "string" ? snapshot.executionBackendId : "";
+    const workflowDigest = typeof snapshot.workflowPackageDigest === "string" ? snapshot.workflowPackageDigest : "";
+    const request = snapshot.request && typeof snapshot.request === "object" ? snapshot.request as Record<string, unknown> : {};
+    const config = snapshot.configJson && typeof snapshot.configJson === "object" ? snapshot.configJson as Record<string, unknown> : {};
+    if (!backendId || !workflowDigest) return failJob(job.id, "", workerId, jobFencingToken, "Backend and active workflow package are required", "config_error");
 
-    if (!backendId) {
-      return failJob(job.id, attemptId, "No backend specified", "config_error", jobFencingToken);
+    const [backend] = await db.select().from(executionBackends).where(eq(executionBackends.id, backendId));
+    if (!backend || !backend.enabled) return failJob(job.id, "", workerId, jobFencingToken, "Execution backend is missing or disabled", "config_error");
+    const workflowPackage = await loadActiveWorkflowPackage(workflowDigest);
+    if (workflowPackage.manifest.capability !== job.capability) return failJob(job.id, "", workerId, jobFencingToken, "Workflow capability does not match job", "config_error");
+    const [backendValidation] = await db.select().from(workflowBackendValidations).where(and(
+      eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
+      eq(workflowBackendValidations.executionBackendId, backendId),
+    ));
+    if (!backendValidation
+      || backendValidation.environmentFingerprint !== backend.environmentFingerprint
+      || backendValidation.environmentLockDigest !== workflowPackage.revision.environmentLockDigest) {
+      return failJob(
+        job.id, "", workerId, jobFencingToken,
+        "Workflow package is not validated for the exact backend environment",
+        "workflow_backend_validation_missing", true,
+      );
     }
 
-    const [backend] = await db
-      .select()
-      .from(executionBackends)
-      .where(eq(executionBackends.id, backendId));
-
-    if (!backend) {
-      return failJob(job.id, attemptId, "Backend not found", "config_error", jobFencingToken);
-    }
-
+    const authHeaders = await resolveBackendAuthHeaders(backend.authType, backend.authConfigJson);
     transport = await createComfyUITransport(
-      backend.baseUrl,
-      backend.topology,
+      backend.baseUrl, backend.topology, authHeaders,
+      Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
+        ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
+        : [],
     );
-
-    features = await probeBackendFeatures(transport);
+    const activeTransport = transport;
+    const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
+    if (backend.environmentFingerprint && backend.environmentFingerprint !== features.environmentFingerprint) {
+      return failJob(job.id, "", workerId, jobFencingToken, "Backend environment fingerprint drifted after workflow activation", "environment_drift", true);
+    }
+    const modelFolders = new Map<string, string[]>();
+    for (const model of workflowPackage.manifest.requirements.models) {
+      if (!modelFolders.has(model.folder)) {
+        modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
+      }
+      if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
+        return failJob(
+          job.id, "", workerId, jobFencingToken,
+          `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
+          "environment_model_drift", true,
+        );
+      }
+    }
 
     const attemptNo = await getNextAttemptNo(job.id);
-
-    // 先持久化 attempt 记录，再领取资源槽位。
-    // resource_pool_slots.owner_attempt_id 外键要求 attempt 必须先存在。
+    const correlationId = `corr-${attemptId}`;
+    const outputPrefix = `ai-m/${job.id}/${attemptNo}`;
     await db.insert(generationAttempts).values({
       id: attemptId,
       jobId: job.id,
       attemptNo,
+      jobClaimFencingToken: jobFencingToken,
       phase: "PREPARING",
       backendId: backend.id,
       backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
       environmentFingerprint: features.environmentFingerprint,
-      submissionCorrelationId: `corr-${attemptId}`,
+      submissionCorrelationId: correlationId,
       externalIdStrategy: features.externalIdStrategy,
-      systemOutputPrefix: `job-${job.id}-${attemptNo}`,
-      resourcePoolId: resourcePoolId ?? "default",
+      systemOutputPrefix: outputPrefix,
+      resourcePoolId: backend.resourcePoolId,
       resourceSlotNo: 0,
       resourceLeaseToken: `pending-${attemptId}`,
       resourceFencingToken: 0,
       createdAtMs: Date.now(),
       updatedAtMs: Date.now(),
     });
+    attemptPersisted = true;
 
-    if (resourcePoolId) {
-      const slot = await acquireResourceSlot(resourcePoolId, attemptId, workerId);
-      if (!slot) {
-        await db
-          .update(generationAttempts)
-          .set({ phase: "FAILED", errorClass: "resource_exhausted", errorMessageSafe: "No resource slot available", finishedAtMs: Date.now(), updatedAtMs: Date.now() })
-          .where(eq(generationAttempts.id, attemptId));
-        return failJob(
-          job.id,
-          attemptId,
-          "No resource slot available",
-          "resource_exhausted",
-          jobFencingToken,
-        );
-      }
-      resourceSlot = slot;
+    const claimed = await updateJobFenced(job.id, workerId, jobFencingToken, { currentAttemptId: attemptId });
+    if (!claimed) throw new Error("job_claim_lost_before_resource_acquisition");
 
-      await db
-        .update(generationAttempts)
-        .set({
-          phase: "SUBMITTING",
-          resourceSlotNo: slot.slotNo,
-          resourceLeaseToken: slot.leaseToken,
-          resourceFencingToken: slot.fencingToken,
-          updatedAtMs: Date.now(),
-        })
-        .where(eq(generationAttempts.id, attemptId));
+    resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
+    if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
+    await updateAttemptFenced(attemptId, jobFencingToken, {
+      phase: "SUBMITTING",
+      resourceSlotNo: resourceSlot.slotNo,
+      resourceLeaseToken: resourceSlot.leaseToken,
+      resourceFencingToken: resourceSlot.fencingToken,
+    });
 
-      resourceLeaseTimer = setInterval(async () => {
-        if (resourceSlot) {
-          const ok = await renewResourceSlot(
-            resourcePoolId,
-            resourceSlot.slotNo,
-            resourceSlot.leaseToken,
-            resourceSlot.fencingToken,
-          );
-          if (!ok) {
-            console.error(`[${workerId}] Resource lease renewal failed for slot ${resourceSlot.slotNo}`);
-          }
+    resourceTimer = setInterval(async () => {
+      if (!resourceSlot || resourceRenewalInFlight) return;
+      resourceRenewalInFlight = true;
+      try {
+        const renewed = await renewResourceSlot(
+          backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken,
+        ).catch(() => false);
+        if (!renewed) {
+          retainResource = true;
+          orchestrator?.stop();
         }
-      }, 30_000);
-    } else {
-      await db
-        .update(generationAttempts)
-        .set({ phase: "SUBMITTING", updatedAtMs: Date.now() })
-        .where(eq(generationAttempts.id, attemptId));
-    }
-
-    await db
-      .update(generationJobs)
-      .set({
-        currentAttemptId: attemptId,
-        updatedAtMs: Date.now(),
-      })
-      .where(
-        and(
-          eq(generationJobs.id, job.id),
-          eq(generationJobs.claimFencingToken, jobFencingToken),
-        ),
-      );
-
-    let workflow: Record<string, unknown>;
-    switch (adapterKind) {
-      case "zimage": {
-        const adapter = await createZImageAdapter();
-        workflow = await buildZImageWorkflow(adapter, {
-          prompt: (request.prompt as string) ?? "",
-          negativePrompt: (request.negativePrompt as string) ?? "",
-          width: (request.width as number) ?? 1024,
-          height: (request.height as number) ?? 1024,
-          seed: (request.seed as string) ?? undefined,
-          quality: (request.quality as string) ?? "standard",
-        });
-        break;
+      } finally {
+        resourceRenewalInFlight = false;
       }
-      case "local-speech": {
-        const adapter = await createLocalSpeechAdapter();
-        workflow = await buildSpeechWorkflow(adapter, {
-          text: (request.text as string) ?? "",
-          voiceProfileId: (request.voiceProfileId as string) ?? "",
-          speed: (request.speed as number) ?? 1.0,
-        });
-        break;
-      }
-      default:
-        return failJob(
-          job.id,
-          attemptId,
-          `Unsupported adapter: ${adapterKind}`,
-          "config_error",
-          jobFencingToken,
-        );
-    }
+    }, 30_000);
+
+    const defaults = config.defaultParameters && typeof config.defaultParameters === "object"
+      ? config.defaultParameters as Record<string, unknown>
+      : {};
+    const materialized = await materializeWorkflowInputs({
+      job,
+      attemptId,
+      compiled: workflowPackage.compiled,
+      transport: activeTransport,
+      request: { ...defaults, ...request },
+      metadata: job.metadataJson as Record<string, unknown>,
+      maxReferenceInputs: workflowPackage.manifest.limits.maxBatch,
+    });
+    inputCleanup = materialized.cleanup;
+    const workflow = bindWorkflow(
+      workflowPackage.workflow,
+      workflowPackage.compiled,
+      materialized.parameters,
+      outputPrefix,
+    );
 
     const callbacks: ExecutionCallbacks = {
-      onPhaseChange: (phase: OrchestratorPhase) => {
-        updateAttemptPhase(attemptId, phase);
+      onPhaseChange: async (phase: OrchestratorPhase) => {
+        const mapped = phase === "CREATED" ? "PREPARING" : phase;
+        await updateAttemptFenced(attemptId, jobFencingToken, { phase: mapped });
       },
-      onProgress: (data) => {
-        db.update(generationAttempts)
-          .set({
-            progressSnapshotJson: data as unknown as Record<string, unknown>,
-            updatedAtMs: Date.now(),
-          })
-          .where(eq(generationAttempts.id, attemptId))
-          .catch(() => {});
+      onExternalJobId: async (externalJobId) => {
+        retainResource = true;
+        await updateAttemptFenced(attemptId, jobFencingToken, {
+          externalJobId,
+          submittedAtMs: Date.now(),
+          phase: "EXTERNAL_QUEUED",
+        });
       },
-      onOutputReady: async (output) => {
-        const artifactId = genId();
-        await commitArtifactFromBuffer({
-          id: artifactId,
+      onProgress: async (progress) => {
+        await updateAttemptFenced(attemptId, jobFencingToken, { progressSnapshotJson: progress as unknown as Record<string, unknown> });
+      },
+      onReconciliation: async (result) => {
+        if (result.discoveredExternalJobId) retainResource = true;
+        await updateAttemptFenced(attemptId, jobFencingToken, {
+          phase: result.exists ? "EXTERNAL_QUEUED" : "SUBMISSION_UNKNOWN",
+          externalJobId: result.discoveredExternalJobId ?? undefined,
+        });
+      },
+      isCancellationRequested: async () => {
+        const [current] = await db
+          .select({ cancelRequestedAtMs: generationJobs.cancelRequestedAtMs })
+          .from(generationJobs)
+          .where(and(
+            eq(generationJobs.id, job.id),
+            eq(generationJobs.claimOwner, workerId),
+            eq(generationJobs.claimFencingToken, jobFencingToken),
+          ));
+        if (!current) throw new Error("job_claim_lost_during_cancellation_probe");
+        return Boolean(current.cancelRequestedAtMs);
+      },
+      onCancellationResult: async (result) => {
+        await updateAttemptFenced(attemptId, jobFencingToken, { phase: "CANCEL_REQUESTED" });
+        await db.insert(generationEvents).values({
+          id: genId(),
+          jobId: job.id,
           attemptId,
+          eventType: "external_cancellation_requested",
+          severity: result.needsReconciliation ? "warning" : "info",
+          safePayloadJson: {
+            requested: result.requested,
+            method: result.method,
+            needsReconciliation: result.needsReconciliation,
+            safeMessage: result.safeMessage.slice(0, 200),
+          },
+          createdAtMs: Date.now(),
+        });
+      },
+      onOutputStream: async (output) => {
+        const sequence = outputSequence++;
+        const media = mimeForOutput(output.filename, output.mediaKind);
+        const contentLength = Number(output.response.headers.get("content-length") ?? 0);
+        if (contentLength > workflowPackage.manifest.limits.maxOutputBytes) throw new Error("Output exceeds workflow package limit");
+        if (!output.response.body) throw new Error("Output response has no body");
+        const committed = await streamCommitArtifact({
+          attemptId,
+          expectedJobClaimFencingToken: jobFencingToken,
           logicalName: `${output.nodeId}_${output.filename}`,
-          kind: output.type === "image" ? "image" : output.type === "audio" ? "audio" : "archive",
-          buffer: Buffer.from(output.data),
-          mimeType: output.type === "image" ? "image/png" : "audio/wav",
+          kind: media.kind,
+          mimeType: media.mimeType,
           visibility: "project",
-          projectId: job.projectId,
+          maxSizeBytes: workflowPackage.manifest.limits.maxOutputBytes,
+          metadata: {
+            nodeId: output.nodeId, outputKey: output.outputKey, outputField: output.field,
+            mediaKind: output.mediaKind, originalFilename: output.filename,
+          },
+          read: () => output.response.body!,
+        });
+        committedArtifacts.push({
+          artifactId: committed.id,
+          nodeId: output.nodeId,
+          outputKey: output.outputKey,
+          field: output.field,
+          sequence,
         });
       },
     };
 
-    const orchestrator = new ComfyUIExecutionOrchestrator(
-      transport,
-      features,
-      backend.baseUrl,
-      callbacks,
-      {},
-      `corr-${attemptId}`,
-    );
-
-    const cancelCheckTimer = setInterval(async () => {
-      const [currentJob] = await db
-        .select({ status: generationJobs.status, cancelRequestedAtMs: generationJobs.cancelRequestedAtMs })
-        .from(generationJobs)
-        .where(eq(generationJobs.id, job.id));
-
-      if (currentJob?.status === "CANCEL_REQUESTED" || currentJob?.cancelRequestedAtMs) {
-        orchestrator.requestCancel().catch(() => {});
-      }
-    }, 2_000);
-
+    orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, backend.baseUrl, callbacks, {
+      totalExecutionTimeoutMs: workflowPackage.manifest.limits.maxJobMs,
+      collectionTimeoutMs: Math.min(workflowPackage.manifest.limits.maxJobMs, 5 * 60 * 1000),
+      isSharedBackend: backend.sharingMode === "shared",
+      maxOutputs: workflowPackage.manifest.limits.maxOutputs,
+      approvedOutputs: workflowPackage.compiled.outputs.map((output) => ({
+        key: output.key, nodeId: output.nodeId, field: output.field,
+        mediaKind: output.mediaKind, maxItems: output.maxItems,
+      })),
+    }, correlationId);
+    const abortListener = () => orchestrator?.stop();
+    abortSignal?.addEventListener("abort", abortListener, { once: true });
     try {
       const result = await orchestrator.execute(workflow);
-
-      if (result.success) {
-        await succeedJob(job.id, attemptId, jobFencingToken);
-        return {
-          success: true,
-          finalPhase: "SUCCEEDED",
-          needsAttention: false,
-        };
-      } else if (result.cancellationRequested) {
-        await cancelJob(job.id, attemptId, jobFencingToken);
-        return {
-          success: false,
-          finalPhase: "CANCELLED",
-          needsAttention: false,
-        };
-      } else {
+      if (abortSignal?.aborted) {
+        retainResource = true;
         return failJob(
-          job.id,
-          attemptId,
-          result.errorMessage ?? "Execution failed",
-          result.errorClass ?? "unknown",
-          jobFencingToken,
-          result.needsAttention,
+          job.id, attemptId, workerId, jobFencingToken,
+          "Execution ownership was lost", "ownership_lost", true,
         );
       }
-    } finally {
-      clearInterval(cancelCheckTimer);
-    }
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    return failJob(
-      job.id,
-      attemptId,
-      error.message,
-      "unexpected_error",
-      jobFencingToken,
-    );
-  } finally {
-    if (resourceLeaseTimer) {
-      clearInterval(resourceLeaseTimer);
-    }
-    if (resourceSlot && job.executionSnapshotJson) {
-      const snapshot = job.executionSnapshotJson as Record<string, unknown>;
-      const resourcePoolId = snapshot.resourcePoolId as string | undefined;
-      if (resourcePoolId) {
-        await releaseResourceSlot(
-          resourcePoolId,
-          resourceSlot.slotNo,
-          resourceSlot.leaseToken,
-          resourceSlot.fencingToken,
-        ).catch(() => {});
+      if (result.success) {
+        retainResource = false;
+        const primaryArtifact = selectPrimaryArtifact(committedArtifacts, workflowPackage.compiled.outputs);
+        const artifactId = await succeedJob(
+          job.id, attemptId, workerId, jobFencingToken, primaryArtifact.artifactId,
+        );
+        try {
+          await linkArtifactToBusinessEntity(job.id, artifactId);
+          await mergeGenerationJobMetadata(job.id, {
+            businessProjectionStatus: "succeeded",
+            businessProjectedAtMs: Date.now(),
+            businessProjectionError: null,
+          });
+        } catch (projectionError) {
+          await db.insert(generationEvents).values({
+            id: genId(), jobId: job.id, attemptId, eventType: "business_projection_pending", severity: "warning",
+            safePayloadJson: { message: projectionError instanceof Error ? projectionError.message.slice(0, 200) : "projection_failed" },
+            createdAtMs: Date.now(),
+          }).catch(() => undefined);
+        }
+        return { success: true, finalPhase: "SUCCEEDED", needsAttention: false };
       }
+      if (result.cancellationRequested && result.phase === "CANCELLED") {
+        retainResource = false;
+        await cancelJob(job.id, attemptId, workerId, jobFencingToken);
+        return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+      }
+      retainResource = retainResource || result.needsAttention || result.phase === "SUBMISSION_UNKNOWN";
+      return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
+    } finally {
+      abortSignal?.removeEventListener("abort", abortListener);
+    }
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    retainResource = retainResource || failure.message.includes("claim_lost") || failure.message.includes("ownership");
+    return failJob(job.id, attemptPersisted ? attemptId : "", workerId, jobFencingToken, failure.message, "unexpected_error", retainResource);
+  } finally {
+    if (resourceTimer) clearInterval(resourceTimer);
+    transport?.close();
+    if (!retainResource && inputCleanup) await inputCleanup().catch(() => undefined);
+    if (resourceSlot && !retainResource) {
+      const snapshot = job.executionSnapshotJson as Record<string, unknown>;
+      const backendId = snapshot.executionBackendId as string;
+      const [backend] = backendId ? await db.select().from(executionBackends).where(eq(executionBackends.id, backendId)) : [];
+      if (backend) await releaseResourceSlot(backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken).catch(() => false);
     }
   }
 }
 
-async function getNextAttemptNo(jobId: string): Promise<number> {
-  const attempts = await db
-    .select({ attemptNo: generationAttempts.attemptNo })
-    .from(generationAttempts)
-    .where(eq(generationAttempts.jobId, jobId))
-    .orderBy(desc(generationAttempts.attemptNo))
-    .limit(1);
 
-  return (attempts[0]?.attemptNo ?? 0) + 1;
+async function cancelQueuedJob(jobId: string, workerId: string, fencingToken: number): Promise<void> {
+  const now = Date.now();
+  const updated = await updateJobFenced(jobId, workerId, fencingToken, {
+    status: "CANCELLED",
+    completedAtMs: now,
+  });
+  if (!updated) throw new Error("Job fencing token is stale while cancelling before submission");
+  await db.insert(generationEvents).values({
+    id: genId(), jobId, attemptId: null, eventType: "job_cancelled_before_submission",
+    severity: "info", safePayloadJson: {}, createdAtMs: now,
+  });
 }
 
-async function updateAttemptPhase(attemptId: string, phase: string): Promise<void> {
-  await db
-    .update(generationAttempts)
-    .set({ phase, updatedAtMs: Date.now() })
-    .where(eq(generationAttempts.id, attemptId))
-    .catch(() => {});
+async function getNextAttemptNo(jobId: string): Promise<number> {
+  const rows = await db.select({ attemptNo: generationAttempts.attemptNo }).from(generationAttempts)
+    .where(eq(generationAttempts.jobId, jobId)).orderBy(desc(generationAttempts.attemptNo)).limit(1);
+  return (rows[0]?.attemptNo ?? 0) + 1;
 }
 
 async function failJob(
   jobId: string,
   attemptId: string,
+  workerId: string,
+  fencingToken: number,
   errorMessage: string,
   errorClass: string,
-  _fencingToken: number,
   needsAttention = false,
 ): Promise<JobExecutionResult> {
   const now = Date.now();
-
-  await db
-    .update(generationAttempts)
-    .set({
-      phase: "FAILED",
-      errorClass,
-      errorMessageSafe: errorMessage.slice(0, 500),
-      finishedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationAttempts.id, attemptId))
-    .catch(() => {});
-
-  await db
-    .update(generationJobs)
-    .set({
-      status: needsAttention ? "NEEDS_ATTENTION" : "FAILED",
-      needsAttentionReason: needsAttention ? `${errorClass}: ${errorMessage.slice(0, 200)}` : null,
-      completedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationJobs.id, jobId))
-    .catch(() => {});
-
-  await db
-    .insert(generationEvents)
-    .values({
-      id: genId(),
-      jobId,
-      attemptId,
-      eventType: "job_failed",
-      severity: "error",
-      safePayloadJson: { errorClass, errorMessage: errorMessage.slice(0, 200) },
-      createdAtMs: now,
-    })
-    .catch(() => {});
-
-  return {
-    success: false,
-    finalPhase: "FAILED",
-    errorMessage,
+  if (attemptId) await updateAttemptFenced(attemptId, fencingToken, {
+    phase: needsAttention ? "ORPHANED" : "FAILED",
     errorClass,
-    needsAttention,
-  };
+    errorMessageSafe: errorMessage.slice(0, 500),
+    finishedAtMs: needsAttention ? null : now,
+  }).catch(() => false);
+  const updated = await updateJobFenced(jobId, workerId, fencingToken, {
+    status: needsAttention ? "NEEDS_ATTENTION" : "FAILED",
+    needsAttentionReason: needsAttention ? `${errorClass}:${errorMessage.slice(0, 200)}` : null,
+    completedAtMs: needsAttention ? null : now,
+  }).catch(() => false);
+  if (updated) await db.insert(generationEvents).values({
+    id: genId(), jobId, attemptId: attemptId || null, eventType: needsAttention ? "job_needs_attention" : "job_failed",
+    severity: needsAttention ? "warning" : "error", safePayloadJson: { errorClass, errorMessage: errorMessage.slice(0, 200) }, createdAtMs: now,
+  }).catch(() => undefined);
+  return { success: false, finalPhase: needsAttention ? "NEEDS_ATTENTION" : "FAILED", errorMessage, errorClass, needsAttention };
 }
 
 async function succeedJob(
   jobId: string,
   attemptId: string,
-  _fencingToken: number,
-): Promise<void> {
+  workerId: string,
+  fencingToken: number,
+  artifactId: string,
+): Promise<string> {
   const now = Date.now();
-
-  const [artifact] = await db
-    .select({ id: generationArtifacts.id })
-    .from(generationArtifacts)
-    .where(eq(generationArtifacts.attemptId, attemptId))
-    .orderBy(desc(generationArtifacts.createdAtMs))
-    .limit(1);
-
-  await db
-    .update(generationAttempts)
-    .set({
-      phase: "SUCCEEDED",
-      finishedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationAttempts.id, attemptId))
-    .catch(() => {});
-
-  await db
-    .update(generationJobs)
-    .set({
-      status: "SUCCEEDED",
-      currentArtifactId: artifact?.id ?? null,
-      completedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationJobs.id, jobId))
-    .catch(() => {});
-
-  await db
-    .insert(generationEvents)
-    .values({
-      id: genId(),
-      jobId,
-      attemptId,
-      eventType: "job_succeeded",
-      severity: "info",
-      safePayloadJson: {},
-      createdAtMs: now,
-    })
-    .catch(() => {});
+  const [artifact] = await db.select({ id: generationArtifacts.id }).from(generationArtifacts)
+    .where(and(
+      eq(generationArtifacts.id, artifactId),
+      eq(generationArtifacts.attemptId, attemptId),
+      eq(generationArtifacts.status, "COMMITTED"),
+    ));
+  if (!artifact) throw new Error("Selected primary artifact is not committed for this execution attempt");
+  if (!await updateAttemptFenced(attemptId, fencingToken, { phase: "SUCCEEDED", finishedAtMs: now })) throw new Error("Attempt fencing token is stale");
+  if (!await updateJobFenced(jobId, workerId, fencingToken, { status: "SUCCEEDED", currentArtifactId: artifact.id, completedAtMs: now })) throw new Error("Job fencing token is stale");
+  await db.insert(generationEvents).values({ id: genId(), jobId, attemptId, eventType: "job_succeeded", severity: "info", safePayloadJson: {}, createdAtMs: now });
+  return artifact.id;
 }
 
-async function cancelJob(
-  jobId: string,
-  attemptId: string,
-  _fencingToken: number,
-): Promise<void> {
+async function cancelJob(jobId: string, attemptId: string, workerId: string, fencingToken: number): Promise<void> {
   const now = Date.now();
-
-  await db
-    .update(generationAttempts)
-    .set({
-      phase: "CANCELLED",
-      finishedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationAttempts.id, attemptId))
-    .catch(() => {});
-
-  await db
-    .update(generationJobs)
-    .set({
-      status: "CANCELLED",
-      completedAtMs: now,
-      updatedAtMs: now,
-    })
-    .where(eq(generationJobs.id, jobId))
-    .catch(() => {});
-
-  await db
-    .insert(generationEvents)
-    .values({
-      id: genId(),
-      jobId,
-      attemptId,
-      eventType: "job_cancelled",
-      severity: "info",
-      safePayloadJson: {},
-      createdAtMs: now,
-    })
-    .catch(() => {});
+  await updateAttemptFenced(attemptId, fencingToken, { phase: "CANCELLED", finishedAtMs: now });
+  await updateJobFenced(jobId, workerId, fencingToken, { status: "CANCELLED", completedAtMs: now });
+  await db.insert(generationEvents).values({ id: genId(), jobId, attemptId, eventType: "job_cancelled", severity: "info", safePayloadJson: {}, createdAtMs: now });
 }

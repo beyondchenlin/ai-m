@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["es2023"],
+    "types": ["node"],
+    "jsx": "preserve"
+  },
+  "include": [
+    "src/worker/**/*.ts",
+    "src/lib/generation/**/*.ts",
+    "src/lib/security/**/*.ts",
+    "src/lib/db/**/*.ts",
+    "src/lib/feature-flags.ts"
+  ],
+  "exclude": ["node_modules", ".next"]
+}

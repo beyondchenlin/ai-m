@@ -15,6 +15,7 @@ CREATE TABLE `visual_subjects` (
 	`updated_at` integer NOT NULL,
 	FOREIGN KEY (`project_id`) REFERENCES `projects`(`id`) ON UPDATE no action ON DELETE cascade
 );
+--> statement-breakpoint
 
 CREATE TABLE `visual_subject_versions` (
 	`id` text PRIMARY KEY NOT NULL,

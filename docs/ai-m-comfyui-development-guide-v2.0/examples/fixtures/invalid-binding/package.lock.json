@@ -3,9 +3,9 @@
   "workflowId": "invalid-binding",
   "version": "1.0.0",
   "files": {
-    "workflow.api.json": "ddd8ad6c686f1f0e809ea409946d535b80ed53ca85d0a045554ffa134c252556",
-    "manifest.json": "6fbb209426c2f2111873905d60118ae641690e025747cb430b6a6f5a5fc38c83",
-    "compiled-bindings.json": "13a5838b965c2054827bccb10b964d09343e4dcceb86c09409173bcae8e10ee2"
+    "workflow.api.json": "03926039481c979b59bd4ad1006ced8ebdbb7d9a74cfe280cff85868722e1106",
+    "manifest.json": "947c6faa1f80f261f2f90f9c0cb908bf483f2e9cfeda479b6df01b94017253b1",
+    "compiled-bindings.json": "724ab193eb862b66133993a8d9eb7c68f64dac074e6425b6f8828085c4e26923"
   },
   "environmentLockDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 }

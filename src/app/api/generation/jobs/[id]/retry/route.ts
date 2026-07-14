@@ -1,74 +1,52 @@
-/**
- * v2.0 生成任务重试 API
- *
- * 手册 §16.2：POST /api/generation/jobs/{id}/retry
- */
-
+/** Retry one failed/cancelled job as a new full execution attempt. */
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
-import { projects, generationJobs } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
-import { retryGenerationJob } from "@/lib/generation/jobs/service";
+import { retryGenerationJob, GenerationJobServiceError } from "@/lib/generation/jobs/service";
 import type { RetryMode } from "@/lib/generation/contracts";
 import { isEnabled, FF } from "@/lib/feature-flags";
+import {
+  assertPlainObject, rejectUnknownKeys, readJsonBodyLimited, RequestValidationError,
+  assertTrustedRequestOrigin,
+} from "@/lib/security";
 
-/** POST /api/generation/jobs/{id}/retry - 重试任务 */
 export async function POST(
   req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   if (!isEnabled(FF.V2_DURABLE_EXECUTION)) {
-    return NextResponse.json(
-      { error: "v2.0 durable execution is not enabled" },
-      { status: 403 }
-    );
+    return NextResponse.json({ error: "v2.0 durable execution is not enabled" }, { status: 403 });
   }
-
   const userId = getUserIdFromRequest(req);
-  if (!userId) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
+  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
-  const body = await req.json();
-  const mode: RetryMode = body.mode ?? "retry_full";
-
-  // 验证重试模式
-  const validModes: RetryMode[] = ["retry_full", "retry_collection", "retry_submission"];
-  if (!validModes.includes(mode)) {
-    return NextResponse.json(
-      { error: `Invalid mode. Must be one of: ${validModes.join(", ")}` },
-      { status: 400 }
-    );
-  }
-
   try {
-    // 验证项目权限
-    const [jobRow] = await db
-      .select({ projectId: generationJobs.projectId })
-      .from(generationJobs)
-      .where(eq(generationJobs.id, id));
-
-    if (!jobRow?.projectId) {
-      return NextResponse.json({ error: "Job not found" }, { status: 404 });
+    assertTrustedRequestOrigin(req);
+    if (!req.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+      throw new RequestValidationError("Content-Type must be application/json");
     }
-
-    const [project] = await db
-      .select()
-      .from(projects)
-      .where(eq(projects.id, jobRow.projectId));
-
-    if (!project || project.userId !== userId) {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    const body: unknown = await readJsonBodyLimited(req);
+    assertPlainObject(body);
+    rejectUnknownKeys(body, ["mode"]);
+    const mode = body.mode === undefined ? "retry_full" : body.mode;
+    if (mode !== "retry_full") {
+      return NextResponse.json(
+        { error: "Only retry_full is supported; recovery of uncertain external execution is automatic" },
+        { status: 400 },
+      );
     }
-
-    const job = await retryGenerationJob(id, { userId, roles: ["user"] }, mode);
-
+    const job = await retryGenerationJob(id, { userId, roles: ["user"] }, mode satisfies RetryMode);
     return NextResponse.json({ job });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[Generation Job API] Retry error:", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+  } catch (error) {
+    if (error instanceof RequestValidationError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
+    if (error instanceof GenerationJobServiceError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: error.status });
+    }
+    if (error instanceof SyntaxError || (error instanceof Error && /must be an object|unknown field/i.test(error.message))) {
+      return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid request" }, { status: 400 });
+    }
+    console.error("[generation/jobs/:id/retry] request failed", error);
+    return NextResponse.json({ error: "Generation job retry failed" }, { status: 500 });
   }
 }

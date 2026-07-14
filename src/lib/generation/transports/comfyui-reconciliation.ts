@@ -83,18 +83,16 @@ export async function reconcileSubmission(
   if (!externalJobId && correlationId) {
     try {
       const queue = await probeQueueStatus(transport, correlationId);
-      const running = (queue.queueRunning ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
-      const pending = (queue.queuePending ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
-      const match = running.find((q) => q.correlation_id === correlationId) ??
-        pending.find((q) => q.correlation_id === correlationId) ??
-        running.find((q) => q.prompt_id) ??
-        pending.find((q) => q.prompt_id);
-      if (match?.prompt_id) {
-        discoveredExternalJobId = match.prompt_id;
+      const running = queue.queueRunning ?? [];
+      const pending = queue.queuePending ?? [];
+      const match = running.find((q) => q.correlationId === correlationId) ??
+        pending.find((q) => q.correlationId === correlationId);
+      if (match?.promptId) {
+        discoveredExternalJobId = match.promptId;
         evidence.push({
           source: "queue_running",
           strength: "strong",
-          description: `Discovered external job id ${match.prompt_id} via correlation id`,
+          description: `Discovered external job id ${match.promptId} via correlation id`,
           collectedAtMs: now,
         });
       }
@@ -149,11 +147,11 @@ export async function reconcileSubmission(
 
   try {
     const queue = await probeQueueStatus(transport, correlationId);
-    const running = (queue.queueRunning ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
-    const pending = (queue.queuePending ?? []) as Array<{ prompt_id?: string; correlation_id?: string }>;
+    const running = queue.queueRunning ?? [];
+    const pending = queue.queuePending ?? [];
 
-    foundInQueueRunning = running.some((item) => item.prompt_id === resolvedExternalJobId);
-    foundInQueuePending = pending.some((item) => item.prompt_id === resolvedExternalJobId);
+    foundInQueueRunning = running.some((item) => item.promptId === resolvedExternalJobId);
+    foundInQueuePending = pending.some((item) => item.promptId === resolvedExternalJobId);
 
     if (foundInQueueRunning) {
       evidence.push({

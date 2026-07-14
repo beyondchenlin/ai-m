@@ -1,44 +1,19 @@
-/**
- * v2.0 工作流包验证器
- *
- * 手册 §8：工作流包上传后进行隔离验证。
- * 包括结构约束、静态策略、环境验证和双人审查。
- */
+/** Platform-owned workflow validation. Workflow authors cannot relax these rules. */
+import { normalizeComfyWorkflow } from "./normalize";
+import { sha256 } from "./canonical";
 
-import { createHash } from "crypto";
-import { db } from "@/lib/db";
-import { workflowPackageRevisions, workflowPackageStates } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
-import { isEnabled, FF } from "@/lib/feature-flags";
-import { writeAuditEvent, AuditAction, AuditTargetType } from "@/lib/security/audit";
-
-/** 结构约束 */
 export interface WorkflowStructureConstraints {
-  /** 节点数限制 */
   maxNodes: number;
-  /** 节点类限制 */
   maxNodeClasses: number;
-  /** 允许的节点类列表 */
   allowedNodeClasses: string[];
-  /** 包大小上限 (bytes) */
   maxPackageSizeBytes: number;
-  /** 最大输出数 */
-  maxOutputs: number;
 }
 
-/** 静态策略 */
 export interface WorkflowStaticPolicy {
-  /** 防止路径遍历 */
   enforcePathTraversalCheck: boolean;
-  /** 最大执行时间 (ms) */
-  maxExecutionTimeMs: number;
-  /** 允许的媒体类型 */
-  allowedMediaTypes: string[];
-  /** 禁止的节点类 */
   blockedNodeClasses: string[];
 }
 
-/** 验证结果 */
 export interface WorkflowValidationResult {
   valid: boolean;
   digest: string;
@@ -48,231 +23,140 @@ export interface WorkflowValidationResult {
   warnings: string[];
 }
 
-/** 默认结构约束 */
 const DEFAULT_CONSTRAINTS: WorkflowStructureConstraints = {
-  maxNodes: 200,
-  maxNodeClasses: 50,
+  maxNodes: 512,
+  maxNodeClasses: 256,
   allowedNodeClasses: ["*"],
-  maxPackageSizeBytes: 10 * 1024 * 1024, // 10 MB
-  maxOutputs: 20,
+  maxPackageSizeBytes: 10 * 1024 * 1024,
 };
 
-/** 默认静态策略 */
-const DEFAULT_STATIC_POLICY: WorkflowStaticPolicy = {
-  enforcePathTraversalCheck: true,
-  maxExecutionTimeMs: 600_000, // 10 分钟
-  allowedMediaTypes: ["image/png", "image/jpeg", "image/webp", "video/mp4", "audio/wav", "audio/mp3"],
-  blockedNodeClasses: [],
-};
+const DEFAULT_BLOCKED_NODE_CLASSES = new Set([
+  "ExecutePython", "PythonScript", "ShellCommand", "SystemCommand",
+  "LoadImageFromUrl", "DownloadFile", "HTTPRequest", "HTTPNode",
+]);
 
-/** 验证工作流 JSON 结构 */
+function unsafePathReason(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.includes("\0")) return "NUL byte";
+  if (trimmed.includes("../") || trimmed.includes("..\\")) return "path traversal";
+  if (/^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|file:)/i.test(trimmed)) return "absolute file path";
+  if (/^https?:\/\//i.test(trimmed)) return "embedded network URL";
+  return null;
+}
+
+function findUnsafeInput(value: unknown, pointer = "inputs"): string | null {
+  if (typeof value === "string") {
+    const reason = unsafePathReason(value);
+    return reason ? `${pointer}: ${reason}` : null;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const result = findUnsafeInput(value[index], `${pointer}[${index}]`);
+      if (result) return result;
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const result = findUnsafeInput(item, `${pointer}.${key}`);
+      if (result) return result;
+    }
+  }
+  return null;
+}
+
+function serializedSize(value: unknown): number {
+  try { return new TextEncoder().encode(JSON.stringify(value)).byteLength; } catch { return Number.MAX_SAFE_INTEGER; }
+}
+
 export function validateWorkflowStructure(
   workflowApi: Record<string, unknown>,
   constraints: Partial<WorkflowStructureConstraints> = {},
 ): WorkflowValidationResult {
-  const c = { ...DEFAULT_CONSTRAINTS, ...constraints };
+  const settings = { ...DEFAULT_CONSTRAINTS, ...constraints };
   const errors: string[] = [];
   const warnings: string[] = [];
-
-  // 检查节点
-  const nodes = (workflowApi.nodes as Record<string, unknown>[]) ?? [];
-  if (nodes.length === 0) {
-    errors.push("Workflow has no nodes");
+  const packageSize = serializedSize(workflowApi);
+  if (packageSize > settings.maxPackageSizeBytes) {
+    errors.push(`Workflow API exceeds ${settings.maxPackageSizeBytes} bytes`);
   }
-  if (nodes.length > c.maxNodes) {
-    errors.push(`Workflow has ${nodes.length} nodes, max is ${c.maxNodes}`);
+  let workflow: ReturnType<typeof normalizeComfyWorkflow> = {};
+  try {
+    workflow = normalizeComfyWorkflow(workflowApi);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
   }
-
-  // 收集节点类
-  const nodeClasses = new Set<string>();
-  for (const node of nodes) {
-    const classType = node.class_type as string;
-    if (classType) {
-      nodeClasses.add(classType);
-    }
-    if (nodeClasses.size > c.maxNodeClasses) {
-      errors.push(`Workflow has ${nodeClasses.size} node classes, max is ${c.maxNodeClasses}`);
-      break;
+  const nodeCount = Object.keys(workflow).length;
+  const nodeClasses = new Set(Object.values(workflow).map((node) => node.class_type));
+  if (nodeCount > settings.maxNodes) errors.push(`Workflow has ${nodeCount} nodes, max is ${settings.maxNodes}`);
+  if (nodeClasses.size > settings.maxNodeClasses) errors.push(`Workflow has ${nodeClasses.size} node classes, max is ${settings.maxNodeClasses}`);
+  if (!settings.allowedNodeClasses.includes("*")) {
+    for (const classType of nodeClasses) {
+      if (!settings.allowedNodeClasses.includes(classType)) errors.push(`Node class not allowed: ${classType}`);
     }
   }
-
-  // 检查禁止的节点类
-  if (c.allowedNodeClasses.length > 0 && !c.allowedNodeClasses.includes("*")) {
-    for (const nc of nodeClasses) {
-      if (!c.allowedNodeClasses.includes(nc)) {
-        errors.push(`Node class not allowed: ${nc}`);
-      }
-    }
-  }
-
-  // 检查输出数
-  const outputs = (workflowApi.outputs as unknown[]) ?? [];
-  if (outputs.length > c.maxOutputs) {
-    errors.push(`Workflow has ${outputs.length} outputs, max is ${c.maxOutputs}`);
-  }
-  if (outputs.length === 0) {
-    warnings.push("Workflow has no outputs defined");
-  }
-
-  // 计算摘要
-  const digest = `sha256:${createHash("sha256").update(JSON.stringify(workflowApi)).digest("hex")}`;
-
-  return {
-    valid: errors.length === 0,
-    digest,
-    nodeCount: nodes.length,
-    nodeClasses,
-    errors,
-    warnings,
-  };
+  return { valid: errors.length === 0, digest: sha256(workflow), nodeCount, nodeClasses, errors, warnings };
 }
 
-/** 应用静态策略 */
 export function applyStaticPolicy(
   workflowApi: Record<string, unknown>,
   policy: Partial<WorkflowStaticPolicy> = {},
 ): WorkflowValidationResult {
-  const p = { ...DEFAULT_STATIC_POLICY, ...policy };
   const errors: string[] = [];
   const warnings: string[] = [];
-
-  const nodes = (workflowApi.nodes as Record<string, unknown>[]) ?? [];
+  let workflow: ReturnType<typeof normalizeComfyWorkflow> = {};
+  try {
+    workflow = normalizeComfyWorkflow(workflowApi);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  const blocked = new Set([...DEFAULT_BLOCKED_NODE_CLASSES, ...(policy.blockedNodeClasses ?? [])]);
   const nodeClasses = new Set<string>();
-
-  for (const node of nodes) {
-    const classType = node.class_type as string;
-    if (classType) {
-      nodeClasses.add(classType);
-
-      if (p.blockedNodeClasses.includes(classType)) {
-        errors.push(`Blocked node class: ${classType}`);
-      }
-    }
-
-    // 路径遍历检查
-    if (p.enforcePathTraversalCheck) {
-      const inputs = node.inputs as Record<string, unknown>;
-      if (inputs) {
-        for (const [key, value] of Object.entries(inputs)) {
-          if (typeof value === "string" && (value.includes("../") || value.includes("..\\"))) {
-            errors.push(`Path traversal detected in node ${classType}.${key}: ${value}`);
-          }
-        }
-      }
+  for (const [nodeId, node] of Object.entries(workflow)) {
+    nodeClasses.add(node.class_type);
+    if (blocked.has(node.class_type)) errors.push(`Blocked node class: ${node.class_type}`);
+    if (policy.enforcePathTraversalCheck !== false) {
+      const unsafe = findUnsafeInput(node.inputs, `node ${nodeId}.inputs`);
+      if (unsafe) errors.push(`Unsafe static workflow input: ${unsafe}`);
     }
   }
-
-  const digest = `sha256:${createHash("sha256").update(JSON.stringify(workflowApi)).digest("hex")}`;
-
-  return {
-    valid: errors.length === 0,
-    digest,
-    nodeCount: nodes.length,
-    nodeClasses,
-    errors,
-    warnings,
-  };
+  return { valid: errors.length === 0, digest: sha256(workflow), nodeCount: Object.keys(workflow).length, nodeClasses, errors, warnings };
 }
 
-/** 验证工作流包并创建修订版 */
-export async function validateAndCreateWorkflowPackage(
-  displayName: string,
-  workflowApi: Record<string, unknown>,
-  manifest: Record<string, unknown>,
-  packageLock: Record<string, unknown>,
-  actor: { id: string },
-): Promise<{ id: string; digest: string }> {
-  if (!isEnabled(FF.V2_WORKFLOW_SUPPLY_CHAIN)) {
-    throw new Error("v2.0 workflow supply chain is not enabled");
+export function assertWorkflowPromotionPolicy(workflowApi: Record<string, unknown>): void {
+  const structure = validateWorkflowStructure(workflowApi);
+  const policy = applyStaticPolicy(workflowApi);
+  const errors = [...structure.errors, ...policy.errors];
+  const allowlist = (process.env.AI_M_WORKFLOW_NODE_ALLOWLIST ?? "")
+    .split(",").map((item) => item.trim()).filter(Boolean);
+  const requireAllowlist = process.env.NODE_ENV === "production"
+    || process.env.AI_M_REQUIRE_WORKFLOW_NODE_ALLOWLIST === "true";
+  if (requireAllowlist && allowlist.length === 0) {
+    errors.push("AI_M_WORKFLOW_NODE_ALLOWLIST is required for workflow promotion");
   }
-
-  // 结构验证
-  const structResult = validateWorkflowStructure(workflowApi);
-  if (!structResult.valid) {
-    throw new Error(`Workflow structure validation failed: ${structResult.errors.join("; ")}`);
+  if (allowlist.length > 0) {
+    for (const classType of structure.nodeClasses) {
+      if (!allowlist.includes(classType)) errors.push(`Node class is not in the platform allowlist: ${classType}`);
+    }
   }
-
-  // 静态策略验证
-  const policyResult = applyStaticPolicy(workflowApi);
-  if (!policyResult.valid) {
-    throw new Error(`Workflow static policy validation failed: ${policyResult.errors.join("; ")}`);
-  }
-
-  const now = Date.now();
-  const id = crypto.randomUUID();
-  const digest = structResult.digest;
-
-  await db.insert(workflowPackageRevisions).values({
-    id,
-    displayName,
-    revisionNo: 1,
-    workflowApiJson: workflowApi,
-    manifestJson: manifest,
-    packageLockJson: packageLock,
-    digest,
-    environmentLockJson: {
-      os: process.platform,
-      nodeVersion: process.version,
-      gpuDriver: "unknown",
-      comfyVersion: manifest.version ?? "unknown",
-    },
-    nodeClasses: Array.from(structResult.nodeClasses),
-    reviewedBy: null,
-    uploadedBy: actor.id,
-    createdAtMs: now,
-  });
-
-  await db.insert(workflowPackageStates).values({
-    workflowPackageRevisionId: id,
-    state: "installed",
-    stateReason: "Created via upload",
-    updatedAtMs: now,
-  });
-
-  // 审计
-  await writeAuditEvent({
-    action: AuditAction.WORKFLOW_UPLOADED,
-    targetType: AuditTargetType.WORKFLOW,
-    targetId: id,
-    detailsSafe: {
-      displayName,
-      nodeCount: structResult.nodeCount,
-      nodeClasses: Array.from(structResult.nodeClasses),
-      digest,
-    },
-  });
-
-  return { id, digest };
+  if (errors.length) throw new Error(`Workflow promotion policy failed: ${errors.join("; ")}`);
 }
 
-/** 环境指纹 */
 export function captureEnvironmentFingerprint(): Record<string, unknown> {
   return {
     os: process.platform,
-    osVersion: process.getuid?.()?.toString() ?? "unknown",
     nodeVersion: process.version,
     architecture: process.arch,
-    cwd: process.cwd(),
-    timestamp: Date.now(),
+    capturedAtMs: Date.now(),
   };
 }
 
-/** 比较环境指纹 */
 export function compareEnvironmentFingerprints(
-  baseline: Record<string, unknown>,
-  current: Record<string, unknown>,
+  expected: Record<string, unknown>,
+  actual: Record<string, unknown>,
 ): { compatible: boolean; differences: string[] } {
-  const differences: string[] = [];
-  const keysToCompare = ["os", "nodeVersion", "architecture"];
-
-  for (const key of keysToCompare) {
-    if (baseline[key] !== current[key]) {
-      differences.push(`${key}: ${baseline[key]} → ${current[key]}`);
-    }
-  }
-
-  return {
-    compatible: differences.length === 0,
-    differences,
-  };
+  const ignored = new Set(["capturedAtMs", "timestamp"]);
+  const keys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+  const differences = [...keys]
+    .filter((key) => !ignored.has(key) && JSON.stringify(expected[key]) !== JSON.stringify(actual[key]))
+    .map((key) => `${key}: expected=${JSON.stringify(expected[key])}, actual=${JSON.stringify(actual[key])}`);
+  return { compatible: differences.length === 0, differences };
 }

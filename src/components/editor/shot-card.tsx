@@ -132,7 +132,7 @@ function StepRow({
   const [open, setOpen] = useState(defaultOpen || isNext);
 
   useEffect(() => {
-    if (isNext) setOpen(true);
+    if (isNext) queueMicrotask(() => setOpen(true));
   }, [isNext]);
 
   return (

@@ -126,11 +126,17 @@ export function CharacterCard({
   }
 
   async function handleGenerateImage() {
-    if (!imageGuard()) return;
+    const selectedProvider = imageModelRef
+      ? providers.find((provider) => provider.id === imageModelRef.providerId)
+      : null;
+    const isLocalGeneration = imageModelRef?.providerId === "local" || selectedProvider?.protocol === "comfyui";
+    if (!isLocalGeneration && !imageGuard()) return;
+    if (isLocalGeneration && !imageModelRef?.modelId) {
+      toast.warning(t("settings.notConfiguredImage"));
+      return;
+    }
     setGenerating(true);
     try {
-      // 检查是否选择了本地生成配置
-      const isLocalGeneration = imageModelRef?.providerId === "local";
 
       if (isLocalGeneration) {
         // v2 本地生成流程

@@ -3,9 +3,9 @@
   "workflowId": "generic-image-smoke",
   "version": "1.0.0",
   "files": {
-    "workflow.api.json": "ddd8ad6c686f1f0e809ea409946d535b80ed53ca85d0a045554ffa134c252556",
-    "manifest.json": "583abfa318567c19457a07f0da4ba88ff8d76d9496729142273a03914468d72d",
-    "compiled-bindings.json": "577b038bda0a484b62bda36e517e293522d576ff9c9521b8402d4ec22b359ad8"
+    "workflow.api.json": "03926039481c979b59bd4ad1006ced8ebdbb7d9a74cfe280cff85868722e1106",
+    "manifest.json": "1a5ccab033002fa13a8acab70071162e531fc9e4aea2f17bbbf78beb282fe7cf",
+    "compiled-bindings.json": "05daab9d6e2e074ea5748adde0234d6320460b42101dd31da5a708aaa3083c6d"
   },
   "environmentLockDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 }

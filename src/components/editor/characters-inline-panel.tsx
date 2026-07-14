@@ -45,17 +45,11 @@ export function CharactersInlinePanel({
   const storageKey = `charPanel:${projectId}`;
   const anyMissingRef = characters.some((c) => !c.referenceImage);
 
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    // Auto-expand rule: condition takes precedence over localStorage at mount time
-    if (generationMode === "reference" && anyMissingRef) {
-      setOpen(true);
-      return;
-    }
-    const stored = localStorage.getItem(storageKey);
-    setOpen(stored === "true");
-  }, []); // only on mount
+  const [open, setOpen] = useState(() => (
+    generationMode === "reference" && anyMissingRef
+      ? true
+      : typeof window !== "undefined" && localStorage.getItem(storageKey) === "true"
+  ));
 
   function toggle() {
     setOpen((prev) => {

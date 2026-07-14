@@ -203,11 +203,9 @@ export function VisualSubjectPanel({ projectId }: VisualSubjectPanelProps) {
           <Badge variant="secondary">{subjects.length}</Badge>
         </div>
         <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-          <DialogTrigger asChild>
-            <Button size="sm">
+          <DialogTrigger render={<Button size="sm" />}>
               <Plus className="h-4 w-4 mr-1" />
               创建
-            </Button>
           </DialogTrigger>
           <DialogContent>
             <DialogHeader>

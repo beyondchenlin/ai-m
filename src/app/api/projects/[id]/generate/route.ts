@@ -60,6 +60,7 @@ import {
 } from "@/lib/shot-asset-utils";
 import { buildRefImagePromptsRequest } from "@/lib/ai/prompts/ref-image-prompts";
 import { buildKeyframePromptsRequest } from "@/lib/ai/prompts/keyframe-prompts";
+import type { ReferenceSemanticType } from "@/lib/generation/reference-image-processor";
 
 export const maxDuration = 300;
 
@@ -664,7 +665,7 @@ async function handleCharacterExtract(
     .select()
     .from(characters)
     .where(eq(characters.projectId, projectId));
-  const existingByName = new Map(
+  const existingByName = new Map<string, typeof characters.$inferSelect>(
     existingChars.map((c) => [c.name.toLowerCase().trim(), c])
   );
 
@@ -2802,7 +2803,7 @@ async function handleSingleVideoPrompt(
   // Reference mode: pass ALL scene reference frames (ordered) so multi-
   // scene shots (ground → sky etc.) get the full spatial context.
   const visionFrames: string[] = [];
-  let sceneMetaList: Array<{ sceneName?: string } | null> = [];
+  const sceneMetaList: Array<{ sceneName?: string } | null> = [];
   if (genMode === "reference") {
     const sceneAssets = shotView.referenceImages
       .filter((r) => r.fileUrl)
@@ -3913,7 +3914,7 @@ async function handleSingleCharacterImageV2(
   const referenceMode = payload?.referenceMode as "off" | "auto" | "forced" | undefined;
   const referenceImages = payload?.referenceImages as Array<{
     source: string;
-    semanticType?: string;
+    semanticType?: ReferenceSemanticType;
     strength?: number;
   }> | undefined;
 
@@ -3939,7 +3940,7 @@ async function handleSingleCharacterImageV2(
         referenceMode,
         referenceImages: referenceImages?.map(ref => ({
           source: ref.source,
-          semanticType: ref.semanticType as any,
+          semanticType: ref.semanticType,
           strength: ref.strength,
         })),
       }

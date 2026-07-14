@@ -33,12 +33,16 @@ export function getSqlite(): SqliteConnection {
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
 
   const sqlite = new Database(absolutePath);
-  if (process.env.NODE_ENV !== "production") {
-    globalForDb.sqlite = sqlite;
-  }
+  // Cache one connection per process in every environment. The worker and web
+  // processes are isolated, while opening a connection for every property
+  // access in production leaks file descriptors and defeats WAL coordination.
+  globalForDb.sqlite = sqlite;
 
   sqlite.pragma("journal_mode = WAL");
   sqlite.pragma("foreign_keys = ON");
+  // Web and worker processes share the same SQLite file. Give short-lived
+  // writers time to finish instead of surfacing transient SQLITE_BUSY errors.
+  sqlite.pragma("busy_timeout = 5000");
 
   return sqlite;
 }
@@ -48,9 +52,7 @@ function createDb(): DrizzleDB {
 
   const sqlite = getSqlite();
   const instance = drizzle(sqlite, { schema });
-  if (process.env.NODE_ENV !== "production") {
-    globalForDb.drizzleDb = instance;
-  }
+  globalForDb.drizzleDb = instance;
   return instance;
 }
 
@@ -62,6 +64,12 @@ function tableExists(sqlite: SqliteConnection, tableName: string) {
     .get(tableName);
 
   return Boolean(row);
+}
+
+function schemaObjectExists(sqlite: SqliteConnection, type: "index" | "trigger", name: string): boolean {
+  return Boolean(sqlite.prepare<[string, string], { name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
+  ).get(type, name));
 }
 
 function columnExists(
@@ -124,17 +132,60 @@ function isCurrentSchemaSnapshot(sqlite: SqliteConnection) {
   );
 }
 
-function shouldBaselineExistingSchema(sqlite: SqliteConnection) {
-  return (
-    getRecordedMigrationCount(sqlite) === 0 &&
-    getAppTableCount(sqlite) > 0 &&
-    isCurrentSchemaSnapshot(sqlite)
-  );
+function detectConfirmedBaselineMigrationCount(sqlite: SqliteConnection): number {
+  if (getRecordedMigrationCount(sqlite) !== 0 || getAppTableCount(sqlite) === 0) return 0;
+  if (!isCurrentSchemaSnapshot(sqlite)) return 0;
+
+  // Legacy application schema is confirmed through 0053. Newer platform
+  // migrations are recorded only when their own tables/columns exist. Never
+  // mark migrations as applied merely because an unrelated application table
+  // exists.
+  const markers = [
+    tableExists(sqlite, "resource_pools")
+      && tableExists(sqlite, "generation_jobs")
+      && tableExists(sqlite, "workflow_package_revisions"),
+    tableExists(sqlite, "key_references"),
+    tableExists(sqlite, "visual_subjects") && tableExists(sqlite, "visual_subject_versions"),
+    columnExists(sqlite, "workflow_package_revisions", "workflow_api_json")
+      && columnExists(sqlite, "generation_jobs", "idempotency_key")
+      && columnExists(sqlite, "generation_attempts", "job_claim_fencing_token")
+      && tableExists(sqlite, "voice_profiles")
+      && tableExists(sqlite, "workflow_backend_validations")
+      && schemaObjectExists(sqlite, "index", "generation_jobs_idempotency_unique")
+      && schemaObjectExists(sqlite, "index", "generation_jobs_active_dedupe_unique")
+      && schemaObjectExists(sqlite, "trigger", "generation_job_terminal_status_guard"),
+    tableExists(sqlite, "source_media_assets")
+      && tableExists(sqlite, "generation_job_source_assets")
+      && columnExists(sqlite, "voice_profiles", "reference_source_asset_id")
+      && schemaObjectExists(sqlite, "index", "source_media_assets_storage_key_unique")
+      && schemaObjectExists(sqlite, "index", "source_media_assets_owner_project_idx")
+      && schemaObjectExists(sqlite, "index", "generation_job_source_assets_asset_idx"),
+    columnExists(sqlite, "generation_jobs", "idempotency_request_digest")
+      && columnExists(sqlite, "voice_profiles", "consent_statement_version")
+      && schemaObjectExists(sqlite, "index", "source_media_assets_status_updated_idx")
+      && schemaObjectExists(sqlite, "index", "voice_profiles_reference_source_asset_idx")
+      && schemaObjectExists(sqlite, "index", "generation_jobs_claim_queue_idx")
+      && [
+        "source_media_assets_validate_insert", "source_media_assets_validate_update",
+        "source_media_assets_status_transition_guard", "voice_profiles_validate_insert",
+        "voice_profiles_validate_update", "voice_profiles_immutable_identity_guard",
+        "voice_profiles_source_reference_guard_insert", "voice_profiles_source_reference_guard_update",
+        "generation_job_source_assets_guard_insert", "source_media_assets_delete_reference_guard",
+        "source_media_assets_immutable_content_guard", "generation_jobs_idempotency_digest_guard_insert",
+        "generation_jobs_idempotency_digest_guard_update", "generation_jobs_idempotency_identity_guard",
+      ].every((name) => schemaObjectExists(sqlite, "trigger", name)),
+  ];
+  const firstMissing = markers.indexOf(false);
+  if (firstMissing >= 0 && markers.slice(firstMissing + 1).some(Boolean)) {
+    throw new Error(`Database schema drift: migration ${55 + firstMissing} is incomplete while a later migration is present`);
+  }
+  return 54 + (firstMissing < 0 ? markers.length : firstMissing);
 }
 
 function baselineMigrations(
   sqlite: SqliteConnection,
   migrationsFolder: string,
+  confirmedCount: number,
 ) {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { readMigrationFiles } = require("drizzle-orm/migrator") as {
@@ -142,28 +193,49 @@ function baselineMigrations(
   };
 
   const migrations = readMigrationFiles({ migrationsFolder });
+  if (confirmedCount > migrations.length) {
+    throw new Error(`Confirmed migration count ${confirmedCount} exceeds available migrations ${migrations.length}`);
+  }
   const insert = sqlite.prepare<[string, number]>(
     'INSERT INTO "__drizzle_migrations" ("hash", "created_at") VALUES (?, ?)',
   );
 
   sqlite.transaction(() => {
-    for (const migration of migrations) {
+    for (const migration of migrations.slice(0, confirmedCount)) {
       insert.run(migration.hash, migration.folderMillis);
     }
   })();
+}
+
+function validateRecordedMigrationPrefix(sqlite: SqliteConnection, migrationsFolder: string): void {
+  const rows = sqlite.prepare<[], { hash: string; createdAt: number }>(
+    'SELECT hash, created_at AS createdAt FROM "__drizzle_migrations" ORDER BY created_at, rowid',
+  ).all();
+  if (!rows.length) return;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readMigrationFiles } = require("drizzle-orm/migrator") as {
+    readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMeta[];
+  };
+  const migrations = readMigrationFiles({ migrationsFolder });
+  if (rows.length > migrations.length) throw new Error("Migration journal is ahead of this application build");
+  rows.forEach((row, index) => {
+    const expected = migrations[index];
+    if (row.hash !== expected.hash || Number(row.createdAt) !== expected.folderMillis) {
+      throw new Error(`Migration journal drift at index ${index}; refusing to guess schema state`);
+    }
+  });
 }
 
 export function runMigrations() {
   const sqlite = getSqlite();
   const migrationsFolder = path.resolve("drizzle");
   ensureMigrationsTable(sqlite);
+  validateRecordedMigrationPrefix(sqlite, migrationsFolder);
 
-  if (shouldBaselineExistingSchema(sqlite)) {
-    console.log(
-      "[DB] Existing schema detected without migration history. Baselining migrations...",
-    );
-    baselineMigrations(sqlite, migrationsFolder);
-    return;
+  const confirmedBaselineCount = detectConfirmedBaselineMigrationCount(sqlite);
+  if (confirmedBaselineCount > 0) {
+    console.log(`[DB] Existing schema detected. Baselining ${confirmedBaselineCount} confirmed migrations...`);
+    baselineMigrations(sqlite, migrationsFolder, confirmedBaselineCount);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports

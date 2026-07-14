@@ -38,7 +38,7 @@ export async function handleCharacterExtract(task: Task) {
     projectId: payload.projectId,
   });
 
-  const ai = resolveAIProvider(payload.modelConfig);
+  const ai = await resolveAIProvider(payload.modelConfig);
   const result = await ai.generateText(
     buildCharacterExtractPrompt(payload.screenplay),
     { systemPrompt, temperature: 0.5 }

@@ -1,4 +1,5 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const projects = sqliteTable("projects", {
   id: text("id").primaryKey(),
@@ -471,12 +472,15 @@ export const workflowPackageRevisions = sqliteTable("workflow_package_revisions"
   capability: text("capability", {
     enum: ["image", "video", "speech", "utility"],
   }).notNull(),
+  workflowApiJson: text("workflow_api_json", { mode: "json" }).notNull(),
   manifestJson: text("manifest_json", { mode: "json" }).notNull(),
   compiledBindingsJson: text("compiled_bindings_json", { mode: "json" }).notNull(),
   packageLockJson: text("package_lock_json", { mode: "json" }).notNull(),
   packagePath: text("package_path").notNull(),
   workflowSha256: text("workflow_sha256").notNull(),
   environmentLockDigest: text("environment_lock_digest"),
+  compilerVersion: text("compiler_version").notNull().default("1.0.0"),
+  compiledAtMs: integer("compiled_at_ms").notNull().default(0),
   createdAtMs: integer("created_at_ms").notNull(),
 });
 
@@ -491,6 +495,22 @@ export const workflowPackageStates = sqliteTable("workflow_package_states", {
   reviewedBy: text("reviewed_by"),
   reviewedAtMs: integer("reviewed_at_ms"),
   revokedAtMs: integer("revoked_at_ms"),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const workflowBackendValidations = sqliteTable("workflow_backend_validations", {
+  id: text("id").primaryKey(),
+  workflowPackageDigest: text("workflow_package_digest")
+    .notNull()
+    .references(() => workflowPackageRevisions.digest, { onDelete: "cascade" }),
+  executionBackendId: text("execution_backend_id")
+    .notNull()
+    .references(() => executionBackends.id, { onDelete: "cascade" }),
+  environmentFingerprint: text("environment_fingerprint").notNull(),
+  environmentLockDigest: text("environment_lock_digest"),
+  reviewerId: text("reviewer_id").notNull(),
+  reportJson: text("report_json", { mode: "json" }).notNull(),
+  validatedAtMs: integer("validated_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 });
 
@@ -543,6 +563,10 @@ export const generationJobs = sqliteTable("generation_jobs", {
   id: text("id").primaryKey(),
   businessTaskId: text("business_task_id"),
   projectId: text("project_id"),
+  requestedBy: text("requested_by"),
+  idempotencyKey: text("idempotency_key"),
+  idempotencyRequestDigest: text("idempotency_request_digest"),
+  metadataJson: text("metadata_json", { mode: "json" }).notNull().default({}),
   capability: text("capability", {
     enum: ["text", "image", "video", "speech", "utility"],
   }).notNull(),
@@ -562,7 +586,9 @@ export const generationJobs = sqliteTable("generation_jobs", {
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
   completedAtMs: integer("completed_at_ms"),
-});
+}, (table) => [
+  index("generation_jobs_claim_queue_idx").on(table.status, table.capability, table.createdAtMs),
+]);
 
 export const generationAttempts = sqliteTable("generation_attempts", {
   id: text("id").primaryKey(),
@@ -570,6 +596,7 @@ export const generationAttempts = sqliteTable("generation_attempts", {
     .notNull()
     .references(() => generationJobs.id, { onDelete: "cascade" }),
   attemptNo: integer("attempt_no").notNull(),
+  jobClaimFencingToken: integer("job_claim_fencing_token").notNull().default(0),
   phase: text("phase", {
     enum: [
       "CREATED", "LEASED", "PREPARING", "SUBMITTING",
@@ -645,7 +672,67 @@ export const generationArtifacts = sqliteTable("generation_artifacts", {
   parentArtifactId: text("parent_artifact_id"),
   committedAtMs: integer("committed_at_ms"),
   createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
 });
+
+/** User-supplied immutable media used as controlled workflow input. */
+export const sourceMediaAssets = sqliteTable("source_media_assets", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  kind: text("kind", { enum: ["image", "video", "audio"] }).notNull(),
+  status: text("status", { enum: ["STAGING", "COMMITTED", "QUARANTINED", "DELETED"] }).notNull(),
+  storageKey: text("storage_key").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  sha256: text("sha256").notNull(),
+  durationMs: integer("duration_ms"),
+  metadataJson: text("metadata_json", { mode: "json" }).notNull().default({}),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+}, (table) => [
+  uniqueIndex("source_media_assets_storage_key_unique").on(table.storageKey),
+  index("source_media_assets_owner_project_idx").on(table.userId, table.projectId, table.status),
+  index("source_media_assets_status_updated_idx").on(table.status, table.updatedAtMs),
+]);
+
+export const generationJobSourceAssets = sqliteTable("generation_job_source_assets", {
+  jobId: text("job_id").notNull().references(() => generationJobs.id, { onDelete: "cascade" }),
+  sourceAssetId: text("source_asset_id").notNull().references(() => sourceMediaAssets.id),
+  role: text("role").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.jobId, table.sourceAssetId, table.role] }),
+  index("generation_job_source_assets_asset_idx").on(table.sourceAssetId, table.jobId),
+]);
+
+export const voiceProfiles = sqliteTable("voice_profiles", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  name: text("name").notNull(),
+  provider: text("provider").notNull(),
+  /** Legacy generated-audio reference, retained for backwards compatibility. */
+  referenceArtifactId: text("reference_artifact_id").references(() => generationArtifacts.id),
+  /** Preferred user-uploaded immutable source asset. */
+  referenceSourceAssetId: text("reference_source_asset_id").references(() => sourceMediaAssets.id),
+  referenceText: text("reference_text"),
+  language: text("language").notNull().default("zh-CN"),
+  defaultSpeed: integer("default_speed_milli").notNull().default(1000),
+  defaultPitch: integer("default_pitch_milli").notNull().default(1000),
+  consentConfirmedAtMs: integer("consent_confirmed_at_ms").notNull(),
+  consentStatementVersion: text("consent_statement_version").notNull().default("voice-clone-consent-v1"),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+}, (table) => [
+  index("voice_profiles_project_user_index").on(table.projectId, table.userId),
+  index("voice_profiles_reference_source_asset_idx").on(table.referenceSourceAssetId),
+  check(
+    "voice_profiles_exactly_one_reference_check",
+    sql`((${table.referenceArtifactId} IS NOT NULL AND ${table.referenceSourceAssetId} IS NULL) OR (${table.referenceArtifactId} IS NULL AND ${table.referenceSourceAssetId} IS NOT NULL))`,
+  ),
+]);
+
 
 export const generationEvents = sqliteTable("generation_events", {
   id: text("id").primaryKey(),
@@ -687,7 +774,7 @@ export const keyReferences = sqliteTable("key_references", {
   keyType: text("key_type", {
     enum: ["bearer", "header-token", "basic", "mtls-key"],
   }).notNull(),
-  /** 加密存储的密钥值（阶段 B 先用明文，后续接入密钥管理服务） */
+  /** AES-256-GCM 加密信封；禁止持久化明文。 */
   secretValue: text("secret_value").notNull(),
   createdBy: text("created_by"),
   createdAtMs: integer("created_at_ms").notNull(),

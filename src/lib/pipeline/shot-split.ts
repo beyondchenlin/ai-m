@@ -70,7 +70,7 @@ export async function handleShotSplit(task: Task) {
     projectId: payload.projectId,
   });
 
-  const ai = resolveAIProvider(payload.modelConfig);
+  const ai = await resolveAIProvider(payload.modelConfig);
   const performanceStyles = projectCharacters
     .filter(c => c.performanceStyle)
     .map(c => ({ name: c.name, performanceStyle: c.performanceStyle! }));

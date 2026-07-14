@@ -65,7 +65,7 @@ describe("v2.0 Regression Baseline: 后端解析", () => {
   });
 
   afterAll(() => {
-    ctx.cleanup();
+    ctx?.cleanup();
   });
 
   beforeEach(async () => {
@@ -226,9 +226,8 @@ describe("v2.0 Regression Baseline: 执行后端适配器映射", () => {
         baseUrl: "https://test.example.com",
         apiKey: "test-key",
         capability: "image",
-        enabled: true,
-        modelId: "test-model",
-      } as Parameters<typeof providerToBackendParams>[0]);
+        models: [{ id: "test-model", name: "Test Model", checked: true }],
+      });
 
       expect(typeof params.id).toBe("string");
       expect(params.adapterKind.endsWith("-http")).toBe(true);

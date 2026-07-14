@@ -71,7 +71,7 @@ export async function handleFrameGenerate(task: Task) {
     .orderBy(desc(shots.sequence))
     .limit(1);
 
-  const ai = resolveImageProvider(payload.modelConfig);
+  const ai = await resolveImageProvider(payload.modelConfig);
 
   const userId = payload.userId ?? "";
   const projectId = payload.projectId;

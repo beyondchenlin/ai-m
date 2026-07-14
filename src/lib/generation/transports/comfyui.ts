@@ -6,7 +6,9 @@
  */
 
 import { isEnabled, FF } from "@/lib/feature-flags";
-import { validateBackendUrl } from "@/lib/security/network-policy";
+import { validateBackendUrlResolved } from "@/lib/security/network-policy";
+import net from "node:net";
+import { Agent, fetch as undiciFetch, FormData as UndiciFormData, WebSocket as UndiciWebSocket } from "undici";
 
 /** ComfyUI 提示词提交请求 */
 export interface ComfyPromptRequest {
@@ -87,14 +89,18 @@ export type ComfyWSMessage =
   | { type: "execution_start"; data: { prompt_id: string } }
   | { type: "execution_cached"; data: { prompt_id: string; nodes: string[] } }
   | { type: "executing"; data: { node: string | null; prompt_id: string } }
-  | { type: "progress"; data: { node: string; value: number; max: number } }
+  | { type: "progress"; data: { prompt_id: string; node: string; value: number; max: number } }
   | { type: "executed"; data: { prompt_id: string; node: string; output: Record<string, unknown> } }
   | { type: "execution_error"; data: { prompt_id: string; node_id: string; node_type: string; exception_message: string; traceback: string[] } };
 
 /** 传输适配器接口 */
 export interface ComfyUITransport {
-  /** 代理请求到 ComfyUI */
+  /** Read one allow-listed ComfyUI resource. */
+  get(path: string): Promise<Response>;
+  /** Mutate one allow-listed ComfyUI resource. */
   post(path: string, body: unknown): Promise<Response>;
+  /** Upload a bounded image into the ComfyUI input namespace. */
+  uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }): Promise<{ name: string; subfolder: string; type: string }>;
   /** 获取文件 */
   getFile(params: { filename: string; subfolder: string; type: string }): Promise<Response>;
   /** 建立 WebSocket 连接 */
@@ -107,16 +113,43 @@ export interface ComfyUITransport {
   close(): void;
 }
 
+function assertSafeComfyFilePart(value: string, field: string, allowEmpty = false): void {
+  if (allowEmpty && value === "") return;
+  if (!value || value.includes("\0") || value.includes("/") || value.includes("\\") || value === "." || value === "..") {
+    throw new Error(`Invalid ComfyUI ${field}`);
+  }
+  if (value.length > 255) throw new Error(`ComfyUI ${field} is too long`);
+}
+
+function assertSafeSubfolder(value: string): void {
+  if (!value) return;
+  if (value.includes("\0") || value.startsWith("/") || value.startsWith("\\")) throw new Error("Invalid ComfyUI subfolder");
+  const parts = value.replace(/\\/g, "/").split("/");
+  if (parts.some((part) => !part || part === "." || part === ".." || part.length > 120)) throw new Error("Invalid ComfyUI subfolder");
+}
+
 /** HTTP 传输实现 */
 export class ComfyUIHttpTransport implements ComfyUITransport {
   private readonly baseUrl: string;
   private readonly controller: AbortController;
+  private readonly headers: Readonly<Record<string, string>>;
+  private readonly dispatcher: Agent | undefined;
   private ws: WebSocket | null = null;
   private clientId: string;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, headers: Record<string, string> = {}, approvedAddresses: readonly string[] = []) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.controller = new AbortController();
+    this.headers = Object.freeze({ ...headers });
+    const addresses = [...new Set(approvedAddresses)].map((address) => ({
+      address, family: net.isIP(address) as 4 | 6,
+    })).filter((item) => item.family === 4 || item.family === 6);
+    this.dispatcher = addresses.length ? new Agent({ connect: {
+      lookup: (_hostname, lookupOptions, callback) => {
+        if (typeof lookupOptions === "object" && lookupOptions.all) callback(null, addresses);
+        else callback(null, addresses[0].address, addresses[0].family);
+      },
+    } }) : undefined;
     this.clientId = this.generateClientId();
   }
 
@@ -124,25 +157,86 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     return `ai-m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  private url(path: string): string {
+    return `${this.baseUrl}${path}`;
+  }
+
+  async get(path: string): Promise<Response> {
+    const allowed = path === "/system_stats" || path === "/object_info" || path === "/queue"
+      || /^\/history\/[A-Za-z0-9._:-]+$/.test(path)
+      || /^\/models\/[A-Za-z0-9._-]+$/.test(path);
+    if (!allowed) throw new Error(`ComfyUI GET endpoint is not allowed: ${path}`);
+    return undiciFetch(this.url(path), {
+      method: "GET",
+      headers: this.headers,
+      signal: this.controller.signal,
+      redirect: "manual",
+      dispatcher: this.dispatcher,
+    }) as unknown as Promise<Response>;
+  }
+
   async post(path: string, body: unknown): Promise<Response> {
-    const url = `${this.baseUrl}${path}`;
-    return fetch(url, {
+    const allowed = path === "/prompt" || path === "/interrupt" || path === "/queue" || path === "/free";
+    if (!allowed) throw new Error(`ComfyUI POST endpoint is not allowed: ${path}`);
+    return undiciFetch(this.url(path), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...this.headers, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: this.controller.signal,
-    });
+      redirect: "manual",
+      dispatcher: this.dispatcher,
+    }) as unknown as Promise<Response>;
+  }
+
+  async uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }): Promise<{ name: string; subfolder: string; type: string }> {
+    assertSafeComfyFilePart(input.filename, "upload filename");
+    assertSafeSubfolder(input.subfolder ?? "");
+    if (!/^image\/(png|jpeg|webp)$/.test(input.mimeType)) throw new Error("Unsupported ComfyUI upload MIME type");
+    if (input.bytes.byteLength <= 0 || input.bytes.byteLength > 20 * 1024 * 1024) throw new Error("ComfyUI upload size is invalid");
+    const form = new UndiciFormData();
+    // Copy to an owned ArrayBuffer so callers cannot mutate an in-flight body.
+    const uploadBytes = Uint8Array.from(input.bytes);
+    form.set("image", new Blob([uploadBytes.buffer], { type: input.mimeType }), input.filename);
+    form.set("type", "input");
+    form.set("overwrite", "false");
+    if (input.subfolder) form.set("subfolder", input.subfolder);
+    const response = await undiciFetch(this.url("/upload/image"), {
+      method: "POST", headers: this.headers, body: form, signal: this.controller.signal, redirect: "manual",
+      dispatcher: this.dispatcher,
+    }) as unknown as Response;
+    if (!response.ok) throw new Error(`ComfyUI image upload failed (${response.status})`);
+    const result = await readJsonLimited<Record<string, unknown>>(response, 256 * 1024);
+    const name = typeof result.name === "string" ? result.name : "";
+    const subfolder = typeof result.subfolder === "string" ? result.subfolder : "";
+    const type = typeof result.type === "string" ? result.type : "";
+    assertSafeComfyFilePart(name, "uploaded filename");
+    assertSafeSubfolder(subfolder);
+    if (type !== "input") throw new Error("ComfyUI image upload returned an unexpected storage type");
+    return { name, subfolder, type };
   }
 
   async getFile(params: { filename: string; subfolder: string; type: string }): Promise<Response> {
+    assertSafeComfyFilePart(params.filename, "output filename");
+    assertSafeSubfolder(params.subfolder);
+    if (!new Set(["output", "temp", "input"]).has(params.type)) throw new Error("Invalid ComfyUI output type");
     const query = new URLSearchParams(params).toString();
-    const url = `${this.baseUrl}/view?${query}`;
-    return fetch(url, { signal: this.controller.signal });
+    return undiciFetch(this.url(`/view?${query}`), {
+      method: "GET",
+      headers: this.headers,
+      signal: this.controller.signal,
+      redirect: "manual",
+      dispatcher: this.dispatcher,
+    }) as unknown as Promise<Response>;
   }
 
   connectWebSocket(): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${this.clientId}`;
-    this.ws = new WebSocket(wsUrl);
+    const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(this.clientId)}`;
+    // Browser WebSocket cannot attach arbitrary auth headers. Remote authenticated
+    // backends must use a same-origin gateway or a short-lived URL credential.
+    this.ws = new UndiciWebSocket(wsUrl, {
+      dispatcher: this.dispatcher,
+      headers: this.headers,
+    }) as unknown as WebSocket;
     return this.ws;
   }
 
@@ -160,10 +254,46 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       this.ws.close();
       this.ws = null;
     }
+    void this.dispatcher?.close();
   }
 
   getClientId(): string {
     return this.clientId;
+  }
+}
+
+
+export async function readTextLimited(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error(`ComfyUI response exceeds ${maxBytes} bytes`);
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(merged);
+}
+
+async function readJsonLimited<T>(response: Response, maxBytes: number): Promise<T> {
+  const text = await readTextLimited(response, maxBytes);
+  try {
+    return JSON.parse(text || "null") as T;
+  } catch {
+    throw new Error(`ComfyUI returned invalid JSON (${Math.min(text.length, maxBytes)} bytes)`);
   }
 }
 
@@ -184,57 +314,117 @@ export async function submitPrompt(
   const response = await transport.post("/prompt", body);
 
   if (!response.ok) {
-    const text = await response.text();
+    const text = await readTextLimited(response, 64 * 1024);
     throw new Error(`ComfyUI prompt submission failed (${response.status}): ${text}`);
   }
 
-  const raw = (await response.json()) as Record<string, unknown>;
+  const raw = await readJsonLimited<Record<string, unknown>>(response, 2 * 1024 * 1024);
 
   // ComfyUI 原生返回 snake_case，统一映射到本地 camelCase 类型
-  const promptId = (raw.prompt_id as string) ?? (raw.promptId as string);
-  const number = (raw.number as number) ?? (raw.queue_remaining as number);
-  const queueRemaining = (raw.queue_remaining as number) ?? (raw.number as number);
-  const nodeErrorsRaw = (raw.node_errors ?? raw.nodeErrors) as
-    | Record<string, { classType: string; errors: { details: string }[] }>
-    | undefined;
-
-  const result: ComfyPromptResponse = {
-    promptId: promptId ?? "",
-    number,
-    queueRemaining,
-    nodeErrors: nodeErrorsRaw,
-  };
-
-  if (result.promptId === "") {
-    throw new Error("ComfyUI prompt submission returned no prompt_id");
+  const promptId = typeof raw.prompt_id === "string"
+    ? raw.prompt_id
+    : typeof raw.promptId === "string" ? raw.promptId : "";
+  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(promptId)) {
+    throw new Error("ComfyUI prompt submission returned an invalid prompt_id");
   }
-
-  if (result.nodeErrors && Object.keys(result.nodeErrors).length > 0) {
-    const errors = Object.entries(result.nodeErrors)
-      .map(([nodeId, err]) => `${nodeId}: ${err.errors.map((e) => e.details).join(", ")}`)
-      .join("; ");
+  const number = typeof raw.number === "number" && Number.isFinite(raw.number) ? raw.number : undefined;
+  const queueRemaining = typeof raw.queue_remaining === "number" && Number.isFinite(raw.queue_remaining)
+    ? raw.queue_remaining
+    : undefined;
+  const nodeErrorsValue = raw.node_errors ?? raw.nodeErrors;
+  const nodeErrorsRaw = nodeErrorsValue && typeof nodeErrorsValue === "object" && !Array.isArray(nodeErrorsValue)
+    ? nodeErrorsValue as Record<string, unknown>
+    : {};
+  if (Object.keys(nodeErrorsRaw).length > 0) {
+    const errors = Object.entries(nodeErrorsRaw).map(([nodeId, value]) => {
+      const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      const details = Array.isArray(record.errors)
+        ? record.errors.map((entry) => {
+            if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+              const detail = (entry as Record<string, unknown>).details;
+              if (typeof detail === "string") return detail.slice(0, 500);
+            }
+            return "validation error";
+          })
+        : ["validation error"];
+      return `${nodeId.slice(0, 80)}: ${details.join(", ")}`;
+    }).join("; ");
     throw new Error(`ComfyUI workflow validation errors: ${errors}`);
   }
+
+  const result: ComfyPromptResponse = { promptId, number, queueRemaining };
 
   return result;
 }
 
 /** 行为探测：获取系统信息 */
 export async function probeSystemInfo(transport: ComfyUITransport): Promise<ComfySystemInfo> {
-  const response = await transport.post("/system_stats", {});
-  if (!response.ok) {
-    throw new Error(`ComfyUI system probe failed (${response.status})`);
-  }
-  return response.json() as Promise<ComfySystemInfo>;
+  const response = await transport.get("/system_stats");
+  if (!response.ok) throw new Error(`ComfyUI system probe failed (${response.status})`);
+  const result = await readJsonLimited<unknown>(response, 1024 * 1024);
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("ComfyUI system probe returned an invalid payload");
+  return result as ComfySystemInfo;
 }
 
 /** 行为探测：获取节点对象信息 */
 export async function probeObjectInfo(transport: ComfyUITransport): Promise<ComfyObjectInfo> {
-  const response = await transport.post("/object_info", {});
-  if (!response.ok) {
-    throw new Error(`ComfyUI object_info probe failed (${response.status})`);
+  const response = await transport.get("/object_info");
+  if (!response.ok) throw new Error(`ComfyUI object_info probe failed (${response.status})`);
+  const result = await readJsonLimited<unknown>(response, 16 * 1024 * 1024);
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("ComfyUI object_info probe returned an invalid payload");
+  return result as ComfyObjectInfo;
+}
+
+/** Return the exact model filenames exposed by one allow-listed ComfyUI model folder. */
+export async function probeModelFolder(transport: ComfyUITransport, folder: string): Promise<string[]> {
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(folder)) throw new Error("Invalid ComfyUI model folder");
+  const response = await transport.get(`/models/${folder}`);
+  if (!response.ok) throw new Error(`ComfyUI model probe failed (${response.status})`);
+  const result = await readJsonLimited<unknown>(response, 4 * 1024 * 1024);
+  if (!Array.isArray(result) || result.length > 100_000) throw new Error("ComfyUI model probe returned an invalid payload");
+  const models = result.map((value) => {
+    if (typeof value !== "string" || value.length < 1 || value.length > 1024 || value.includes("\0")) {
+      throw new Error("ComfyUI model probe returned an unsafe filename");
+    }
+    return value.replace(/\\/g, "/");
+  });
+  return [...new Set(models)];
+}
+
+export interface ComfyQueueEntry {
+  promptId: string;
+  correlationId?: string;
+  queueNumber?: number;
+  raw: unknown;
+}
+
+function normalizeQueueEntry(value: unknown): ComfyQueueEntry | null {
+  if (Array.isArray(value)) {
+    const promptId = typeof value[1] === "string" ? value[1] : "";
+    if (!promptId) return null;
+    const extra = value[3] && typeof value[3] === "object" && !Array.isArray(value[3])
+      ? value[3] as Record<string, unknown>
+      : {};
+    const nested = extra.extra_data && typeof extra.extra_data === "object" && !Array.isArray(extra.extra_data)
+      ? extra.extra_data as Record<string, unknown>
+      : {};
+    const correlationId = typeof extra.correlation_id === "string"
+      ? extra.correlation_id
+      : typeof nested.correlation_id === "string" ? nested.correlation_id : undefined;
+    return { promptId, correlationId, queueNumber: typeof value[0] === "number" ? value[0] : undefined, raw: value };
   }
-  return response.json() as Promise<ComfyObjectInfo>;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const promptId = typeof record.prompt_id === "string"
+      ? record.prompt_id
+      : typeof record.promptId === "string" ? record.promptId : typeof record.id === "string" ? record.id : "";
+    if (!promptId) return null;
+    const correlationId = typeof record.correlation_id === "string"
+      ? record.correlation_id
+      : typeof record.correlationId === "string" ? record.correlationId : undefined;
+    return { promptId, correlationId, queueNumber: typeof record.number === "number" ? record.number : undefined, raw: value };
+  }
+  return null;
 }
 
 /** 行为探测：获取队列状态 */
@@ -242,18 +432,18 @@ export async function probeQueueStatus(
   transport: ComfyUITransport,
   correlationId?: string,
 ): Promise<{
-  queueRunning: Array<unknown>;
-  queuePending: Array<unknown>;
+  queueRunning: ComfyQueueEntry[];
+  queuePending: ComfyQueueEntry[];
 }> {
-  const body = correlationId ? { correlation_id: correlationId } : {};
-  const response = await transport.post("/queue", body);
-  if (!response.ok) {
-    throw new Error(`ComfyUI queue probe failed (${response.status})`);
-  }
-  const data = (await response.json()) as Record<string, unknown>;
+  const response = await transport.get("/queue");
+  if (!response.ok) throw new Error(`ComfyUI queue probe failed (${response.status})`);
+  const data = await readJsonLimited<Record<string, unknown>>(response, 8 * 1024 * 1024);
+  void correlationId;
+  const runningRaw = Array.isArray(data.queue_running) ? data.queue_running : [];
+  const pendingRaw = Array.isArray(data.queue_pending) ? data.queue_pending : [];
   return {
-    queueRunning: (data.queue_running as Array<unknown>) ?? [],
-    queuePending: (data.queue_pending as Array<unknown>) ?? [],
+    queueRunning: runningRaw.map(normalizeQueueEntry).filter((item): item is ComfyQueueEntry => Boolean(item)),
+    queuePending: pendingRaw.map(normalizeQueueEntry).filter((item): item is ComfyQueueEntry => Boolean(item)),
   };
 }
 
@@ -263,40 +453,36 @@ export async function probeHistory(
   promptId: string,
   correlationId?: string,
 ): Promise<Record<string, ComfyExecutionResult>> {
-  const body = correlationId ? { correlation_id: correlationId } : {};
-  const response = await transport.post(`/history/${promptId}`, body);
-  if (!response.ok) {
-    throw new Error(`ComfyUI history probe failed (${response.status})`);
-  }
-  return response.json();
-}
-
-/** 下载输出文件 */
-export async function downloadOutput(
-  transport: ComfyUITransport,
-  output: { filename: string; subfolder: string; type: string },
-): Promise<ArrayBuffer> {
-  const response = await transport.getFile(output);
-  if (!response.ok) {
-    throw new Error(`ComfyUI file download failed (${response.status}): ${output.filename}`);
-  }
-  return response.arrayBuffer();
+  if (!/^[A-Za-z0-9._:-]+$/.test(promptId)) throw new Error("Invalid ComfyUI prompt ID");
+  const response = await transport.get(`/history/${promptId}`);
+  if (!response.ok) throw new Error(`ComfyUI history probe failed (${response.status})`);
+  void correlationId;
+  return readJsonLimited<Record<string, ComfyExecutionResult>>(response, 16 * 1024 * 1024);
 }
 
 /** 创建 ComfyUI 传输适配器（带地址校验） */
 export async function createComfyUITransport(
   baseUrl: string,
   topology: string,
+  headers: Record<string, string> = {},
+  expectedResolvedAddresses: readonly string[] = [],
 ): Promise<ComfyUITransport> {
   if (!isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
     throw new Error("v2.0 ComfyUI transport is not enabled");
   }
 
   // SSRF 防护
-  const validation = validateBackendUrl(baseUrl, topology);
+  const validation = await validateBackendUrlResolved(baseUrl, topology as import("@/lib/security/network-policy").BackendTopology);
   if (!validation.valid) {
-    throw new Error(`Invalid ComfyUI backend URL: ${validation.error}`);
+    throw new Error(`Invalid ComfyUI backend URL: ${validation.errors.join("; ")}`);
+  }
+  if (expectedResolvedAddresses.length) {
+    const expected = [...new Set(expectedResolvedAddresses)].sort();
+    const actual = [...new Set(validation.resolvedAddresses)].sort();
+    if (expected.length !== actual.length || expected.some((address, index) => address !== actual[index])) {
+      throw new Error("ComfyUI backend DNS resolution differs from the approved backend revision");
+    }
   }
 
-  return new ComfyUIHttpTransport(baseUrl);
+  return new ComfyUIHttpTransport(baseUrl, headers, validation.resolvedAddresses);
 }

@@ -81,6 +81,30 @@ export class FakeComfyUITransport implements ComfyUITransport {
     );
   }
 
+  async get(path: string): Promise<Response> {
+    if (path === "/system_stats") {
+      return jsonResponse(this.scenario.systemInfo ?? {
+        system: { comfy_version: "0.0.1" },
+        devices: [{ name: "Fake GPU", type: "cuda", index: 0, vramTotal: 8 * 1024 * 1024 * 1024 }],
+      });
+    }
+    if (path === "/object_info") {
+      return jsonResponse(this.scenario.objectInfo ?? {
+        CheckpointLoaderSimple: {
+          input: { required: { ckpt_name: ["test.safetensors"] } }, output: ["MODEL", "CLIP", "VAE"],
+          output_is_list: [false, false, false], output_name: ["MODEL", "CLIP", "VAE"],
+          name: "CheckpointLoaderSimple", display_name: "Load Checkpoint", description: "", category: "loaders", output_node: false,
+        },
+      });
+    }
+    if (path === "/queue") return jsonResponse({ queue_running: this.scenario.queueRunning ?? [], queue_pending: this.scenario.queuePending ?? [] });
+    if (path.startsWith("/history/")) {
+      const id = path.split("/")[2];
+      return jsonResponse(id && this.scenario.history?.[id] ? { [id]: this.scenario.history[id] } : {});
+    }
+    return emptyResponse(404);
+  }
+
   async post(path: string, body: unknown): Promise<Response> {
     if (path === "/prompt") {
       if (this.scenario.submitError) {
@@ -133,6 +157,13 @@ export class FakeComfyUITransport implements ComfyUITransport {
     }
 
     if (path === "/queue") {
+      const payload = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+      const deletions = Array.isArray(payload.delete) ? payload.delete.filter((item): item is string => typeof item === "string") : [];
+      if (deletions.length) {
+        this.scenario.queueRunning = (this.scenario.queueRunning ?? []).filter((item) => !deletions.includes(item.prompt_id));
+        this.scenario.queuePending = (this.scenario.queuePending ?? []).filter((item) => !deletions.includes(item.prompt_id));
+        return emptyResponse(200);
+      }
       const correlatedPromptId = this.resolveCorrelation(body);
       const running = this.scenario.queueRunning ?? [];
       const pending = this.scenario.queuePending ?? [];
@@ -171,6 +202,11 @@ export class FakeComfyUITransport implements ComfyUITransport {
     }
 
     return emptyResponse(404);
+  }
+
+  async uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }): Promise<{ name: string; subfolder: string; type: string }> {
+    if (input.bytes.byteLength === 0) throw new Error("empty upload");
+    return { name: input.filename, subfolder: input.subfolder ?? "", type: "input" };
   }
 
   async getFile(): Promise<Response> {

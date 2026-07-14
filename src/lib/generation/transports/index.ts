@@ -3,9 +3,9 @@ export {
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
+  probeModelFolder,
   probeQueueStatus,
   probeHistory,
-  downloadOutput,
   createComfyUITransport,
 } from "./comfyui";
 export type {

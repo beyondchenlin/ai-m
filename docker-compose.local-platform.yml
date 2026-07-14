@@ -1,0 +1,34 @@
+services:
+  web:
+    build: .
+    command: ["node", "server.js"]
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: file:/app/data/aicomic.db
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - ai_m_data:/app/data
+      - ai_m_uploads:/app/uploads
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "dist/worker/index.cjs"]
+    env_file: .env
+    environment:
+      DATABASE_URL: file:/app/data/aicomic.db
+      UPLOAD_DIR: /app/uploads
+      AI_M_COMFYUI_SHARED_INPUT_ROOT: /app/comfyui-input
+    volumes:
+      - ai_m_data:/app/data
+      - ai_m_uploads:/app/uploads
+      - ${COMFYUI_INPUT_DIR:-./data/comfyui-input}:/app/comfyui-input
+    restart: unless-stopped
+    depends_on:
+      - web
+
+volumes:
+  ai_m_data:
+  ai_m_uploads:

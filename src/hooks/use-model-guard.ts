@@ -11,6 +11,7 @@ const messageKeys: Record<Capability, string> = {
   text: "notConfiguredText",
   image: "notConfiguredImage",
   video: "notConfiguredVideo",
+  speech: "notConfiguredSpeech",
 };
 
 /**

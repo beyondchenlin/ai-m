@@ -8,6 +8,7 @@ import { uploadUrl } from "@/lib/utils/upload-url";
 import { useModelStore } from "@/stores/model-store";
 import { useModelGuard } from "@/hooks/use-model-guard";
 import { apiFetch } from "@/lib/api-fetch";
+import { DialogueSpeechPanel } from "@/components/editor/dialogue-speech-panel";
 import { toast } from "sonner";
 import {
   X,
@@ -365,16 +366,11 @@ export function ShotDrawer({
                 </span>
               </div>
               {shot.dialogues.length > 0 && (
-                <div className="space-y-1 rounded-xl bg-[--surface] p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[--text-muted]">{t("shot.dialogue")}</p>
-                  {shot.dialogues.map((d) => (
-                    <p key={d.id} className="text-sm">
-                      <span className="font-semibold text-primary">{d.characterName}</span>
-                      <span className="mx-1.5 text-[--text-muted]">&mdash;</span>
-                      <span className="text-[--text-secondary]">{d.text}</span>
-                    </p>
-                  ))}
-                </div>
+                <DialogueSpeechPanel
+                  projectId={projectId}
+                  dialogues={shot.dialogues}
+                  onCompleted={onUpdate}
+                />
               )}
               <Button size="xs" variant="outline" onClick={handleRewriteText} disabled={rewritingText || anyGenerating}>
                 {rewritingText ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}

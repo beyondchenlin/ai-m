@@ -9,7 +9,7 @@ import {
   detectImageDimensions,
   detectAudioDuration,
 } from '../content-detection';
-import { validateStorageKey, generateStorageKey } from '../atomic-commit';
+import { isArtifactStorageKeySafe } from '../commit';
 
 describe('PR-06: 安全媒体归档', () => {
   describe('内容检测', () => {
@@ -48,7 +48,7 @@ describe('PR-06: 安全媒体归档', () => {
 
     it('应该正确检测 MP3 文件', () => {
       const mp3Header = new Uint8Array([0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
-      expect(detectMimeType(mp3Header)).toBe('audio/mp3');
+      expect(detectMimeType(mp3Header)).toBe('audio/mpeg');
     });
 
     it('应该正确检测 MP4 文件', () => {
@@ -134,38 +134,18 @@ describe('PR-06: 安全媒体归档', () => {
 
   describe('存储键验证', () => {
     it('应该接受合法的存储键', () => {
-      expect(validateStorageKey('artifacts/abc123/image.png', '/data')).toBe(true);
-      expect(validateStorageKey('images/2024/01/photo.jpg', '/data')).toBe(true);
+      expect(isArtifactStorageKeySafe('attempt/abc123/image.png')).toBe(true);
+      expect(isArtifactStorageKeySafe('.staging/attempt/file.part')).toBe(true);
     });
 
-    it('应该拒绝绝对路径', () => {
-      expect(validateStorageKey('/etc/passwd', '/data')).toBe(false);
-      expect(validateStorageKey('C:\\Windows\\System32', '/data')).toBe(false);
-    });
-
-    it('应该拒绝路径穿越', () => {
-      expect(validateStorageKey('../etc/passwd', '/data')).toBe(false);
-      expect(validateStorageKey('artifacts/../../etc/passwd', '/data')).toBe(false);
-    });
-
-    it('应该拒绝特殊字符', () => {
-      expect(validateStorageKey('file<name.png', '/data')).toBe(false);
-      expect(validateStorageKey('file>name.png', '/data')).toBe(false);
-      expect(validateStorageKey('file:name.png', '/data')).toBe(false);
+    it('应该拒绝绝对路径、路径穿越和特殊字符', () => {
+      expect(isArtifactStorageKeySafe('/etc/passwd')).toBe(false);
+      expect(isArtifactStorageKeySafe('C:\\Windows\\System32')).toBe(false);
+      expect(isArtifactStorageKeySafe('../etc/passwd')).toBe(false);
+      expect(isArtifactStorageKeySafe('artifacts/../../etc/passwd')).toBe(false);
+      expect(isArtifactStorageKeySafe('file<name.png')).toBe(false);
+      expect(isArtifactStorageKeySafe('file:name.png')).toBe(false);
     });
   });
 
-  describe('存储键生成', () => {
-    it('应该生成合法的存储键', () => {
-      const key = generateStorageKey('attempt123', 'image/png', 0);
-      expect(key).toMatch(/^artifacts\/attempt123\/\d+_0_[a-z0-9]+\.png$/);
-    });
-
-    it('应该根据 MIME 类型生成正确的扩展名', () => {
-      expect(generateStorageKey('a', 'image/jpeg', 0)).toMatch(/\.jpg$/);
-      expect(generateStorageKey('a', 'image/webp', 0)).toMatch(/\.webp$/);
-      expect(generateStorageKey('a', 'audio/wav', 0)).toMatch(/\.wav$/);
-      expect(generateStorageKey('a', 'video/mp4', 0)).toMatch(/\.mp4$/);
-    });
-  });
 });

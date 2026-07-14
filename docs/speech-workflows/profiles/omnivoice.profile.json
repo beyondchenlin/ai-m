@@ -1,0 +1,8 @@
+{
+  "speechEngine": "omnivoice",
+  "defaultParameters": {
+    "speed": 1,
+    "pitch": 1,
+    "language": "zh-CN"
+  }
+}

@@ -16,20 +16,9 @@ export {
   getGenerationJob,
   cancelGenerationJob,
   retryGenerationJob,
+  listGenerationJobs,
 } from "./jobs";
 export { LegacyAIProviderFacade, LegacyVideoProviderFacade } from "./adapters/legacy-facade";
-export {
-  ZImageAdapter,
-  createZImageAdapter,
-  buildZImageWorkflow,
-} from "./adapters/zimage";
-export type { QualityWorkflow, ZImageBuildInput } from "./adapters/zimage";
-export {
-  LocalSpeechAdapter,
-  createLocalSpeechAdapter,
-  buildSpeechWorkflow,
-} from "./adapters/local-speech";
-export type { VoiceProfile } from "./adapters/local-speech";
 export {
   LEASE_CONFIG,
   acquireResourceSlot,
@@ -43,7 +32,7 @@ export {
 export {
   validateWorkflowStructure,
   applyStaticPolicy,
-  validateAndCreateWorkflowPackage,
+  assertWorkflowPromotionPolicy,
   captureEnvironmentFingerprint,
   compareEnvironmentFingerprints,
 } from "./workflows";
@@ -57,9 +46,9 @@ export {
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
+  probeModelFolder,
   probeQueueStatus,
   probeHistory,
-  downloadOutput,
   createComfyUITransport,
   probeBackendFeatures,
   isProbeFresh,
@@ -112,6 +101,11 @@ export {
   validateMagicBytes,
   checkArtifactAccess,
   cleanupStagingDir,
+  recoverStagingArtifacts,
+  isArtifactStorageKeySafe,
+  ContentType,
   ContenType,
 } from "./archiving";
 export type { ArtifactStreamInput, ArtifactCommitResult } from "./archiving";
+export { materializeWorkflowInputs } from "./input-materializer";
+export type { MaterializedWorkflowInput } from "./input-materializer";

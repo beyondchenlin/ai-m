@@ -68,7 +68,7 @@ async function createBackendAndPool(capability = "image", capacity = 2) {
     tlsConfigJson: {},
     networkPolicyJson: { allowRedirect: false, allowedHosts: [], allowedCidrs: [] },
     resourcePoolId: poolId,
-    capabilitiesJson: [capability],
+    capabilitiesJson: { capabilities: [capability] },
     createdAtMs: now,
     updatedAtMs: now,
   });
@@ -76,7 +76,7 @@ async function createBackendAndPool(capability = "image", capacity = 2) {
   return { poolId, backendId };
 }
 
-async function createQueuedJob(capability = "image") {
+async function createQueuedJob(capability: typeof generationJobs.$inferInsert.capability = "image") {
   const jobId = crypto.randomUUID();
   const now = Date.now();
   await db.insert(generationJobs).values({
@@ -189,8 +189,10 @@ describe("PR-11: 资源槽位租约", () => {
     const newAttempt = await createAttempt(newJobId, backendId, poolId);
     const slot = await acquireResourceSlot(poolId, newAttempt, "worker-2");
     expect(slot).not.toBeNull();
-    expect(slot!.fencingToken).toBe(2);
-    expect(slot!.slotNo).toBe(1);
+    // Expiry alone cannot prove that external inference stopped. The retained
+    // slot stays fenced; another genuinely free slot may still be used.
+    expect(slot!.fencingToken).toBe(1);
+    expect(slot!.slotNo).toBe(2);
   });
 
   it("续租必须使用正确的 leaseToken 和 fencingToken", async () => {
@@ -328,7 +330,7 @@ describe("PR-11: 工作任务领取", () => {
     await scanExpiredClaims();
 
     const second = (await claimJob("worker-2", "image"))!;
-    expect(second.claimFencingToken).toBe(first.claimFencingToken + 1);
+    expect(second.claimFencingToken).toBe(first.claimFencingToken + 2);
 
     const staleRenew = await renewJobClaim(second.id, "worker-1", first.claimFencingToken);
     expect(staleRenew).toBe(false);
@@ -383,15 +385,20 @@ describe("PR-11: 过期租约恢复扫描", () => {
   it("应恢复过期工作任务并释放过期资源槽位", async () => {
     const { poolId, backendId } = await createBackendAndPool();
     const jobId = await createQueuedJob();
-    const attemptId = await createAttempt(jobId, backendId, poolId);
+    const attemptId = await createAttempt(jobId, backendId, poolId, {
+      phase: "PREPARING",
+      jobClaimFencingToken: 1,
+    });
     const now = Date.now();
 
     await db
       .update(generationJobs)
       .set({
         status: "RUNNING",
+        currentAttemptId: attemptId,
         claimOwner: "ghost-worker",
         claimUntilMs: now - 1,
+        claimFencingToken: 1,
         updatedAtMs: now,
       })
       .where(eq(generationJobs.id, jobId));
@@ -408,8 +415,8 @@ describe("PR-11: 过期租约恢复扫描", () => {
 
     const result = await scanExpiredClaims();
 
-    expect(result.expiredJobs).toContain(jobId);
-    expect(result.expiredSlots).toContainEqual({ poolId, slotNo: 1 });
+    expect(result.requeuedJobs).toContain(jobId);
+    expect(result.releasedSlots).toContainEqual({ poolId, slotNo: 1 });
 
     const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
     expect(job.status).toBe("QUEUED");
@@ -422,4 +429,32 @@ describe("PR-11: 过期租约恢复扫描", () => {
     expect(slot.ownerAttemptId).toBeNull();
     expect(slot.expiresAtMs).toBeNull();
   });
+  it("应将过期且尚未提交的取消请求终结为 CANCELLED", async () => {
+    const { poolId, backendId } = await createBackendAndPool();
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId, {
+      phase: "PREPARING",
+      jobClaimFencingToken: 3,
+      externalJobId: null,
+    });
+    const now = Date.now();
+    await db.update(generationJobs).set({
+      status: "CANCEL_REQUESTED",
+      currentAttemptId: attemptId,
+      claimOwner: "dead-worker",
+      claimUntilMs: now - 1,
+      claimFencingToken: 3,
+      cancelRequestedAtMs: now - 1000,
+      updatedAtMs: now,
+    }).where(eq(generationJobs.id, jobId));
+
+    const result = await scanExpiredClaims();
+    expect(result.cancelledJobs).toContain(jobId);
+    expect(result.requeuedJobs).not.toContain(jobId);
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe("CANCELLED");
+    expect(attempt.phase).toBe("CANCELLED");
+  });
+
 });

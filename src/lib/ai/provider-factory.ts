@@ -9,8 +9,9 @@ import { UCloudSeedanceProvider } from "./providers/ucloud-seedance";
 import { DashScopeImageProvider } from "./providers/dashscope-image";
 import { getAIProvider, getVideoProvider } from "./index";
 import { db } from "@/lib/db";
-import { executionBackends, keyReferences } from "@/lib/db/schema";
+import { executionBackends } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
+import { resolveLegacyProviderSecrets } from "@/lib/security/provider-secrets";
 import { normalizeDashScopeBaseUrl } from "./dashscope-url";
 import type { AIProvider, VideoProvider } from "./types";
 
@@ -26,6 +27,7 @@ export interface ModelConfigPayload {
   text?: ProviderConfig | null;
   image?: ProviderConfig | null;
   video?: ProviderConfig | null;
+  speech?: ProviderConfig | null;
   /** v2.0: 执行后端 ID，优先于此字段解析 */
   backendId?: string;
 }
@@ -39,31 +41,7 @@ const ADAPTER_TO_PROTOCOL: Record<string, string> = {
   "kling-http": "kling",
   "wan-http": "wan",
   "dashscope-http": "dashscope",
-  "comfyui-http": "dashscope",
 };
-
-/** 从 keyRefIds 解析密钥 */
-async function resolveKeys(keyRefIds: string[]): Promise<{ apiKey: string; secretKey?: string }> {
-  if (keyRefIds.length === 0) return { apiKey: "" };
-
-  const refs = await db
-    .select()
-    .from(keyReferences)
-    .where(
-      keyRefIds.length === 1
-        ? eq(keyReferences.id, keyRefIds[0])
-        : undefined
-    );
-
-  // 简单场景：第一个 bearer key 作为 apiKey，第一个 basic 作为 secretKey
-  const bearerKey = refs.find((r) => r.keyType === "bearer");
-  const basicKey = refs.find((r) => r.keyType === "basic");
-
-  return {
-    apiKey: bearerKey?.secretValue ?? "",
-    secretKey: basicKey?.secretValue,
-  };
-}
 
 /** 从服务端执行后端解析 ProviderConfig */
 export async function resolveBackendConfig(backendId: string): Promise<ProviderConfig> {
@@ -76,9 +54,10 @@ export async function resolveBackendConfig(backendId: string): Promise<ProviderC
     throw new Error(`Execution backend not found: ${backendId}`);
   }
 
-  const protocol = ADAPTER_TO_PROTOCOL[backend.adapterKind] ?? "openai";
-  const authConfig = backend.authConfigJson as { keyRefIds?: string[] };
-  const keys = await resolveKeys(authConfig.keyRefIds ?? []);
+  const protocol = ADAPTER_TO_PROTOCOL[backend.adapterKind];
+  if (!protocol) throw new Error(`Backend adapter is not supported by the legacy cloud facade: ${backend.adapterKind}`);
+  if (!backend.enabled) throw new Error(`Execution backend is disabled: ${backend.id}`);
+  const keys = await resolveLegacyProviderSecrets(backend.authConfigJson);
 
   let baseUrl = backend.baseUrl;
   if (backend.adapterKind === "dashscope-http") {

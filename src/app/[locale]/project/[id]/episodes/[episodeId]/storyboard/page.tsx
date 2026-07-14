@@ -78,6 +78,7 @@ export default function EpisodeStoryboardPage() {
   const [lastBatchAction, setLastBatchAction] = useState<string | null>(null);
   const [compareMode, setCompareMode] = useState(false);
   const [generatingRefPrompts, setGeneratingRefPrompts] = useState(false);
+  const [generatingKeyframeAssets, setGeneratingKeyframeAssets] = useState(false);
 
   const currentEpisodeId = useProjectStore((s) => s.currentEpisodeId);
   const episodeStoreEpisodes = useEpisodeStore((s) => s.episodes);
@@ -135,25 +136,23 @@ export default function EpisodeStoryboardPage() {
     };
   }, [project?.shots]);
 
-  if (!project) return null;
-
-  const totalShots = project.shots.length;
-  const shotsWithFrames = project.shots.filter((s) => hasKeyframePair(s)).length;
-  const generationMode = (project.generationMode || "keyframe") as "keyframe" | "reference";
-  const shotsWithVideo = project.shots.filter((s) =>
+  const totalShots = project?.shots.length ?? 0;
+  const shotsWithFrames = project?.shots.filter((s) => hasKeyframePair(s)).length ?? 0;
+  const generationMode = (project?.generationMode || "keyframe") as "keyframe" | "reference";
+  const shotsWithVideo = project?.shots.filter((s) =>
     generationMode === "reference" ? getReferenceVideoUrl(s) : getKeyframeVideoUrl(s)
-  ).length;
-  const shotsWithVideoPrompts = project.shots.filter((s) => s.videoPrompt).length;
-  const shotsWithSceneFrames = project.shots.filter((s) => getSceneRefFrameUrl(s)).length;
-  const shotsWithFrameAny = project.shots.filter(
+  ).length ?? 0;
+  const shotsWithVideoPrompts = project?.shots.filter((s) => s.videoPrompt).length ?? 0;
+  const shotsWithSceneFrames = project?.shots.filter((s) => getSceneRefFrameUrl(s)).length ?? 0;
+  const shotsWithFrameAny = project?.shots.filter(
     (s) => getSceneRefFrameUrl(s) || getFirstFrameUrl(s) || getLastFrameUrl(s)
-  ).length;
-  const charactersWithRefs = project.characters.filter((c) => c.referenceImage);
+  ).length ?? 0;
+  const charactersWithRefs = project?.characters.filter((c) => c.referenceImage) ?? [];
   const hasReferenceImages = charactersWithRefs.length > 0;
 
   // Check if all reference images are generated (for reference mode blocking)
   const allRefImagesGenerated = useMemo(() => {
-    if (generationMode !== "reference") return true;
+    if (!project || generationMode !== "reference") return true;
     for (const shot of project.shots) {
       const refOnly = getReferenceAssets(shot);
       if (refOnly.length === 0) continue;
@@ -162,7 +161,7 @@ export default function EpisodeStoryboardPage() {
       }
     }
     return true;
-  }, [project.shots, generationMode]);
+  }, [project?.shots, generationMode]);
 
   const shotsWithRefPrompts = useMemo(() => {
     if (!project) return 0;
@@ -188,6 +187,8 @@ export default function EpisodeStoryboardPage() {
       return refOnly.length > 0 && refOnly.every((r) => r.status === "completed" && r.fileUrl);
     }).length;
   }, [project?.shots]);
+
+  if (!project) return null;
 
   const anyGenerating = generating || generatingFrames || generatingVideos || generatingSceneFrames || generatingRefImages || generatingVideoPrompts || generatingRefPrompts;
 
@@ -387,7 +388,6 @@ export default function EpisodeStoryboardPage() {
 
   // Synchronous batch generator for keyframe (first/last frame) image prompts.
   // Mirrors handleGenerateRefPrompts — single LLM call, returns immediately.
-  const [generatingKeyframeAssets, setGeneratingKeyframeAssets] = useState(false);
 
   async function handleGenerateKeyframeAssets() {
     if (!project) return;
@@ -437,8 +437,9 @@ export default function EpisodeStoryboardPage() {
       if (!resp.ok) throw new Error("Failed");
       const data = await resp.json();
 
-      const totalGenerated = data.results?.reduce((sum: number, r: any) => sum + (r.generated || 0), 0) || 0;
-      const totalFailed = data.results?.reduce((sum: number, r: any) => sum + (r.failed || 0), 0) || 0;
+      const results = Array.isArray(data.results) ? data.results as Array<{ generated?: number; failed?: number }> : [];
+      const totalGenerated = results.reduce((sum, result) => sum + (result.generated || 0), 0);
+      const totalFailed = results.reduce((sum, result) => sum + (result.failed || 0), 0);
 
       if (totalFailed > 0) {
         toast.error(`${totalFailed} reference images failed`);

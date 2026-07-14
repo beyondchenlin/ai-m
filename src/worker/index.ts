@@ -10,11 +10,16 @@
 
 import { claimJob, renewJobClaim, releaseJobClaim, scanExpiredClaims, LEASE_CONFIG } from "@/lib/generation/resources/leases";
 import { executeGenerationJob } from "@/lib/generation/worker-executor";
+import { recoverStagingArtifacts } from "@/lib/generation/archiving";
+import { cleanupTerminalSharedInputs } from "@/lib/generation/input-materializer";
+import { cleanupSourceAssetStorage, recoverSourceMediaAssets } from "@/lib/generation/source-assets";
+import { getSqlite } from "@/lib/db";
+import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-adapter";
 import { isEnabled, FF } from "@/lib/feature-flags";
 
 // Worker 标识
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
-const SUPPORTED_CAPABILITIES = ["image", "text", "video", "speech"];
+const SUPPORTED_CAPABILITIES = ["image", "text", "video", "speech"] as const;
 
 // 运行状态
 let running = true;
@@ -22,6 +27,10 @@ let currentJobId: string | null = null;
 let currentFencingToken: number | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let recoveryTimer: ReturnType<typeof setInterval> | null = null;
+let currentAbortController: AbortController | null = null;
+let currentJobPromise: Promise<void> | null = null;
+let shutdownStarted = false;
+let recoveryScanRunning = false;
 
 /** 心跳续期循环 */
 function startHeartbeat(jobId: string, fencingToken: number) {
@@ -32,9 +41,8 @@ function startHeartbeat(jobId: string, fencingToken: number) {
       const ok = await renewJobClaim(jobId, WORKER_ID, fencingToken);
       if (!ok) {
         console.error(`[${WORKER_ID}] Heartbeat failed for job ${jobId}, fencing token mismatch`);
-        // 租约丢失，安全退出
-        currentJobId = null;
-        currentFencingToken = null;
+        // Ownership was lost. Abort local coordination; external state will be reconciled.
+        currentAbortController?.abort(new Error("job_claim_lost"));
         stopHeartbeat();
       }
     } catch (err) {
@@ -54,16 +62,32 @@ function stopHeartbeat() {
 /** 恢复扫描器 */
 function startRecoveryScanner() {
   recoveryTimer = setInterval(async () => {
+    if (recoveryScanRunning) return;
+    recoveryScanRunning = true;
     try {
       const result = await scanExpiredClaims();
-      if (result.expiredJobs.length > 0) {
-        console.log(`[${WORKER_ID}] Recovery: freed ${result.expiredJobs.length} expired jobs`);
+      const projections = await reconcileBusinessArtifactProjections();
+      const cleanedSharedInputs = await cleanupTerminalSharedInputs();
+      const sourceRecovery = await recoverSourceMediaAssets();
+      const sourceCleanup = await cleanupSourceAssetStorage();
+      if (projections.projected > 0 || projections.failed > 0) {
+        console.log(`[${WORKER_ID}] Business projections: projected=${projections.projected}, pending=${projections.failed}`);
       }
-      if (result.expiredSlots.length > 0) {
-        console.log(`[${WORKER_ID}] Recovery: freed ${result.expiredSlots.length} expired slots`);
+      if (result.requeuedJobs.length > 0) console.log(`[${WORKER_ID}] Recovery: requeued ${result.requeuedJobs.length} pre-submission jobs`);
+      if (result.attentionJobs.length > 0) console.warn(`[${WORKER_ID}] Recovery: escalated ${result.attentionJobs.length} externally-uncertain jobs`);
+      if (result.cancelledJobs.length > 0) console.log(`[${WORKER_ID}] Recovery: finalized ${result.cancelledJobs.length} pre-submission cancellations`);
+      if (result.releasedSlots.length > 0) console.log(`[${WORKER_ID}] Recovery: released ${result.releasedSlots.length} terminal slots`);
+      if (cleanedSharedInputs > 0) console.log(`[${WORKER_ID}] Recovery: removed ${cleanedSharedInputs} terminal shared-input namespaces`);
+      if (sourceRecovery.committed || sourceRecovery.quarantined) {
+        console.log(`[${WORKER_ID}] Source recovery: committed=${sourceRecovery.committed}, quarantined=${sourceRecovery.quarantined}`);
+      }
+      if (sourceCleanup.deletedFiles || sourceCleanup.orphanStagingFiles || sourceCleanup.abandonedAssets) {
+        console.log(`[${WORKER_ID}] Source cleanup: deleted=${sourceCleanup.deletedFiles}, orphanStaging=${sourceCleanup.orphanStagingFiles}, abandoned=${sourceCleanup.abandonedAssets}`);
       }
     } catch (err) {
       console.error(`[${WORKER_ID}] Recovery scanner error:`, err);
+    } finally {
+      recoveryScanRunning = false;
     }
   }, LEASE_CONFIG.CLAIM_LEASE_MS);
 }
@@ -77,39 +101,59 @@ async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>
 
     console.log(`[${WORKER_ID}] Claimed job ${job.id} (capability: ${job.capability}, project: ${job.projectId})`);
 
+    currentAbortController = new AbortController();
     // 启动心跳
     startHeartbeat(job.id, fencingToken);
 
-    // 检查取消请求
-    if (job.cancelRequestedAtMs) {
-      console.log(`[${WORKER_ID}] Job ${job.id} cancelled before execution`);
-      await releaseJobClaim(job.id, WORKER_ID, fencingToken);
-      return;
-    }
+    // Worker must never silently skip a claimed job.  The executor owns feature
+    // checks and persists a terminal/attention state before ownership is released.
+    console.log(`[${WORKER_ID}] Executing job ${job.id}...`);
+    const result = await executeGenerationJob(job, WORKER_ID, fencingToken, currentAbortController.signal);
+    console.log(`[${WORKER_ID}] Job ${job.id} finished: ${result.finalPhase}`);
 
-    // 检查是否启用 ComfyUI 传输
-    if (isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
-      console.log(`[${WORKER_ID}] Executing job ${job.id} via ComfyUI transport...`);
-      const result = await executeGenerationJob(job, WORKER_ID, fencingToken);
-      console.log(`[${WORKER_ID}] Job ${job.id} finished: ${result.finalPhase}`);
-    } else {
-      // 无传输层时的占位处理
-      console.log(`[${WORKER_ID}] ComfyUI transport not enabled, skipping execution for job ${job.id}`);
-    }
-
-    // 执行完成后释放
+    // Release only after the executor has durably recorded the outcome.
     await releaseJobClaim(job.id, WORKER_ID, fencingToken);
     console.log(`[${WORKER_ID}] Completed job ${job.id}`);
   } catch (err) {
     console.error(`[${WORKER_ID}] Error processing job ${job.id}:`, err);
-    // 释放租约让其他 Worker 重试
-    if (currentFencingToken !== null) {
-      await releaseJobClaim(job.id, WORKER_ID, currentFencingToken).catch(() => {});
-    }
+    // Do not release ownership after an unexpected failure.  The external submit
+    // may have succeeded even when the local response was lost.  Recovery must
+    // classify the persisted attempt before another worker may act.
   } finally {
     stopHeartbeat();
     currentJobId = null;
     currentFencingToken = null;
+    currentAbortController = null;
+  }
+}
+
+
+async function waitForPlatformSchema(timeoutMs = 60_000): Promise<void> {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      const sqlite = getSqlite();
+      const tables = sqlite.prepare<[], { name: string }>(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('generation_jobs','generation_attempts','generation_artifacts','workflow_package_revisions','workflow_backend_validations','voice_profiles','source_media_assets','generation_job_source_assets')",
+      ).all();
+      const names = new Set(tables.map((row) => row.name));
+      if ([
+        "generation_jobs",
+        "generation_attempts",
+        "generation_artifacts",
+        "workflow_package_revisions",
+        "workflow_backend_validations",
+        "voice_profiles",
+        "source_media_assets",
+        "generation_job_source_assets",
+      ].every((name) => names.has(name))) return;
+    } catch {
+      // The web process may still be applying migrations. Retry until timeout.
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Platform schema is not ready. Run application migrations before starting the worker.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
 }
 
@@ -120,7 +164,29 @@ async function mainLoop() {
     return;
   }
 
-  console.log(`[${WORKER_ID}] Worker started, polling for jobs...`);
+  console.log(`[${WORKER_ID}] Worker started, waiting for platform schema...`);
+  await waitForPlatformSchema();
+  console.log(`[${WORKER_ID}] Platform schema ready, polling for jobs...`);
+
+  const artifactRecovery = await recoverStagingArtifacts();
+  const cleanedSharedInputs = await cleanupTerminalSharedInputs();
+  const sourceRecovery = await recoverSourceMediaAssets();
+  const sourceCleanup = await cleanupSourceAssetStorage();
+  if (artifactRecovery.committed || artifactRecovery.quarantined) {
+    console.log(
+      `[${WORKER_ID}] Artifact recovery: committed=${artifactRecovery.committed}, quarantined=${artifactRecovery.quarantined}`,
+    );
+  }
+
+  if (cleanedSharedInputs > 0) {
+    console.log(`[${WORKER_ID}] Shared-input recovery: removed=${cleanedSharedInputs}`);
+  }
+  if (sourceRecovery.committed || sourceRecovery.quarantined) {
+    console.log(`[${WORKER_ID}] Source recovery: committed=${sourceRecovery.committed}, quarantined=${sourceRecovery.quarantined}`);
+  }
+  if (sourceCleanup.deletedFiles || sourceCleanup.orphanStagingFiles || sourceCleanup.abandonedAssets) {
+    console.log(`[${WORKER_ID}] Source cleanup: deleted=${sourceCleanup.deletedFiles}, orphanStaging=${sourceCleanup.orphanStagingFiles}, abandoned=${sourceCleanup.abandonedAssets}`);
+  }
 
   // 启动恢复扫描
   startRecoveryScanner();
@@ -135,7 +201,12 @@ async function mainLoop() {
       }
 
       if (job) {
-        await processJob(job);
+        currentJobPromise = processJob(job);
+        try {
+          await currentJobPromise;
+        } finally {
+          currentJobPromise = null;
+        }
       } else {
         // 没有任务，等待
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -149,29 +220,40 @@ async function mainLoop() {
 
 /** 优雅关闭 */
 async function gracefulShutdown(signal: string) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
   console.log(`[${WORKER_ID}] Received ${signal}, shutting down gracefully...`);
   running = false;
-
-  stopHeartbeat();
 
   if (recoveryTimer) {
     clearInterval(recoveryTimer);
     recoveryTimer = null;
   }
 
-  // 释放当前任务
-  if (currentJobId && currentFencingToken !== null) {
-    console.log(`[${WORKER_ID}] Releasing current job ${currentJobId}...`);
-    await releaseJobClaim(currentJobId, WORKER_ID, currentFencingToken).catch(() => {});
+  // Preserve the claim while the executor persists an attention/terminal state.
+  currentAbortController?.abort(new Error(`worker_shutdown:${signal}`));
+  if (currentJobPromise) {
+    const graceMs = Math.max(5_000, Number(process.env.AI_M_WORKER_SHUTDOWN_GRACE_MS ?? 25_000));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      currentJobPromise.then(() => false, () => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), graceMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) {
+      console.warn(`[${WORKER_ID}] Graceful shutdown timed out; durable recovery will reconcile the retained claim`);
+    }
   }
-
-  console.log(`[${WORKER_ID}] Shutdown complete`);
-  process.exit(0);
+  stopHeartbeat();
+  console.log(`[${WORKER_ID}] Shutdown coordination complete`);
+  process.exitCode = 0;
 }
 
 // 注册信号处理
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
 
 // 启动
 mainLoop().catch((err) => {

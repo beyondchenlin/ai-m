@@ -150,7 +150,7 @@ export async function POST(
   const scriptSplitSystem = await resolvePrompt("script_split", { userId, projectId });
 
   // Process all chunks concurrently
-  let episodeOffset = 0;
+  const episodeOffset = 0;
   const chunkPromises = chunks.map(async (chunk, idx) => {
     const prompt = buildScriptSplitPrompt(chunk, {
       chunkIndex: idx,
