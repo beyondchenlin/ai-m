@@ -15,6 +15,69 @@ ARCHITECTURE_FILES = [
     "src/lib/db/migration-baseline-approval.ts",
 ]
 
+SETTINGS_ARCHITECTURE_FILES = [
+    "src/app/[locale]/settings/page.tsx",
+    "src/app/[locale]/settings/settings-page-client.tsx",
+]
+
+
+class SettingsBoundaryStaticChecksTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        for relative in SETTINGS_ARCHITECTURE_FILES:
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pr13_static_checks.ROOT / relative, destination)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def check(self) -> None:
+        checker = getattr(pr13_static_checks, "check_settings_page_invariants", None)
+        self.assertIsNotNone(checker, "settings page checker export is missing")
+        checker(self.root)
+
+    def test_current_server_client_boundary_passes(self) -> None:
+        self.check()
+
+    def test_speech_capability_must_remain_in_the_client(self) -> None:
+        client = self.root / "src/app/[locale]/settings/settings-page-client.tsx"
+        source = client.read_text(encoding="utf-8")
+        self.assertIn('capability="speech"', source)
+        client.write_text(source.replace('capability="speech"', 'capability="text"', 1), encoding="utf-8")
+
+        with self.assertRaisesRegex(AssertionError, "speech capability"):
+            self.check()
+
+    def test_server_wrapper_must_import_the_settings_client(self) -> None:
+        page = self.root / "src/app/[locale]/settings/page.tsx"
+        source = page.read_text(encoding="utf-8")
+        self.assertIn('import { SettingsPageClient } from "./settings-page-client";', source)
+        page.write_text(
+            source.replace('import { SettingsPageClient } from "./settings-page-client";', "", 1),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "import SettingsPageClient"):
+            self.check()
+
+    def test_server_wrapper_must_render_the_settings_client(self) -> None:
+        page = self.root / "src/app/[locale]/settings/page.tsx"
+        source = page.read_text(encoding="utf-8")
+        self.assertIn("<SettingsPageClient", source)
+        page.write_text(source.replace("<SettingsPageClient", "<main", 1), encoding="utf-8")
+
+        with self.assertRaisesRegex(AssertionError, "render SettingsPageClient"):
+            self.check()
+
+    def test_settings_client_module_must_exist(self) -> None:
+        client = self.root / "src/app/[locale]/settings/settings-page-client.tsx"
+        client.unlink()
+
+        with self.assertRaisesRegex(AssertionError, "settings client module is missing"):
+            self.check()
+
 
 class MigrationRecoveryStaticChecksTest(unittest.TestCase):
     def setUp(self) -> None:

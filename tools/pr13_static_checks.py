@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,6 +20,35 @@ def _require_at(root: Path, path: str) -> str:
     if not file.is_file():
         raise AssertionError(f"missing migration recovery architecture file: {path}")
     return file.read_text(encoding="utf-8")
+
+
+def check_settings_page_invariants(root: Path = ROOT) -> None:
+    page_path = root / "src/app/[locale]/settings/page.tsx"
+    client_path = root / "src/app/[locale]/settings/settings-page-client.tsx"
+    if not page_path.is_file():
+        raise AssertionError("settings server wrapper is missing")
+    if not client_path.is_file():
+        raise AssertionError("settings client module is missing")
+
+    page = page_path.read_text(encoding="utf-8")
+    client = client_path.read_text(encoding="utf-8")
+    if not re.search(
+        r'import\s*{\s*SettingsPageClient\s*}\s*from\s*["\']\./settings-page-client["\']',
+        page,
+    ):
+        raise AssertionError("settings server wrapper must import SettingsPageClient")
+    if not re.search(
+        r"<SettingsPageClient\b[^>]*\bmetadata\s*=\s*{\s*readEmbeddedBuildMetadata\s*\(\s*\)\s*}",
+        page,
+        re.DOTALL,
+    ):
+        raise AssertionError("settings server wrapper must render SettingsPageClient with embedded metadata")
+    if not re.search(
+        r'<ProviderSection\b[^>]*\bcapability\s*=\s*["\']speech["\']',
+        client,
+        re.DOTALL,
+    ):
+        raise AssertionError("settings page does not expose speech capability")
 
 
 def _function_body(source: str, signature: str) -> str:
@@ -86,10 +116,7 @@ def main() -> int:
         if token not in store:
             raise AssertionError(f"model store does not securely scope browser credentials: {token}")
 
-    settings = require("src/app/[locale]/settings/page.tsx")
-    settings += require("src/app/[locale]/settings/settings-page-client.tsx")
-    if 'capability="speech"' not in settings:
-        raise AssertionError("settings page does not expose speech capability")
+    check_settings_page_invariants(ROOT)
 
     if (ROOT / "src/lib/generation/adapters/local-speech.ts").exists():
         raise AssertionError("placeholder local-speech adapter must be removed")
