@@ -16,6 +16,7 @@ import { cleanupSourceAssetStorage, recoverSourceMediaAssets } from "@/lib/gener
 import { getSqlite } from "@/lib/db";
 import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-adapter";
 import { isEnabled, FF } from "@/lib/feature-flags";
+import { settleClaimedJob } from "./claim-settlement";
 
 // Worker 标识
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
@@ -110,12 +111,16 @@ async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>
     // Worker must never silently skip a claimed job.  The executor owns feature
     // checks and persists a terminal/attention state before ownership is released.
     console.log(`[${WORKER_ID}] Executing job ${job.id}...`);
-    const result = await executeGenerationJob(job, WORKER_ID, fencingToken, currentAbortController.signal);
+    const result = await settleClaimedJob({
+      execute: () => executeGenerationJob(job, WORKER_ID, fencingToken, currentAbortController!.signal),
+      release: () => releaseJobClaim(job.id, WORKER_ID, fencingToken),
+    });
     console.log(`[${WORKER_ID}] Job ${job.id} finished: ${result.finalPhase}`);
-
-    // Release only after the executor has durably recorded the outcome.
-    await releaseJobClaim(job.id, WORKER_ID, fencingToken);
-    console.log(`[${WORKER_ID}] Completed job ${job.id}`);
+    if (result.claimDisposition === "release-terminal") {
+      console.log(`[${WORKER_ID}] Completed job ${job.id}`);
+    } else {
+      console.warn(`[${WORKER_ID}] Retained job ${job.id} for fenced recovery`);
+    }
   } catch (err) {
     console.error(`[${WORKER_ID}] Error processing job ${job.id}:`, err);
     // Do not release ownership after an unexpected failure.  The external submit

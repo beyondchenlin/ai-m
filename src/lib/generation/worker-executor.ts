@@ -3,7 +3,6 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   executionBackends,
-  generationArtifacts,
   generationAttempts,
   generationEvents,
   generationJobs,
@@ -13,6 +12,7 @@ import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import {
   ComfyUIExecutionOrchestrator,
+  ExecutionCallbackPersistenceError,
   acquireResourceSlot,
   createComfyUITransport,
   probeBackendFeatures,
@@ -33,16 +33,36 @@ import {
   finalizeOwnedJob,
   updateOwnedAttempt,
   type OwnedAttemptValues,
+  type AttemptPhase,
   type TransitionResult,
 } from "@/lib/generation/jobs/state-transitions";
+import {
+  finalizeGenerationFailure,
+  finalizeGenerationSuccess,
+  ownershipLostResult,
+  OwnedTransitionError,
+  requireApplied,
+  type JobExecutionResult,
+} from "@/lib/generation/jobs/worker-finalization";
+export type { JobExecutionResult } from "@/lib/generation/jobs/worker-finalization";
 
-export interface JobExecutionResult {
-  success: boolean;
-  finalPhase: string;
-  errorMessage?: string;
-  errorClass?: string;
-  needsAttention: boolean;
-}
+const OWNED_ACTIVE_ATTEMPT_PHASES = [
+  "CREATED", "LEASED", "PREPARING", "SUBMITTING", "SUBMISSION_UNKNOWN",
+  "EXTERNAL_QUEUED", "EXTERNAL_RUNNING", "COLLECTING", "COMMITTING",
+  "RETRY_WAIT", "CANCEL_REQUESTED",
+] as const;
+
+const ATTEMPT_PHASE_PREDECESSORS: Partial<Record<AttemptPhase, readonly AttemptPhase[]>> = {
+  PREPARING: ["CREATED", "LEASED", "PREPARING"],
+  SUBMITTING: ["PREPARING", "SUBMITTING"],
+  SUBMISSION_UNKNOWN: ["SUBMITTING", "SUBMISSION_UNKNOWN"],
+  EXTERNAL_QUEUED: ["SUBMITTING", "SUBMISSION_UNKNOWN", "EXTERNAL_QUEUED"],
+  EXTERNAL_RUNNING: ["EXTERNAL_QUEUED", "EXTERNAL_RUNNING"],
+  COLLECTING: ["EXTERNAL_RUNNING", "COLLECTING"],
+  COMMITTING: ["COLLECTING", "COMMITTING"],
+  RETRY_WAIT: ["SUBMITTING", "SUBMISSION_UNKNOWN", "RETRY_WAIT"],
+  CANCEL_REQUESTED: OWNED_ACTIVE_ATTEMPT_PHASES,
+};
 
 function mimeForOutput(
   filename: string,
@@ -64,16 +84,6 @@ function mimeForOutput(
   return detected;
 }
 
-const OWNED_ACTIVE_ATTEMPT_PHASES = [
-  "CREATED", "LEASED", "PREPARING", "SUBMITTING", "SUBMISSION_UNKNOWN",
-  "EXTERNAL_QUEUED", "EXTERNAL_RUNNING", "COLLECTING", "COMMITTING",
-  "RETRY_WAIT", "CANCEL_REQUESTED",
-] as const;
-
-function requireApplied(result: TransitionResult, operation: string): void {
-  if (result.status !== "applied") throw new Error(`${operation}:${result.status}`);
-}
-
 function updateAttemptFenced(
   jobId: string,
   attemptId: string,
@@ -86,10 +96,15 @@ function updateAttemptFenced(
     safePayloadJson: Record<string, unknown>;
   },
 ): TransitionResult {
-  const now = Date.now();
+  const { phase: nextPhase, ...patch } = values;
+  const expectedPhases = nextPhase
+    ? ATTEMPT_PHASE_PREDECESSORS[nextPhase]
+    : OWNED_ACTIVE_ATTEMPT_PHASES;
+  if (!expectedPhases) return { status: "invalid-transition" };
   return updateOwnedAttempt({ jobId, attemptId, workerId, jobFencingToken }, {
-    now,
-    values,
+    expectedPhases,
+    nextPhase,
+    values: patch,
     event,
   });
 }
@@ -102,14 +117,13 @@ export async function executeGenerationJob(
 ): Promise<JobExecutionResult> {
   if (job.cancelRequestedAtMs) {
     await cancelQueuedJob(job.id, workerId, jobFencingToken);
-    return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+    return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
   }
   if (!isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
     return failJob(job.id, "", workerId, jobFencingToken, "ComfyUI transport is not enabled", "config_error");
   }
 
   const attemptId = genId();
-  let attemptPersisted = false;
   let resourceSlot: { slotNo: number; leaseToken: string; fencingToken: number } | null = null;
   let resourceTimer: ReturnType<typeof setInterval> | null = null;
   let retainResource = false;
@@ -182,7 +196,6 @@ export async function executeGenerationJob(
       workerId,
       jobFencingToken,
     }, {
-      now: attemptCreatedAtMs,
       attempt: {
         id: attemptId,
         jobId: job.id,
@@ -204,7 +217,6 @@ export async function executeGenerationJob(
       },
     });
     requireApplied(attached, "job_claim_lost_before_attempt_attachment");
-    attemptPersisted = true;
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
     if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
@@ -251,7 +263,7 @@ export async function executeGenerationJob(
       outputPrefix,
     );
 
-    const callbacks: ExecutionCallbacks = {
+    const durableCallbacks: ExecutionCallbacks = {
       onPhaseChange: async (phase: OrchestratorPhase) => {
         const mapped = phase === "CREATED" ? "PREPARING" : phase;
         if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(mapped)) return;
@@ -336,6 +348,14 @@ export async function executeGenerationJob(
         });
       },
     };
+    const callbacks = new Proxy(durableCallbacks, {
+      get(target, property, receiver) {
+        const callback = Reflect.get(target, property, receiver);
+        if (typeof callback !== "function") return callback;
+        return (...args: unknown[]) => Promise.resolve(Reflect.apply(callback, target, args))
+          .catch((error: unknown) => { throw new ExecutionCallbackPersistenceError(error); });
+      },
+    });
 
     orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, backend.baseUrl, callbacks, {
       totalExecutionTimeoutMs: workflowPackage.manifest.limits.maxJobMs,
@@ -361,9 +381,13 @@ export async function executeGenerationJob(
       if (result.success) {
         retainResource = false;
         const primaryArtifact = selectPrimaryArtifact(committedArtifacts, workflowPackage.compiled.outputs);
-        const artifactId = await succeedJob(
-          job.id, attemptId, workerId, jobFencingToken, primaryArtifact.artifactId,
-        );
+        const artifactId = await finalizeGenerationSuccess({
+          jobId: job.id,
+          attemptId,
+          workerId,
+          fencingToken: jobFencingToken,
+          artifactId: primaryArtifact.artifactId,
+        });
         try {
           await linkArtifactToBusinessEntity(job.id, artifactId);
           await mergeGenerationJobMetadata(job.id, {
@@ -378,12 +402,12 @@ export async function executeGenerationJob(
             createdAtMs: Date.now(),
           }).catch(() => undefined);
         }
-        return { success: true, finalPhase: "SUCCEEDED", needsAttention: false };
+        return { success: true, finalPhase: "SUCCEEDED", needsAttention: false, claimDisposition: "release-terminal" };
       }
       if (result.cancellationRequested && result.phase === "CANCELLED") {
         retainResource = false;
         await cancelJob(job.id, attemptId, workerId, jobFencingToken);
-        return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+        return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
       }
       retainResource = retainResource || result.needsAttention || result.phase === "SUBMISSION_UNKNOWN";
       return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
@@ -391,9 +415,13 @@ export async function executeGenerationJob(
       abortSignal?.removeEventListener("abort", abortListener);
     }
   } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    retainResource = retainResource || failure.message.includes("claim_lost") || failure.message.includes("ownership");
-    return failJob(job.id, attemptPersisted ? attemptId : "", workerId, jobFencingToken, failure.message, "unexpected_error", retainResource);
+    if (error instanceof OwnedTransitionError
+      && (error.transitionStatus === "lost-race" || error.transitionStatus === "ownership-lost")) {
+      retainResource = true;
+      return ownershipLostResult();
+    }
+    retainResource = true;
+    throw error;
   } finally {
     if (resourceTimer) clearInterval(resourceTimer);
     transport?.close();
@@ -411,7 +439,6 @@ export async function executeGenerationJob(
 async function cancelQueuedJob(jobId: string, workerId: string, fencingToken: number): Promise<void> {
   const now = Date.now();
   const result = finalizeOwnedJob({ jobId, workerId, jobFencingToken: fencingToken }, {
-    now,
     expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
     jobValues: { status: "CANCELLED", completedAtMs: now },
     event: {
@@ -438,88 +465,20 @@ async function failJob(
   errorClass: string,
   needsAttention = false,
 ): Promise<JobExecutionResult> {
-  const now = Date.now();
-  const event = {
-    eventType: needsAttention ? "job_needs_attention" : "job_failed",
-    severity: needsAttention ? "warning" as const : "error" as const,
-    safePayloadJson: { errorClass, errorMessage: errorMessage.slice(0, 200) },
-  };
-  let transition: TransitionResult;
-  try {
-    transition = attemptId
-      ? finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
-        now,
-        expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
-        expectedAttemptPhases: OWNED_ACTIVE_ATTEMPT_PHASES,
-        attemptValues: {
-          phase: needsAttention ? "ORPHANED" : "FAILED",
-          errorClass,
-          errorMessageSafe: errorMessage.slice(0, 500),
-          finishedAtMs: needsAttention ? null : now,
-        },
-        jobValues: {
-          status: needsAttention ? "NEEDS_ATTENTION" : "FAILED",
-          needsAttentionReason: needsAttention ? `${errorClass}:${errorMessage.slice(0, 200)}` : null,
-          completedAtMs: needsAttention ? null : now,
-        },
-        event,
-      })
-      : finalizeOwnedJob({ jobId, workerId, jobFencingToken: fencingToken }, {
-        now,
-        expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
-        jobValues: {
-          status: needsAttention ? "NEEDS_ATTENTION" : "FAILED",
-          needsAttentionReason: needsAttention ? `${errorClass}:${errorMessage.slice(0, 200)}` : null,
-          completedAtMs: needsAttention ? null : now,
-        },
-        event,
-      });
-  } catch {
-    transition = { status: "lost-race" };
-  }
-  if (transition.status !== "applied") {
-    return {
-      success: false,
-      finalPhase: "OWNERSHIP_LOST",
-      errorMessage: "Execution ownership was lost before the terminal transition",
-      errorClass: "ownership_lost",
-      needsAttention: true,
-    };
-  }
-  return { success: false, finalPhase: needsAttention ? "NEEDS_ATTENTION" : "FAILED", errorMessage, errorClass, needsAttention };
-}
-
-async function succeedJob(
-  jobId: string,
-  attemptId: string,
-  workerId: string,
-  fencingToken: number,
-  artifactId: string,
-): Promise<string> {
-  const now = Date.now();
-  const [artifact] = await db.select({ id: generationArtifacts.id }).from(generationArtifacts)
-    .where(and(
-      eq(generationArtifacts.id, artifactId),
-      eq(generationArtifacts.attemptId, attemptId),
-      eq(generationArtifacts.status, "COMMITTED"),
-    ));
-  if (!artifact) throw new Error("Selected primary artifact is not committed for this execution attempt");
-  const result = finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
-    now,
-    expectedJobStatuses: ["RUNNING"],
-    expectedAttemptPhases: OWNED_ACTIVE_ATTEMPT_PHASES,
-    attemptValues: { phase: "SUCCEEDED", finishedAtMs: now },
-    jobValues: { status: "SUCCEEDED", currentArtifactId: artifact.id, completedAtMs: now },
-    event: { eventType: "job_succeeded", severity: "info", safePayloadJson: {} },
+  return finalizeGenerationFailure({
+    jobId,
+    attemptId,
+    workerId,
+    fencingToken,
+    errorMessage,
+    errorClass,
+    needsAttention,
   });
-  requireApplied(result, "job_claim_lost_finalizing_success");
-  return artifact.id;
 }
 
 async function cancelJob(jobId: string, attemptId: string, workerId: string, fencingToken: number): Promise<void> {
   const now = Date.now();
   const result = finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
-    now,
     expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
     expectedAttemptPhases: ["CANCEL_REQUESTED"],
     attemptValues: { phase: "CANCELLED", finishedAtMs: now },

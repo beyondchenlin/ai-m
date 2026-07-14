@@ -239,7 +239,6 @@ export interface RecoveryScanResult {
 
 type RecoverCandidate = (
   snapshot: ExpiredJobSnapshot,
-  now: number,
 ) => TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }>
   | Promise<TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }>>;
 
@@ -276,7 +275,7 @@ async function scanExpiredClaimsUsing(recoverCandidate: RecoverCandidate): Promi
         externalJobId: attempt.externalJobId,
       } : null,
     };
-    const result = await recoverCandidate(snapshot, now);
+    const result = await recoverCandidate(snapshot);
     outcomes.push(result.status === "applied"
       ? { jobId: job.id, status: result.status, disposition: result.disposition }
       : { jobId: job.id, status: result.status });
@@ -315,11 +314,4 @@ async function scanExpiredClaimsUsing(recoverCandidate: RecoverCandidate): Promi
 /** Scan with the production recovery transition; callers cannot replace it. */
 export function scanExpiredClaims(): Promise<RecoveryScanResult> {
   return scanExpiredClaimsUsing(recoverExpiredJob);
-}
-
-/** @internal Narrow test seam: pauses after the joined candidate snapshot. */
-export function scanExpiredClaimsWithTransitionForTest(
-  recoverCandidate: RecoverCandidate,
-): Promise<RecoveryScanResult> {
-  return scanExpiredClaimsUsing(recoverCandidate);
 }

@@ -1,9 +1,9 @@
 import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
+import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
 import { db } from "@/lib/db";
-import * as schema from "@/lib/db/schema";
 import { executionBackends, generationAttempts, generationJobs, resourcePools } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { attachOwnedAttempt } from "../state-transitions";
@@ -105,24 +105,43 @@ describe("owned attempt attachment", () => {
     const seeded = await seedOwnedJob();
     const firstAttemptId = crypto.randomUUID();
     const secondAttemptId = crypto.randomUUID();
-    const secondDb = drizzle(secondConnection, { schema });
-    const identity = { jobId: seeded.jobId, workerId: "worker-a", jobFencingToken: 13 };
-
-    const first = attachOwnedAttempt(identity, {
-      now: seeded.now,
-      attempt: attemptValues({ ...seeded, attemptId: firstAttemptId }),
+    const fixture = path.join(__dirname, "fixtures", "attach-attempt-writer.ts");
+    const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const launch = (attemptId: string) => spawn(process.execPath, [
+      tsxCli,
+      fixture,
+      seeded.jobId,
+      attemptId,
+      seeded.poolId,
+      seeded.backendId,
+      String(seeded.now),
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, DATABASE_URL: `file:${ctx.dbPath}` },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
     });
-    const second = attachOwnedAttempt(identity, {
-      now: seeded.now,
-      attempt: attemptValues({ ...seeded, attemptId: secondAttemptId }),
-    }, secondDb);
+    const firstWriter = launch(firstAttemptId);
+    const secondWriter = launch(secondAttemptId);
+    const nextMessage = (child: ChildProcess) => new Promise<Record<string, unknown>>((resolve, reject) => {
+      child.once("message", (message) => resolve(message as Record<string, unknown>));
+      child.once("error", reject);
+    });
+    await Promise.all([nextMessage(firstWriter), nextMessage(secondWriter)]);
+    const firstResult = nextMessage(firstWriter);
+    const secondResult = nextMessage(secondWriter);
+    firstWriter.send({ go: true });
+    secondWriter.send({ go: true });
+    const [firstMessage, secondMessage] = await Promise.all([firstResult, secondResult]);
+    const first = firstMessage.result as { status: string };
+    const second = secondMessage.result as { status: string };
 
     expect([first.status, second.status].sort()).toEqual(["applied", "ownership-lost"]);
     const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
     const attempts = await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, seeded.jobId));
-    expect(job.currentAttemptId).toBe(firstAttemptId);
-    expect(attempts.map((attempt) => attempt.id)).toEqual([firstAttemptId]);
-    expect(attempts.some((attempt) => attempt.id === secondAttemptId)).toBe(false);
+    const winnerId = attempts[0]?.id;
+    expect(job.currentAttemptId).toBe(winnerId);
+    expect(attempts).toHaveLength(1);
+    expect([firstAttemptId, secondAttemptId]).toContain(winnerId);
   });
 
   it("rolls back the inserted attempt when binding the job affects zero rows", async () => {
@@ -139,7 +158,7 @@ describe("owned attempt attachment", () => {
       workerId: "worker-a",
       jobFencingToken: 13,
     }, {
-      now: seeded.now,
+      clock: () => seeded.now,
       attempt: attemptValues({ ...seeded, attemptId }),
     });
 

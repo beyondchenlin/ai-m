@@ -6,7 +6,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ComfyUIExecutionOrchestrator } from "../comfyui-execution-orchestrator";
+import {
+  ComfyUIExecutionOrchestrator,
+  ExecutionCallbackPersistenceError,
+} from "../comfyui-execution-orchestrator";
 import { connectionManagerRegistry } from "../comfyui-connection-manager";
 import {
   FakeComfyUITransport,
@@ -103,6 +106,22 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.phase).toBe("SUCCEEDED");
     expect(result.externalJobId).toBe(promptId);
     expect(outputs).toHaveLength(1);
+  });
+
+  it("propagates durable callback failures instead of classifying them as execution errors", async () => {
+    const transport = new FakeComfyUITransport({ promptId: "callback-failure" });
+    const injected = new Error("database write failed");
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onPhaseChange: () => { throw new ExecutionCallbackPersistenceError(injected); },
+      },
+      fastConfig(),
+    );
+
+    await expect(orchestrator.execute(workflow)).rejects.toMatchObject({ cause: injected });
   });
 
   it("提交响应丢失后应对账发现任务正在运行并完成", async () => {

@@ -63,6 +63,7 @@ export {
   nextReconciliationDelay,
   classifySubmissionError,
   ComfyUIExecutionOrchestrator,
+  ExecutionCallbackPersistenceError,
 } from "./transports";
 export type {
   ComfyUITransport,

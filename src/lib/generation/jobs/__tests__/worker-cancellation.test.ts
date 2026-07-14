@@ -7,12 +7,14 @@ import { db } from "@/lib/db";
 import {
   executionBackends,
   generationAttempts,
+  generationArtifacts,
   generationEvents,
   generationJobs,
   resourcePools,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { finalizeOwnedExecution, finalizeOwnedJob } from "../state-transitions";
+import { finalizeGenerationFailure, finalizeGenerationSuccess } from "../worker-finalization";
 
 describe("worker terminal transitions", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -36,6 +38,7 @@ describe("worker terminal transitions", () => {
     secondConnection.exec("DROP TRIGGER IF EXISTS ignore_terminal_job_update");
     secondConnection.exec("DROP TRIGGER IF EXISTS ignore_terminal_attempt_update");
     await db.delete(generationEvents);
+    await db.delete(generationArtifacts);
     await db.delete(generationAttempts);
     await db.delete(generationJobs);
     await db.delete(executionBackends);
@@ -109,7 +112,7 @@ describe("worker terminal transitions", () => {
     const result = finalizeOwnedExecution({
       jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },
@@ -137,7 +140,7 @@ describe("worker terminal transitions", () => {
       workerId: "worker-a",
       jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["RUNNING"],
       jobValues: { status: "CANCELLED", completedAtMs: now },
       event: { eventType: "job_cancelled_before_submission", severity: "info", safePayloadJson: {} },
@@ -158,7 +161,7 @@ describe("worker terminal transitions", () => {
     const result = finalizeOwnedExecution({
       jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },
@@ -182,7 +185,7 @@ describe("worker terminal transitions", () => {
     const result = finalizeOwnedExecution({
       jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },
@@ -213,7 +216,7 @@ describe("worker terminal transitions", () => {
     expect(() => finalizeOwnedExecution({
       jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },
@@ -226,6 +229,65 @@ describe("worker terminal transitions", () => {
     expect(job.status).toBe("CANCEL_REQUESTED");
     expect(attempt.phase).toBe("CANCEL_REQUESTED");
     expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+  });
+
+  it("propagates an injected terminal-event failure through the worker finalizer", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    secondConnection.exec(`
+      CREATE TRIGGER reject_terminal_event BEFORE INSERT ON generation_events
+      WHEN NEW.event_type = 'job_failed'
+      BEGIN SELECT RAISE(ABORT, 'worker event rejected'); END
+    `);
+
+    expect(() => finalizeGenerationFailure({
+      jobId,
+      attemptId,
+      workerId: "worker-a",
+      fencingToken: 11,
+      errorMessage: "transport failed",
+      errorClass: "unexpected_error",
+      now,
+    })).toThrow(/worker event rejected/);
+
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe("CANCEL_REQUESTED");
+    expect(attempt.phase).toBe("CANCEL_REQUESTED");
+  });
+
+  it("commits completed output when cancellation was requested during collection", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    const artifactId = crypto.randomUUID();
+    await db.insert(generationArtifacts).values({
+      id: artifactId,
+      attemptId,
+      logicalName: "completed.png",
+      kind: "image",
+      status: "COMMITTED",
+      storageKey: `${attemptId}/${artifactId}.png`,
+      visibility: "project",
+      mimeType: "image/png",
+      sizeBytes: 1,
+      sha256: "a".repeat(64),
+      metadataJson: {},
+      committedAtMs: now,
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
+
+    await expect(finalizeGenerationSuccess({
+      jobId,
+      attemptId,
+      workerId: "worker-a",
+      fencingToken: 11,
+      artifactId,
+      now,
+    })).resolves.toBe(artifactId);
+
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job).toMatchObject({ status: "SUCCEEDED", currentArtifactId: artifactId });
+    expect(attempt.phase).toBe("SUCCEEDED");
   });
 
   it.each([
@@ -245,7 +307,7 @@ describe("worker terminal transitions", () => {
       const result = finalizeOwnedExecution({
         jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
       }, {
-        now,
+        clock: () => now,
         expectedJobStatuses: ["CANCEL_REQUESTED"],
         expectedAttemptPhases: ["CANCEL_REQUESTED"],
         attemptValues: { phase: attemptPhase, finishedAtMs: now },
@@ -273,7 +335,7 @@ describe("worker terminal transitions", () => {
     const result = finalizeOwnedExecution({
       jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
     }, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },
@@ -295,7 +357,7 @@ describe("worker terminal transitions", () => {
     const identity = { jobId, attemptId, workerId: "worker-a", jobFencingToken: 11 };
 
     const completion = finalizeOwnedExecution(identity, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "SUCCEEDED", finishedAtMs: now },
@@ -303,7 +365,7 @@ describe("worker terminal transitions", () => {
       event: { eventType: "job_succeeded", severity: "info", safePayloadJson: {} },
     });
     const cancellation = finalizeOwnedExecution(identity, {
-      now,
+      clock: () => now,
       expectedJobStatuses: ["CANCEL_REQUESTED"],
       expectedAttemptPhases: ["CANCEL_REQUESTED"],
       attemptValues: { phase: "CANCELLED", finishedAtMs: now },

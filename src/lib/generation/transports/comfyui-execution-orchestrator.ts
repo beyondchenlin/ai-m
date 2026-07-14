@@ -68,6 +68,13 @@ export interface ExecutionCallbacks {
   onCancellationResult?: (result: CancellationResult) => void | Promise<void>;
 }
 
+/** A durable callback failed; callers must retain ownership for recovery. */
+export class ExecutionCallbackPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("execution_callback_persistence_failed", { cause });
+  }
+}
+
 /** 执行配置 */
 export interface ExecutionConfig {
   /** 提交超时（ms） */
@@ -236,6 +243,7 @@ export class ComfyUIExecutionOrchestrator {
       await this.setPhase("SUCCEEDED");
       return this.buildResult();
     } catch (err) {
+      if (err instanceof ExecutionCallbackPersistenceError) throw err;
       const error = err instanceof Error ? err : new Error(String(err));
       const classification = classifySubmissionError(error);
       await this.callbacks.onError?.(error, classification.errorClass);
@@ -572,6 +580,7 @@ export class ComfyUIExecutionOrchestrator {
               filename: file.filename, subfolder: file.subfolder, type: file.type, response,
             });
           } catch (error) {
+            if (error instanceof ExecutionCallbackPersistenceError) throw error;
             const failure = error instanceof Error ? error : new Error(String(error));
             await this.callbacks.onError?.(failure, "collection_error");
             return false;
@@ -586,6 +595,7 @@ export class ComfyUIExecutionOrchestrator {
       this.outputCollected = true;
       return true;
     } catch (err) {
+      if (err instanceof ExecutionCallbackPersistenceError) throw err;
       const error = err instanceof Error ? err : new Error(String(err));
       await this.callbacks.onError?.(error, "collection_error");
       return false;

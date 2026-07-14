@@ -68,7 +68,7 @@ export type {
   ReconciliationConfig,
 } from "./comfyui-reconciliation";
 
-export { ComfyUIExecutionOrchestrator } from "./comfyui-execution-orchestrator";
+export { ComfyUIExecutionOrchestrator, ExecutionCallbackPersistenceError } from "./comfyui-execution-orchestrator";
 export type {
   OrchestratorPhase,
   ExecutionCallbacks,

@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import * as schema from "@/lib/db/schema";
 import { db } from "@/lib/db";
 import {
@@ -12,16 +14,9 @@ import {
   resourcePools,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
-import { scanExpiredClaimsWithTransitionForTest } from "../../resources/leases";
 import { recoverExpiredJob, updateOwnedAttempt, type ExpiredJobSnapshot } from "../state-transitions";
 
 type RecoverableJobStatus = "RUNNING" | "CANCEL_REQUESTED";
-
-function deferred<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
-}
 
 describe("expired claim recovery concurrency", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -121,15 +116,22 @@ describe("expired claim recovery concurrency", () => {
     "does not recover a %s snapshot after the worker crosses the external submission boundary",
     async (status) => {
       const { jobId, attemptId } = await seedExpiredPreparingJob(status);
-
-      const candidateRead = deferred<ExpiredJobSnapshot>();
-      const releaseRecovery = deferred();
-      const recovery = scanExpiredClaimsWithTransitionForTest(async (snapshot, now) => {
-        candidateRead.resolve(snapshot);
-        await releaseRecovery.promise;
-        return recoverExpiredJob(snapshot, now);
-      });
-      const snapshot = await candidateRead.promise;
+      const [jobBefore] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+      const [attemptBefore] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+      const snapshot: ExpiredJobSnapshot = {
+        jobId,
+        jobStatus: status,
+        claimOwner: jobBefore.claimOwner!,
+        claimUntilMs: jobBefore.claimUntilMs!,
+        claimFencingToken: jobBefore.claimFencingToken,
+        currentAttemptId: attemptId,
+        attempt: {
+          id: attemptId,
+          phase: attemptBefore.phase,
+          jobClaimFencingToken: attemptBefore.jobClaimFencingToken,
+          externalJobId: attemptBefore.externalJobId,
+        },
+      };
       expect(snapshot.attempt).toMatchObject({
         id: attemptId,
         phase: "PREPARING",
@@ -144,19 +146,14 @@ describe("expired claim recovery concurrency", () => {
         `).run(1_750_000_000_001, attemptId);
         expect(attempt.changes).toBe(1);
       }).immediate();
-      releaseRecovery.resolve();
-
-      const result = await recovery;
+      const result = recoverExpiredJob(snapshot, undefined, () => 1_750_000_000_100);
       const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
       const [attempt] = await db.select().from(generationAttempts).where(and(
         eq(generationAttempts.id, attemptId),
         eq(generationAttempts.jobId, jobId),
       ));
 
-      expect(result.requeuedJobs).not.toContain(jobId);
-      expect(result.cancelledJobs).not.toContain(jobId);
-      expect(result.attentionJobs).not.toContain(jobId);
-      expect(result.outcomes).toEqual([{ jobId, status: "lost-race" }]);
+      expect(result).toEqual({ status: "lost-race" });
       expect(job.status).toBe(status);
       expect(job.currentAttemptId).toBe(attemptId);
       expect(attempt.phase).toBe("SUBMITTING");
@@ -196,11 +193,12 @@ describe("expired claim recovery concurrency", () => {
       workerId: "worker-a",
       jobFencingToken: 7,
     }, {
-      now: workerNow,
+      clock: () => workerNow,
       expectedPhases: ["PREPARING"],
-      values: { phase: "SUBMITTING", externalJobId: "external-race-2" },
+      nextPhase: "SUBMITTING",
+      values: { externalJobId: "external-race-2" },
     }, workerDb);
-    const recoveryResult = recoverExpiredJob(scannerSnapshot, workerNow + 200);
+    const recoveryResult = recoverExpiredJob(scannerSnapshot, undefined, () => workerNow + 200);
 
     expect(workerResult).toEqual({ status: "applied" });
     expect(recoveryResult).toEqual({ status: "lost-race" });
@@ -221,10 +219,48 @@ describe("expired claim recovery concurrency", () => {
       workerId: "worker-a",
       jobFencingToken: 7,
     }, {
-      now,
+      clock: () => now,
       expectedPhases: ["PREPARING"],
-      values: { phase: "SUBMITTING", externalJobId: "must-not-persist" },
+      nextPhase: "SUBMITTING",
+      values: { externalJobId: "must-not-persist" },
     }, workerDb);
+
+    expect(result).toEqual({ status: "ownership-lost" });
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(attempt).toMatchObject({ phase: "PREPARING", externalJobId: null });
+  });
+
+  it("reads lease time after waiting for the BEGIN IMMEDIATE writer lock", async () => {
+    const { jobId, attemptId } = await seedExpiredPreparingJob("RUNNING");
+    const observedAtMs = Date.now();
+    await db.update(generationJobs).set({ claimUntilMs: observedAtMs + 100 })
+      .where(eq(generationJobs.id, jobId));
+
+    const locker = spawn(process.execPath, ["-e", `
+      const Database = require('better-sqlite3');
+      const database = new Database(process.argv[1]);
+      database.pragma('busy_timeout = 5000');
+      database.exec('BEGIN IMMEDIATE');
+      process.stdout.write('locked\\n');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+      database.exec('COMMIT');
+      database.close();
+    `, ctx.dbPath], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
+    const lockerExited = once(locker, "exit");
+    await once(locker.stdout!, "data");
+
+    const workerDb = drizzle(workerConnection, { schema });
+    const result = updateOwnedAttempt({
+      jobId,
+      attemptId,
+      workerId: "worker-a",
+      jobFencingToken: 7,
+    }, {
+      expectedPhases: ["PREPARING"],
+      nextPhase: "SUBMITTING",
+      values: { externalJobId: "must-not-persist" },
+    }, workerDb);
+    await lockerExited;
 
     expect(result).toEqual({ status: "ownership-lost" });
     const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
@@ -255,7 +291,7 @@ describe("expired claim recovery concurrency", () => {
       BEGIN SELECT RAISE(IGNORE); END
     `);
 
-    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+    const result = recoverExpiredJob(snapshot, undefined, () => 1_750_000_000_100);
 
     expect(result).toEqual({ status: "lost-race" });
     const [currentJob] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
@@ -289,7 +325,7 @@ describe("expired claim recovery concurrency", () => {
       BEGIN SELECT RAISE(IGNORE); END
     `);
 
-    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+    const result = recoverExpiredJob(snapshot, undefined, () => 1_750_000_000_100);
 
     expect(result).toEqual({ status: "lost-race" });
     const [currentJob] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
@@ -319,7 +355,7 @@ describe("expired claim recovery concurrency", () => {
       },
     };
 
-    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+    const result = recoverExpiredJob(snapshot, undefined, () => 1_750_000_000_100);
 
     expect(result).toEqual({ status: "applied", disposition: "requeued" });
     const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));

@@ -4,9 +4,10 @@ import { generationAttempts, generationEvents, generationJobs } from "@/lib/db/s
 import { id as genId } from "@/lib/id";
 
 type JobStatus = typeof generationJobs.$inferSelect.status;
-type AttemptPhase = typeof generationAttempts.$inferSelect.phase;
+export type AttemptPhase = typeof generationAttempts.$inferSelect.phase;
 export type OwnedAttemptValues = Partial<Omit<typeof generationAttempts.$inferInsert,
   "id" | "jobId" | "attemptNo" | "jobClaimFencingToken" | "createdAtMs">>;
+export type OwnedAttemptPatch = Omit<OwnedAttemptValues, "phase">;
 
 export type TransitionResult<T extends object = object> =
   | ({ status: "applied" } & T)
@@ -64,11 +65,12 @@ function rollbackLostRace(): never {
  */
 export function recoverExpiredJob(
   snapshot: ExpiredJobSnapshot,
-  now: number,
   database: DB = db,
+  clock: () => number = Date.now,
 ): TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }> {
   try {
     return database.transaction((tx) => {
+      const now = clock();
       const currentJob = tx.select().from(generationJobs)
         .where(eq(generationJobs.id, snapshot.jobId)).get();
       if (!currentJob) return { status: "lost-race" } as const;
@@ -184,7 +186,7 @@ export function recoverExpiredJob(
 export function attachOwnedAttempt(
   identity: OwnedJobIdentity,
   input: {
-    now: number;
+    clock?: () => number;
     attempt: typeof generationAttempts.$inferInsert;
   },
   database: DB = db,
@@ -196,6 +198,7 @@ export function attachOwnedAttempt(
   }
   try {
     return database.transaction((tx) => {
+      const now = input.clock?.() ?? Date.now();
       const current = tx.select().from(generationJobs)
         .where(eq(generationJobs.id, identity.jobId)).get();
       if (!current
@@ -203,7 +206,7 @@ export function attachOwnedAttempt(
         || current.claimOwner !== identity.workerId
         || current.claimFencingToken !== identity.jobFencingToken
         || current.claimUntilMs === null
-        || current.claimUntilMs < input.now
+        || current.claimUntilMs < now
         || current.status !== "RUNNING") {
         return { status: "ownership-lost" } as const;
       }
@@ -214,7 +217,7 @@ export function attachOwnedAttempt(
 
       const attached = tx.update(generationJobs).set({
         currentAttemptId: input.attempt.id,
-        updatedAtMs: input.now,
+        updatedAtMs: now,
       }).where(and(
         eq(generationJobs.id, identity.jobId),
         eq(generationJobs.status, "RUNNING"),
@@ -235,9 +238,10 @@ export function attachOwnedAttempt(
 export function updateOwnedAttempt(
   identity: OwnedAttemptIdentity,
   input: {
-    now: number;
-    expectedPhases?: readonly AttemptPhase[];
-    values: OwnedAttemptValues;
+    clock?: () => number;
+    expectedPhases: readonly AttemptPhase[];
+    nextPhase?: AttemptPhase;
+    values: OwnedAttemptPatch;
     event?: {
       eventType: string;
       severity: typeof generationEvents.$inferInsert.severity;
@@ -247,6 +251,7 @@ export function updateOwnedAttempt(
   database: DB = db,
 ): TransitionResult {
   return database.transaction((tx) => {
+    const now = input.clock?.() ?? Date.now();
     const current = tx.select({
       attemptPhase: generationAttempts.phase,
       attemptToken: generationAttempts.jobClaimFencingToken,
@@ -267,17 +272,18 @@ export function updateOwnedAttempt(
       || current.claimFencingToken !== identity.jobFencingToken
       || current.attemptToken !== identity.jobFencingToken
       || current.claimUntilMs === null
-      || current.claimUntilMs < input.now
+      || current.claimUntilMs < now
       || !(["RUNNING", "CANCEL_REQUESTED"] as JobStatus[]).includes(current.jobStatus)) {
       return { status: "ownership-lost" } as const;
     }
-    if (input.expectedPhases && !input.expectedPhases.includes(current.attemptPhase)) {
+    if (!input.expectedPhases.includes(current.attemptPhase)) {
       return { status: "invalid-transition" } as const;
     }
 
     const changed = tx.update(generationAttempts).set({
       ...input.values,
-      updatedAtMs: input.now,
+      ...(input.nextPhase ? { phase: input.nextPhase } : {}),
+      updatedAtMs: now,
     }).where(and(
       eq(generationAttempts.id, identity.attemptId),
       eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
@@ -291,7 +297,7 @@ export function updateOwnedAttempt(
         jobId: identity.jobId,
         attemptId: identity.attemptId,
         ...input.event,
-        createdAtMs: input.now,
+        createdAtMs: now,
       }).run();
     }
     return { status: "applied" } as const;
@@ -302,7 +308,7 @@ export function updateOwnedAttempt(
 export function finalizeOwnedExecution(
   identity: OwnedAttemptIdentity,
   input: {
-    now: number;
+    clock?: () => number;
     expectedJobStatuses: readonly ("RUNNING" | "CANCEL_REQUESTED")[];
     expectedAttemptPhases: readonly AttemptPhase[];
     attemptValues: OwnedAttemptValues;
@@ -318,6 +324,7 @@ export function finalizeOwnedExecution(
 ): TransitionResult {
   try {
     return database.transaction((tx) => {
+      const now = input.clock?.() ?? Date.now();
       const current = tx.select({
         attemptPhase: generationAttempts.phase,
         attemptToken: generationAttempts.jobClaimFencingToken,
@@ -338,7 +345,7 @@ export function finalizeOwnedExecution(
         || current.claimFencingToken !== identity.jobFencingToken
         || current.attemptToken !== identity.jobFencingToken
         || current.claimUntilMs === null
-        || current.claimUntilMs < input.now
+        || current.claimUntilMs < now
         || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
         return { status: "ownership-lost" } as const;
       }
@@ -349,7 +356,7 @@ export function finalizeOwnedExecution(
 
       const attemptChanged = tx.update(generationAttempts).set({
         ...input.attemptValues,
-        updatedAtMs: input.now,
+        updatedAtMs: now,
       }).where(and(
         eq(generationAttempts.id, identity.attemptId),
         eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
@@ -359,7 +366,7 @@ export function finalizeOwnedExecution(
 
       const jobChanged = tx.update(generationJobs).set({
         ...input.jobValues,
-        updatedAtMs: input.now,
+        updatedAtMs: now,
       }).where(and(
         eq(generationJobs.id, identity.jobId),
         eq(generationJobs.status, current.jobStatus),
@@ -374,7 +381,7 @@ export function finalizeOwnedExecution(
         jobId: identity.jobId,
         attemptId: identity.attemptId,
         ...input.event,
-        createdAtMs: input.now,
+        createdAtMs: now,
       }).run();
       return { status: "applied" } as const;
     }, { behavior: "immediate" });
@@ -388,7 +395,7 @@ export function finalizeOwnedExecution(
 export function finalizeOwnedJob(
   identity: OwnedJobIdentity,
   input: {
-    now: number;
+    clock?: () => number;
     expectedJobStatuses: readonly ("RUNNING" | "CANCEL_REQUESTED")[];
     jobValues: Partial<Omit<typeof generationJobs.$inferInsert,
       "id" | "currentAttemptId" | "claimOwner" | "claimUntilMs" | "claimFencingToken" | "createdAtMs">>;
@@ -401,6 +408,7 @@ export function finalizeOwnedJob(
   database: DB = db,
 ): TransitionResult {
   return database.transaction((tx) => {
+    const now = input.clock?.() ?? Date.now();
     const current = tx.select().from(generationJobs)
       .where(eq(generationJobs.id, identity.jobId)).get();
     if (!current
@@ -408,7 +416,7 @@ export function finalizeOwnedJob(
       || current.claimOwner !== identity.workerId
       || current.claimFencingToken !== identity.jobFencingToken
       || current.claimUntilMs === null
-      || current.claimUntilMs < input.now
+      || current.claimUntilMs < now
       || (current.status !== "RUNNING" && current.status !== "CANCEL_REQUESTED")) {
       return { status: "ownership-lost" } as const;
     }
@@ -417,7 +425,7 @@ export function finalizeOwnedJob(
     }
     const changed = tx.update(generationJobs).set({
       ...input.jobValues,
-      updatedAtMs: input.now,
+      updatedAtMs: now,
     }).where(and(
       eq(generationJobs.id, identity.jobId),
       eq(generationJobs.status, current.status),
@@ -430,7 +438,7 @@ export function finalizeOwnedJob(
       jobId: identity.jobId,
       attemptId: null,
       ...input.event,
-      createdAtMs: input.now,
+      createdAtMs: now,
     }).run();
     return { status: "applied" } as const;
   }, { behavior: "immediate" });

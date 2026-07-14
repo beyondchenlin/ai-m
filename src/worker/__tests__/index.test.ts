@@ -36,7 +36,12 @@ vi.mock("@/lib/generation/resources/leases", () => ({
 }));
 
 vi.mock("@/lib/generation/worker-executor", () => ({
-  executeGenerationJob: vi.fn(() => Promise.resolve({ success: true, finalPhase: "SUCCEEDED" })),
+  executeGenerationJob: vi.fn(() => Promise.resolve({
+    success: true,
+    finalPhase: "SUCCEEDED",
+    needsAttention: false,
+    claimDisposition: "release-terminal",
+  })),
 }));
 
 describe("PR-11: Worker 信号处理", () => {
