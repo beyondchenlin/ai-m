@@ -162,6 +162,17 @@ cd AIComicBuilder
 docker build -t ai-comic-builder .
 ```
 
+不传构建参数时仍可正常构建，设置页会使用“开发版本”和“未提供”作为可选元数据的回退值。发布流水线可显式传入经过校验的提交与构建时间：
+
+```bash
+docker build \
+  --build-arg AI_M_BUILD_COMMIT=<7-to-64-hex-commit> \
+  --build-arg AI_M_BUILD_TIME=2026-01-01T00:00:00.000Z \
+  -t ai-comic-builder .
+```
+
+为保证构建可复现，同一源码重建时复用相同的 UTC 构建时间；该值应由发布流水线从已锁定的发布元数据生成，不要使用构建机器的当前时间。两个 build arg 仅在 builder 阶段传给 Next.js 构建，不会作为 runner 镜像的运行时环境变量保留。
+
 ## 生成流水线
 
 ```

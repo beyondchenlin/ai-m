@@ -16,6 +16,8 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 FROM deps AS builder
+ARG AI_M_BUILD_COMMIT
+ARG AI_M_BUILD_TIME
 WORKDIR /app
 COPY . .
 RUN pnpm worker:build && pnpm build
