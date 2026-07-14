@@ -11,6 +11,7 @@ import {
 import Database from "better-sqlite3";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import path from "node:path";
+import { prepareMigrationJournal } from "../index";
 
 const migrations: MigrationMetadata[] = [
   { folderMillis: 30, hash: "three" },
@@ -212,5 +213,80 @@ describe("journal-less full-schema evidence", () => {
   it("caches immutable expected inventories safely per migration build", () => {
     expect(buildExpectedSchemaInventories(repositoryMigrations))
       .toBe(buildExpectedSchemaInventories(repositoryMigrations));
+  });
+});
+
+describe("migration journal startup ordering", () => {
+  const repositoryMigrations = readMigrationFiles({ migrationsFolder: path.resolve("drizzle") });
+
+  function legacyVisualDatabase(rows: Array<{ hash: string; createdAt: number }>): Database.Database {
+    const sqlite = new Database(":memory:");
+    sqlite.exec(`
+      CREATE TABLE "__drizzle_migrations" (
+        id INTEGER PRIMARY KEY,
+        hash text NOT NULL,
+        created_at numeric
+      );
+      CREATE TABLE visual_subjects (
+        id text PRIMARY KEY,
+        identity_anchors_json text NOT NULL,
+        multi_angle_references_json text NOT NULL
+      );
+      CREATE TABLE visual_subject_versions (
+        id text PRIMARY KEY,
+        snapshot_json text NOT NULL
+      );
+    `);
+    const insert = sqlite.prepare(
+      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
+    );
+    for (const row of rows) insert.run(row.hash, row.createdAt);
+    return sqlite;
+  }
+
+  const validLegacyRows = repositoryMigrations.slice(0, 56).map((migration) => ({
+    hash: migration.hash,
+    createdAt: migration.folderMillis,
+  }));
+
+  it.each([
+    ["bad prior hash", validLegacyRows.map((row, index) => index === 20
+      ? { ...row, hash: "bad-prior-hash" }
+      : row), /hash mismatch/i],
+    ["duplicate timestamp", validLegacyRows.map((row, index) => index === 20
+      ? { ...row, createdAt: validLegacyRows[19].createdAt, hash: validLegacyRows[19].hash }
+      : row), /duplicate recorded migration timestamp/i],
+    ["unknown timestamp", validLegacyRows.map((row, index) => index === 20
+      ? { ...row, createdAt: 123456789, hash: "unknown" }
+      : row), /unknown migration timestamp/i],
+  ])("does not mutate a 56-row legacy journal with a %s", (_name, rows, error) => {
+    const sqlite = legacyVisualDatabase(rows);
+    try {
+      expect(() => prepareMigrationJournal(sqlite, repositoryMigrations)).toThrow(error);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+        .toEqual({ count: 56 });
+      expect(sqlite.prepare(
+        'SELECT COUNT(*) count FROM "__drizzle_migrations" WHERE created_at = ?',
+      ).get(LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP)).toEqual({ count: 0 });
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  it("validates, inserts exact 0056, and validates the repaired journal", () => {
+    const sqlite = legacyVisualDatabase(validLegacyRows);
+    try {
+      prepareMigrationJournal(sqlite, repositoryMigrations);
+      expect(sqlite.prepare(
+        'SELECT hash, created_at createdAt FROM "__drizzle_migrations" WHERE created_at = ?',
+      ).get(LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP)).toEqual({
+        hash: repositoryMigrations[56].hash,
+        createdAt: LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
+      });
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+        .toEqual({ count: 57 });
+    } finally {
+      sqlite.close();
+    }
   });
 });

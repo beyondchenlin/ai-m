@@ -168,6 +168,16 @@ function reconcileLegacyVisualSubjectJournalGap(
   if (repaired) console.log("[DB] Reconciled legacy 0056 journal gap after strict schema verification");
 }
 
+/** Validate both sides of the sole supported legacy journal repair. */
+export function prepareMigrationJournal(
+  sqlite: SqliteConnection,
+  migrations: MigrationMetadata[],
+): void {
+  validateRecordedMigrationJournal(sqlite, migrations);
+  reconcileLegacyVisualSubjectJournalGap(sqlite, migrations);
+  validateRecordedMigrationJournal(sqlite, migrations);
+}
+
 export function runMigrations() {
   const sqlite = getSqlite();
   const migrationsFolder = path.resolve("drizzle");
@@ -177,10 +187,7 @@ export function runMigrations() {
     readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMetadata[];
   };
   const migrations = readMigrationFiles({ migrationsFolder });
-  // Reject ambiguous build metadata before any recovery write is considered.
-  validateMigrationJournal([], migrations);
-  reconcileLegacyVisualSubjectJournalGap(sqlite, migrations);
-  validateRecordedMigrationJournal(sqlite, migrations);
+  prepareMigrationJournal(sqlite, migrations);
 
   const confirmedBaselineCount = detectJournalLessBaselineMigrationCount({
     journalRowCount: getRecordedMigrationCount(sqlite),
