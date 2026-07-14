@@ -2,14 +2,16 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  detectJournalLessBaselineMigrationCount,
+  selectLegacyVisualSubjectJournalRepair,
+  validateMigrationJournal,
+  type MigrationJournalRow,
+  type MigrationMetadata,
+} from "./migration-journal";
 
 type DrizzleDB = ReturnType<typeof drizzle<typeof schema>>;
 type SqliteConnection = import("better-sqlite3").Database;
-type MigrationMeta = {
-  folderMillis: number;
-  hash: string;
-};
-
 const globalForDb = globalThis as unknown as {
   sqlite: SqliteConnection | undefined;
   drizzleDb: DrizzleDB | undefined;
@@ -66,26 +68,6 @@ function tableExists(sqlite: SqliteConnection, tableName: string) {
   return Boolean(row);
 }
 
-function schemaObjectExists(sqlite: SqliteConnection, type: "index" | "trigger", name: string): boolean {
-  return Boolean(sqlite.prepare<[string, string], { name: string }>(
-    "SELECT name FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
-  ).get(type, name));
-}
-
-function columnExists(
-  sqlite: SqliteConnection,
-  tableName: string,
-  columnName: string,
-) {
-  if (!tableExists(sqlite, tableName)) return false;
-
-  const columns = sqlite
-    .prepare<[], { name: string }>(`PRAGMA table_info("${tableName}")`)
-    .all();
-
-  return columns.some((column) => column.name === columnName);
-}
-
 function ensureMigrationsTable(sqlite: SqliteConnection) {
   sqlite.prepare(`
     CREATE TABLE IF NOT EXISTS "__drizzle_migrations" (
@@ -120,79 +102,11 @@ function getAppTableCount(sqlite: SqliteConnection) {
   return Number(row?.count ?? 0);
 }
 
-function isCurrentSchemaSnapshot(sqlite: SqliteConnection) {
-  return (
-    columnExists(sqlite, "projects", "user_id") &&
-    columnExists(sqlite, "projects", "world_setting") &&
-    tableExists(sqlite, "episodes") &&
-    tableExists(sqlite, "shot_assets") &&
-    tableExists(sqlite, "agents") &&
-    columnExists(sqlite, "agents", "platform") &&
-    tableExists(sqlite, "agent_bindings")
-  );
-}
-
-function detectConfirmedBaselineMigrationCount(sqlite: SqliteConnection): number {
-  if (getRecordedMigrationCount(sqlite) !== 0 || getAppTableCount(sqlite) === 0) return 0;
-  if (!isCurrentSchemaSnapshot(sqlite)) return 0;
-
-  // Legacy application schema is confirmed through 0053. Newer platform
-  // migrations are recorded only when their own tables/columns exist. Never
-  // mark migrations as applied merely because an unrelated application table
-  // exists.
-  const markers = [
-    tableExists(sqlite, "resource_pools")
-      && tableExists(sqlite, "generation_jobs")
-      && tableExists(sqlite, "workflow_package_revisions"),
-    tableExists(sqlite, "key_references"),
-    tableExists(sqlite, "visual_subjects") && tableExists(sqlite, "visual_subject_versions"),
-    columnExists(sqlite, "workflow_package_revisions", "workflow_api_json")
-      && columnExists(sqlite, "generation_jobs", "idempotency_key")
-      && columnExists(sqlite, "generation_attempts", "job_claim_fencing_token")
-      && tableExists(sqlite, "voice_profiles")
-      && tableExists(sqlite, "workflow_backend_validations")
-      && schemaObjectExists(sqlite, "index", "generation_jobs_idempotency_unique")
-      && schemaObjectExists(sqlite, "index", "generation_jobs_active_dedupe_unique")
-      && schemaObjectExists(sqlite, "trigger", "generation_job_terminal_status_guard"),
-    tableExists(sqlite, "source_media_assets")
-      && tableExists(sqlite, "generation_job_source_assets")
-      && columnExists(sqlite, "voice_profiles", "reference_source_asset_id")
-      && schemaObjectExists(sqlite, "index", "source_media_assets_storage_key_unique")
-      && schemaObjectExists(sqlite, "index", "source_media_assets_owner_project_idx")
-      && schemaObjectExists(sqlite, "index", "generation_job_source_assets_asset_idx"),
-    columnExists(sqlite, "generation_jobs", "idempotency_request_digest")
-      && columnExists(sqlite, "voice_profiles", "consent_statement_version")
-      && schemaObjectExists(sqlite, "index", "source_media_assets_status_updated_idx")
-      && schemaObjectExists(sqlite, "index", "voice_profiles_reference_source_asset_idx")
-      && schemaObjectExists(sqlite, "index", "generation_jobs_claim_queue_idx")
-      && [
-        "source_media_assets_validate_insert", "source_media_assets_validate_update",
-        "source_media_assets_status_transition_guard", "voice_profiles_validate_insert",
-        "voice_profiles_validate_update", "voice_profiles_immutable_identity_guard",
-        "voice_profiles_source_reference_guard_insert", "voice_profiles_source_reference_guard_update",
-        "generation_job_source_assets_guard_insert", "source_media_assets_delete_reference_guard",
-        "source_media_assets_immutable_content_guard", "generation_jobs_idempotency_digest_guard_insert",
-        "generation_jobs_idempotency_digest_guard_update", "generation_jobs_idempotency_identity_guard",
-      ].every((name) => schemaObjectExists(sqlite, "trigger", name)),
-  ];
-  const firstMissing = markers.indexOf(false);
-  if (firstMissing >= 0 && markers.slice(firstMissing + 1).some(Boolean)) {
-    throw new Error(`Database schema drift: migration ${55 + firstMissing} is incomplete while a later migration is present`);
-  }
-  return 54 + (firstMissing < 0 ? markers.length : firstMissing);
-}
-
 function baselineMigrations(
   sqlite: SqliteConnection,
-  migrationsFolder: string,
+  migrations: MigrationMetadata[],
   confirmedCount: number,
 ) {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { readMigrationFiles } = require("drizzle-orm/migrator") as {
-    readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMeta[];
-  };
-
-  const migrations = readMigrationFiles({ migrationsFolder });
   if (confirmedCount > migrations.length) {
     throw new Error(`Confirmed migration count ${confirmedCount} exceeds available migrations ${migrations.length}`);
   }
@@ -207,35 +121,75 @@ function baselineMigrations(
   })();
 }
 
-function validateRecordedMigrationPrefix(sqlite: SqliteConnection, migrationsFolder: string): void {
-  const rows = sqlite.prepare<[], { hash: string; createdAt: number }>(
-    'SELECT hash, created_at AS createdAt FROM "__drizzle_migrations" ORDER BY created_at, rowid',
+function readMigrationJournal(sqlite: SqliteConnection): MigrationJournalRow[] {
+  return sqlite.prepare<[], MigrationJournalRow>(
+    'SELECT hash, created_at AS createdAt FROM "__drizzle_migrations" ORDER BY rowid',
   ).all();
-  if (!rows.length) return;
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { readMigrationFiles } = require("drizzle-orm/migrator") as {
-    readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMeta[];
-  };
-  const migrations = readMigrationFiles({ migrationsFolder });
-  if (rows.length > migrations.length) throw new Error("Migration journal is ahead of this application build");
-  rows.forEach((row, index) => {
-    const expected = migrations[index];
-    if (row.hash !== expected.hash || Number(row.createdAt) !== expected.folderMillis) {
-      throw new Error(`Migration journal drift at index ${index}; refusing to guess schema state`);
+}
+
+function validateRecordedMigrationJournal(
+  sqlite: SqliteConnection,
+  migrations: MigrationMetadata[],
+): void {
+  const rows = sqlite.prepare<[], { hash: string; createdAt: number }>(
+    'SELECT hash, created_at AS createdAt FROM "__drizzle_migrations" ORDER BY rowid',
+  ).all();
+  validateMigrationJournal(rows, migrations);
+}
+
+function readTableColumns(sqlite: SqliteConnection, tableName: string): string[] | null {
+  if (!tableExists(sqlite, tableName)) return null;
+  const escapedName = tableName.replace(/"/g, '""');
+  return sqlite.prepare<[], { name: string }>(`PRAGMA table_info("${escapedName}")`)
+    .all().map((column) => column.name);
+}
+
+function reconcileLegacyVisualSubjectJournalGap(
+  sqlite: SqliteConnection,
+  migrations: MigrationMetadata[],
+): void {
+  let repaired = false;
+  sqlite.transaction(() => {
+    const tables: Record<string, string[]> = {};
+    for (const tableName of ["visual_subjects", "visual_subject_versions"]) {
+      const columns = readTableColumns(sqlite, tableName);
+      if (columns) tables[tableName] = columns;
     }
-  });
+    const repair = selectLegacyVisualSubjectJournalRepair({
+      journalRows: readMigrationJournal(sqlite),
+      tables,
+    }, migrations);
+    if (!repair) return;
+    sqlite.prepare<[string, number]>(
+      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
+    ).run(repair.hash, repair.folderMillis);
+    repaired = true;
+  }).immediate();
+  if (repaired) console.log("[DB] Reconciled legacy 0056 journal gap after strict schema verification");
 }
 
 export function runMigrations() {
   const sqlite = getSqlite();
   const migrationsFolder = path.resolve("drizzle");
   ensureMigrationsTable(sqlite);
-  validateRecordedMigrationPrefix(sqlite, migrationsFolder);
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { readMigrationFiles } = require("drizzle-orm/migrator") as {
+    readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMetadata[];
+  };
+  const migrations = readMigrationFiles({ migrationsFolder });
+  // Reject ambiguous build metadata before any recovery write is considered.
+  validateMigrationJournal([], migrations);
+  reconcileLegacyVisualSubjectJournalGap(sqlite, migrations);
+  validateRecordedMigrationJournal(sqlite, migrations);
 
-  const confirmedBaselineCount = detectConfirmedBaselineMigrationCount(sqlite);
+  const confirmedBaselineCount = detectJournalLessBaselineMigrationCount({
+    journalRowCount: getRecordedMigrationCount(sqlite),
+    appTableCount: getAppTableCount(sqlite),
+    readActualInventory: () => sqlite,
+  }, migrations);
   if (confirmedBaselineCount > 0) {
     console.log(`[DB] Existing schema detected. Baselining ${confirmedBaselineCount} confirmed migrations...`);
-    baselineMigrations(sqlite, migrationsFolder, confirmedBaselineCount);
+    baselineMigrations(sqlite, migrations, confirmedBaselineCount);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
