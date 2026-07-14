@@ -13,6 +13,7 @@ import {
   baselineJournalLessDatabase,
   applyPendingMigrations,
   computeMigrationsManifestDigest,
+  initializeOwnedSqliteConnection,
   loadValidatedMigrationBundle,
   prepareMigrationJournal,
   resolveMigrationsFolder,
@@ -50,6 +51,66 @@ describe("migration journal startup ordering", () => {
     hash: migration.hash,
     createdAt: migration.folderMillis,
   }));
+
+  it.each([
+    ["SQLITE_BUSY", false, 3, 0, 2],
+    ["SQLITE_LOCKED", false, 3, 0, 2],
+    ["SQLITE_BUSY", true, 1, 1, 0],
+    ["SQLITE_LOCKED", true, 1, 1, 0],
+    ["SQLITE_IOERR", false, 1, 1, 0],
+  ])("handles WAL initialization error %s (timeout=%s)", (code, timeout, expectedAttempts, expectedCloses, expectedWaits) => {
+    let walAttempts = 0;
+    let closes = 0;
+    let waits = 0;
+    let nowCalls = 0;
+    const sqlite = {
+      pragma(value: string) {
+        if (value !== "journal_mode = WAL") return;
+        walAttempts += 1;
+        if (timeout || walAttempts < 3 || code === "SQLITE_IOERR") {
+          throw Object.assign(new Error("wal failed"), { code });
+        }
+      },
+      close() { closes += 1; },
+    };
+    let caught: unknown;
+    try {
+      initializeOwnedSqliteConnection(sqlite as unknown as Parameters<typeof initializeOwnedSqliteConnection>[0], {
+        now: () => timeout && nowCalls++ > 0 ? 6_000 : 0,
+        wait: () => { waits += 1; },
+        timeoutMilliseconds: 5_000,
+      });
+    } catch (error) { caught = error; }
+    expect({
+      walAttempts,
+      closes,
+      waits,
+      ...(expectedCloses ? { code: (caught as { code?: string })?.code } : {}),
+    }).toEqual({ walAttempts: expectedAttempts, closes: expectedCloses, waits: expectedWaits,
+      ...(expectedCloses ? { code } : {}) });
+  });
+
+  it.each(["busy_timeout = 5000", "foreign_keys = ON"])(
+    "closes exactly once when %s initialization fails and preserves the original error",
+    (failedPragma) => {
+      let closes = 0;
+      const sqlite = {
+        pragma(value: string) {
+          if (value === failedPragma) throw Object.assign(new Error("original setup failure"), { code: "SQLITE_IOERR" });
+        },
+        close() { closes += 1; throw new Error("close failure"); },
+      };
+      let caught: unknown;
+      try {
+        initializeOwnedSqliteConnection(sqlite as unknown as Parameters<typeof initializeOwnedSqliteConnection>[0]);
+      } catch (error) { caught = error; }
+      const aggregate = caught as AggregateError;
+      expect(closes).toBe(1);
+      expect([aggregate.message, (aggregate.cause as Error)?.message,
+        ...((aggregate.errors ?? []) as Error[]).map((error) => error.message)])
+        .toContain("original setup failure");
+    },
+  );
 
   it.each([
     ["bad prior hash", validLegacyRows.map((row, index) => index === 20

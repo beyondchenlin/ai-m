@@ -18,6 +18,50 @@ const globalForDb = globalThis as unknown as {
   drizzleDb: DrizzleDB | undefined;
 };
 
+type SqliteInitializationOptions = {
+  now?: () => number;
+  wait?: (milliseconds: number) => void;
+  timeoutMilliseconds?: number;
+};
+
+export function initializeOwnedSqliteConnection<T extends Pick<SqliteConnection, "pragma" | "close">>(
+  sqlite: T,
+  options: SqliteInitializationOptions = {},
+): T {
+  const now = options.now ?? Date.now;
+  const wait = options.wait ?? ((milliseconds: number) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+  });
+  try {
+    sqlite.pragma("busy_timeout = 5000");
+    const deadline = now() + (options.timeoutMilliseconds ?? 5_000);
+    for (;;) {
+      try {
+        sqlite.pragma("journal_mode = WAL");
+        break;
+      } catch (error) {
+        let code: unknown;
+        try { code = typeof error === "object" && error !== null ? Reflect.get(error, "code") : undefined; }
+        catch { code = undefined; }
+        if ((code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED") || now() >= deadline) throw error;
+        wait(20);
+      }
+    }
+    sqlite.pragma("foreign_keys = ON");
+    return sqlite;
+  } catch (initializationError) {
+    try { sqlite.close(); }
+    catch (closeError) {
+      throw new AggregateError(
+        [initializationError, closeError],
+        "SQLite initialization and cleanup both failed",
+        { cause: initializationError },
+      );
+    }
+    throw initializationError;
+  }
+}
+
 function resolveDbPath() {
   // Dynamic require to avoid loading native binary at build time
   const dbPath = process.env.DATABASE_URL?.replace("file:", "") || "./data/aicomic.db";
@@ -35,27 +79,8 @@ export function getSqlite(): SqliteConnection {
   // Ensure the directory exists before opening the database
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
 
-  const sqlite = new Database(absolutePath);
-  // Web and worker processes share the same SQLite file. Give short-lived
-  // writers time to finish instead of surfacing transient SQLITE_BUSY errors.
-  sqlite.pragma("busy_timeout = 5000");
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    try {
-      sqlite.pragma("journal_mode = WAL");
-      break;
-    } catch (error) {
-      if ((error as { code?: string }).code !== "SQLITE_BUSY" || Date.now() >= deadline) {
-        sqlite.close();
-        throw error;
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-    }
-  }
-  sqlite.pragma("foreign_keys = ON");
-
-  // Cache one fully configured connection per process. Do not retain a handle
-  // whose initialization failed partway through.
+  const sqlite = initializeOwnedSqliteConnection(new Database(absolutePath));
+  // Ownership transfers to the process cache only after every setup step succeeds.
   globalForDb.sqlite = sqlite;
 
   return sqlite;

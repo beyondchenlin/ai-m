@@ -45,6 +45,7 @@ describe("audited manual baseline approval", () => {
       expect(restoredRows.dataDigest).toBe(updated.dataDigest);
       await approveBaseline(sqlite, databasePath, migrations, 54, restoredRows.approvalToken, backupPath);
       expect(fs.existsSync(backupPath)).toBe(true);
+      expect(fs.readdirSync(directory).filter((name) => name.includes(".backup-tmp-"))).toEqual([]);
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 54 });
     } finally {
       sqlite.close();
@@ -62,8 +63,8 @@ describe("audited manual baseline approval", () => {
       CREATE TABLE approval_values (value text); INSERT INTO approval_values VALUES ('A' || char(0) || 'B');`);
     try {
       const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
-      await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, () => {
-        sqlite.exec("UPDATE approval_values SET value='A' || char(0) || 'C'");
+      await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, {
+        afterBackup: () => sqlite.exec("UPDATE approval_values SET value='A' || char(0) || 'C'"),
       })).rejects.toThrow(/approval token|backup evidence/i);
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
       const backup = new Database(backupPath, { readonly: true });
@@ -71,6 +72,49 @@ describe("audited manual baseline approval", () => {
         expect(backup.prepare("SELECT hex(CAST(value AS BLOB)) value FROM approval_values").get())
           .toEqual({ value: "410042" });
       } finally { backup.close(); }
+    } finally {
+      sqlite.close();
+      fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  it("publishes with no-replace semantics when a destination appears after backup", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-approval-publish-race-"));
+    const databasePath = path.join(directory, "legacy.sqlite");
+    const backupPath = path.join(directory, "legacy.backup.sqlite");
+    const marker = Buffer.from("do-not-overwrite");
+    const sqlite = new Database(databasePath);
+    for (const migration of migrations.slice(0, 54)) for (const statement of migration.sql) sqlite.exec(statement);
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
+      await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, {
+        beforeBackupPublish: () => fs.writeFileSync(backupPath, marker, { flag: "wx" }),
+      })).rejects.toThrow();
+      expect(fs.readFileSync(backupPath)).toEqual(marker);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
+      expect(fs.readdirSync(directory).filter((name) => name.includes(".backup-tmp-"))).toEqual([]);
+    } finally {
+      sqlite.close();
+      fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  it("removes an unpublished temporary backup when publication is interrupted", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-approval-publish-crash-"));
+    const databasePath = path.join(directory, "legacy.sqlite");
+    const backupPath = path.join(directory, "legacy.backup.sqlite");
+    const sqlite = new Database(databasePath);
+    for (const migration of migrations.slice(0, 54)) for (const statement of migration.sql) sqlite.exec(statement);
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
+      await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, {
+        beforeBackupPublish: () => { throw new Error("simulated interruption"); },
+      })).rejects.toThrow(/interruption/);
+      expect(fs.existsSync(backupPath)).toBe(false);
+      expect(fs.readdirSync(directory).filter((name) => name.includes(".backup-tmp-"))).toEqual([]);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
     } finally {
       sqlite.close();
       fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { MigrationMetadata } from "./migration-journal";
@@ -14,6 +14,11 @@ export type BaselineApprovalManifest = {
   dataDigest: string;
   journalRowCount: number;
   approvalToken: string;
+};
+
+export type BaselineApprovalHooks = {
+  afterBackup?: () => void;
+  beforeBackupPublish?: () => void;
 };
 
 function scalar(sqlite: SqliteDatabase, pragma: string): number {
@@ -117,36 +122,75 @@ export async function approveBaseline(
   boundaryCount: number,
   approvalToken: string,
   backupPath: string,
-  afterBackup?: () => void,
+  hooks: BaselineApprovalHooks = {},
 ): Promise<void> {
   const absoluteBackupPath = path.resolve(backupPath);
   if (absoluteBackupPath === path.resolve(databasePath)) throw new Error("Backup path must differ from the live database");
-  if (fs.existsSync(absoluteBackupPath)) throw new Error("Backup path already exists; refusing to overwrite");
-  await sqlite.backup(absoluteBackupPath);
-  afterBackup?.();
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Database = require("better-sqlite3") as typeof import("better-sqlite3");
-  const backup = new Database(absoluteBackupPath, { fileMustExist: true });
-  let backupManifest: BaselineApprovalManifest;
+  const temporaryBackupPath = path.join(
+    path.dirname(absoluteBackupPath),
+    `.${path.basename(absoluteBackupPath)}.backup-tmp-${randomUUID()}`,
+  );
+  let temporaryExists = false;
+  let primaryError: unknown;
   try {
-    const integrity = backup.pragma("integrity_check", { simple: true });
-    if (integrity !== "ok") throw new Error(`Backup integrity check failed: ${String(integrity)}`);
-    backupManifest = inspectBaselineApproval(backup, absoluteBackupPath, migrations, boundaryCount);
-  } finally { backup.close(); }
-  sqlite.transaction(() => {
-    const manifest = inspectBaselineApprovalLocked(sqlite, databasePath, migrations, boundaryCount);
-    if (manifest.approvalToken !== approvalToken) {
-      throw new Error("Approval token does not match current database identity, prefix, and evidence");
+    const reservation = fs.openSync(temporaryBackupPath, "wx", 0o600);
+    temporaryExists = true;
+    fs.closeSync(reservation);
+    await sqlite.backup(temporaryBackupPath);
+    fs.chmodSync(temporaryBackupPath, 0o600);
+    hooks.afterBackup?.();
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+    const backup = new Database(temporaryBackupPath, { fileMustExist: true });
+    let backupManifest: BaselineApprovalManifest;
+    try {
+      const integrity = backup.pragma("integrity_check", { simple: true });
+      if (integrity !== "ok") throw new Error(`Backup integrity check failed: ${String(integrity)}`);
+      backupManifest = inspectBaselineApproval(backup, temporaryBackupPath, migrations, boundaryCount);
+    } finally { backup.close(); }
+
+    hooks.beforeBackupPublish?.();
+    try { fs.linkSync(temporaryBackupPath, absoluteBackupPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("Backup path already exists; refusing to overwrite", { cause: error });
+      }
+      throw error;
     }
-    if (backupManifest.evidenceDigest !== manifest.evidenceDigest
-      || backupManifest.dataDigest !== manifest.dataDigest
-      || backupManifest.prefixDigest !== manifest.prefixDigest
-      || backupManifest.journalRowCount !== manifest.journalRowCount) {
-      throw new Error("Backup evidence does not match the locked live database state");
+    fs.unlinkSync(temporaryBackupPath);
+    temporaryExists = false;
+
+    sqlite.transaction(() => {
+      const manifest = inspectBaselineApprovalLocked(sqlite, databasePath, migrations, boundaryCount);
+      if (manifest.approvalToken !== approvalToken) {
+        throw new Error("Approval token does not match current database identity, prefix, and evidence");
+      }
+      if (backupManifest.evidenceDigest !== manifest.evidenceDigest
+        || backupManifest.dataDigest !== manifest.dataDigest
+        || backupManifest.prefixDigest !== manifest.prefixDigest
+        || backupManifest.journalRowCount !== manifest.journalRowCount) {
+        throw new Error("Backup evidence does not match the locked live database state");
+      }
+      const insert = sqlite.prepare<[string, number]>(
+        'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
+      );
+      for (const migration of migrations.slice(0, boundaryCount)) insert.run(migration.hash, migration.folderMillis);
+    }).immediate();
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (temporaryExists) {
+      try { fs.unlinkSync(temporaryBackupPath); }
+      catch (cleanupError) {
+        if (primaryError !== undefined) {
+          throw new AggregateError([primaryError, cleanupError], "Backup failed and temporary cleanup failed", {
+            cause: primaryError,
+          });
+        }
+        throw cleanupError;
+      }
     }
-    const insert = sqlite.prepare<[string, number]>(
-      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
-    );
-    for (const migration of migrations.slice(0, boundaryCount)) insert.run(migration.hash, migration.folderMillis);
-  }).immediate();
+  }
 }
