@@ -13,6 +13,7 @@ import {
   workflowPackageRevisions,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
+import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
 import {
   FakeComfyUITransport,
   defaultBackendFeatures,
@@ -371,6 +372,28 @@ describe("worker completion after cancellation intent", () => {
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
       status: "SUCCEEDED",
     });
+  });
+
+  it("keeps a durable success terminal when duplicate-cardinality release fails", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    mocks.releaseResourceSlot.mockRejectedValue(new InvalidResourceCardinalityError("terminal-attempt", 2));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const result = await arranged.execute();
+
+      expect(result).toMatchObject({ success: true, finalPhase: "SUCCEEDED" });
+      expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
+        .toBe("SUCCEEDED");
+      expect(errorLog).toHaveBeenCalledWith(
+        "[generation] retained resource leases after terminal release cardinality failure",
+        expect.objectContaining({
+          code: "invalid_resource_cardinality",
+          attemptId: "terminal-attempt",
+          slotCount: 2,
+        }),
+      );
+      expect(JSON.stringify(errorLog.mock.calls)).not.toContain("leaseToken");
+    } finally { errorLog.mockRestore(); }
   });
 
   it("retains a discovered prompt when cancellation termination remains unknown", async () => {

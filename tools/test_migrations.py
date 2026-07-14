@@ -122,6 +122,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "resource_reconciliation_proofs_lease_unique",
         "resource_reconciliation_proofs_external_unique",
         "resource_reconciliation_proofs_disposition_observed_idx",
+        "resource_pool_slots_owner_attempt_unique",
     }
     missing_indexes = sorted(required_indexes - indexes)
     if missing_indexes:

@@ -24,6 +24,7 @@ import {
   materializeWorkflowInputs,
 } from "@/lib/generation";
 import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
+import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
 import { bindWorkflow, loadActiveWorkflowPackage } from "@/lib/generation/workflows";
 import { resolveBackendAuthHeaders } from "@/lib/security";
 import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
@@ -211,6 +212,7 @@ export async function executeGenerationJob(
     if (!resourceSlot) {
       const cancelled = cancelOwnedAttemptBeforeSubmission({ jobId: job.id, attemptId, workerId, jobFencingToken });
       if (cancelled.status === "applied") return preSubmissionCancelledResult();
+      if (cancelled.status === "invalid-resource-cardinality") return invalidResourceCardinalityResult();
       if (cancelled.status !== "invalid-transition") {
         requireApplied(cancelled, "job_claim_lost_cancelling_before_resource_acquisition");
       }
@@ -231,6 +233,7 @@ export async function executeGenerationJob(
       resourceSlot = null;
       return preSubmissionCancelledResult();
     }
+    if (begun.status === "invalid-resource-cardinality") return invalidResourceCardinalityResult();
     requireApplied(begun, "job_or_resource_lease_lost_before_submission_boundary");
 
     resourceTimer = setInterval(async () => {
@@ -465,7 +468,23 @@ export async function executeGenerationJob(
       const snapshot = job.executionSnapshotJson as Record<string, unknown>;
       const backendId = snapshot.executionBackendId as string;
       const [backend] = backendId ? await db.select().from(executionBackends).where(eq(executionBackends.id, backendId)) : [];
-      if (backend) await releaseResourceSlot(backend.resourcePoolId, resourceSlot.slotNo, attemptId, resourceSlot.leaseToken, resourceSlot.fencingToken).catch(() => false);
+      if (backend) {
+        await releaseResourceSlot(
+          backend.resourcePoolId,
+          resourceSlot.slotNo,
+          attemptId,
+          resourceSlot.leaseToken,
+          resourceSlot.fencingToken,
+        ).catch((error: unknown) => {
+          if (error instanceof InvalidResourceCardinalityError) {
+            console.error(
+              "[generation] retained resource leases after terminal release cardinality failure",
+              { code: error.code, attemptId: error.attemptId, slotCount: error.slotCount },
+            );
+          }
+          return false;
+        });
+      }
     }
   }
 }
@@ -517,6 +536,15 @@ function preSubmissionCancelledResult(): JobExecutionResult {
     finalPhase: "CANCELLED",
     needsAttention: false,
     claimDisposition: "release-terminal",
+  };
+}
+
+function invalidResourceCardinalityResult(): JobExecutionResult {
+  return {
+    success: false,
+    finalPhase: "ORPHANED",
+    needsAttention: true,
+    claimDisposition: "retain-recovery",
   };
 }
 

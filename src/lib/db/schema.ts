@@ -644,7 +644,11 @@ export const resourcePoolSlots = sqliteTable("resource_pool_slots", {
   fencingToken: integer("fencing_token").notNull().default(0),
   expiresAtMs: integer("expires_at_ms"),
   updatedAtMs: integer("updated_at_ms").notNull(),
-});
+}, (table) => [
+  uniqueIndex("resource_pool_slots_owner_attempt_unique")
+    .on(table.ownerAttemptId)
+    .where(sql`${table.ownerAttemptId} IS NOT NULL`),
+]);
 
 export const resourceReconciliationProofs = sqliteTable("resource_reconciliation_proofs", {
   id: text("id").primaryKey(),

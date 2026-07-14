@@ -59,7 +59,10 @@ export interface SubmissionResourceIdentity {
   clock?: () => number;
 }
 
-export type BeginSubmissionResult = TransitionResult | { status: "cancelled-before-submission" };
+export type InvalidResourceCardinalityResult = { status: "invalid-resource-cardinality" };
+export type BeginSubmissionResult = TransitionResult
+  | { status: "cancelled-before-submission" }
+  | InvalidResourceCardinalityResult;
 
 const PRE_SUBMISSION_PHASES = new Set<AttemptPhase>(["CREATED", "LEASED", "PREPARING"]);
 
@@ -127,6 +130,50 @@ class TransitionRollback extends Error {
 
 function rollbackLostRace(): never {
   throw new TransitionRollback("lost-race");
+}
+
+function quarantineInvalidResourceCardinality(
+  database: DB,
+  identity: OwnedAttemptIdentity,
+  current: { attemptPhase: AttemptPhase; jobStatus: JobStatus; claimFencingToken: number },
+  now: number,
+): void {
+  const attemptChanged = database.update(generationAttempts).set({
+    phase: "ORPHANED",
+    errorClass: "invalid_resource_cardinality",
+    errorCode: "invalid_resource_cardinality",
+    errorMessageSafe: "The attempt owns an invalid number of physical resource slots",
+    finishedAtMs: now,
+    updatedAtMs: now,
+  }).where(and(
+    eq(generationAttempts.id, identity.attemptId),
+    eq(generationAttempts.phase, current.attemptPhase),
+    eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
+  )).run();
+  if (attemptChanged.changes !== 1) rollbackLostRace();
+  const jobChanged = database.update(generationJobs).set({
+    status: "NEEDS_ATTENTION",
+    claimOwner: null,
+    claimUntilMs: null,
+    claimFencingToken: current.claimFencingToken + 1,
+    needsAttentionReason: "invalid_resource_cardinality",
+    updatedAtMs: now,
+  }).where(and(
+    eq(generationJobs.id, identity.jobId),
+    eq(generationJobs.status, current.jobStatus),
+    eq(generationJobs.currentAttemptId, identity.attemptId),
+    eq(generationJobs.claimFencingToken, current.claimFencingToken),
+  )).run();
+  if (jobChanged.changes !== 1) rollbackLostRace();
+  database.insert(generationEvents).values({
+    id: genId(),
+    jobId: identity.jobId,
+    attemptId: identity.attemptId,
+    eventType: "invalid_resource_cardinality",
+    severity: "error",
+    safePayloadJson: {},
+    createdAtMs: now,
+  }).run();
 }
 
 /**
@@ -379,7 +426,7 @@ export function cancelOwnedAttemptBeforeSubmission(
   identity: OwnedAttemptIdentity,
   database: DB = db,
   clock: () => number = Date.now,
-): TransitionResult {
+): TransitionResult | InvalidResourceCardinalityResult {
   try {
     return database.transaction((tx) => {
       const now = clock();
@@ -402,8 +449,16 @@ export function cancelOwnedAttemptBeforeSubmission(
         || current.attempt.resourceLeaseToken !== `pending-${current.attempt.id}`
         || current.attempt.resourceFencingToken !== 0) return { status: "invalid-transition" } as const;
       const occupied = tx.select({ slotNo: resourcePoolSlots.slotNo }).from(resourcePoolSlots)
-        .where(eq(resourcePoolSlots.ownerAttemptId, identity.attemptId)).get();
-      if (occupied) return { status: "invalid-transition" } as const;
+        .where(eq(resourcePoolSlots.ownerAttemptId, identity.attemptId)).all();
+      if (occupied.length > 1) {
+        quarantineInvalidResourceCardinality(tx as unknown as DB, identity, {
+          attemptPhase: current.attempt.phase,
+          jobStatus: current.job.status,
+          claimFencingToken: current.job.claimFencingToken,
+        }, now);
+        return { status: "invalid-resource-cardinality" } as const;
+      }
+      if (occupied.length === 1) return { status: "invalid-transition" } as const;
 
       const attemptChanged = tx.update(generationAttempts).set({
         phase: "CANCELLED",
@@ -486,6 +541,16 @@ export function beginOwnedAttemptSubmission(
       return { status: "ownership-lost" } as const;
     }
     if (current.attemptPhase !== "PREPARING") return { status: "invalid-transition" } as const;
+    const ownedSlots = tx.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, identity.attemptId)).all();
+    if (ownedSlots.length !== 1) {
+      quarantineInvalidResourceCardinality(tx as unknown as DB, identity, {
+        attemptPhase: current.attemptPhase,
+        jobStatus: current.jobStatus,
+        claimFencingToken: current.claimFencingToken,
+      }, now);
+      return { status: "invalid-resource-cardinality" } as const;
+    }
     if (current.attemptResourcePoolId !== resource.resourcePoolId) {
       return { status: "ownership-lost" } as const;
     }

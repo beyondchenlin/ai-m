@@ -35,13 +35,15 @@ type BeginSubmission = (
     clock?: () => number;
   },
   database: typeof db,
-) => stateTransitions.TransitionResult | { status: "cancelled-before-submission" };
+) => stateTransitions.TransitionResult
+  | { status: "cancelled-before-submission" }
+  | { status: "invalid-resource-cardinality" };
 
 type CancelBeforeSlot = (
   identity: { jobId: string; attemptId: string; workerId: string; jobFencingToken: number },
   database: typeof db,
   clock?: () => number,
-) => stateTransitions.TransitionResult;
+) => stateTransitions.TransitionResult | { status: "invalid-resource-cardinality" };
 
 type CancelBeforeAttempt = (
   identity: { jobId: string; workerId: string; jobFencingToken: number },
@@ -55,7 +57,7 @@ function beginSubmission(...args: Parameters<BeginSubmission>): ReturnType<Begin
   return transition!(...args);
 }
 
-function cancelBeforeSlot(...args: Parameters<CancelBeforeSlot>): stateTransitions.TransitionResult {
+function cancelBeforeSlot(...args: Parameters<CancelBeforeSlot>): ReturnType<CancelBeforeSlot> {
   const transition = Reflect.get(stateTransitions, "cancelOwnedAttemptBeforeSubmission") as CancelBeforeSlot | undefined;
   expect(transition, "atomic pre-slot cancellation transition").toBeTypeOf("function");
   return transition!(...args);
@@ -126,6 +128,10 @@ describe("resource slot reconciliation concurrency", () => {
     await db.delete(generationJobs);
     await db.delete(executionBackends);
     await db.delete(resourcePools);
+    scannerConnection.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS resource_pool_slots_owner_attempt_unique
+      ON resource_pool_slots (owner_attempt_id) WHERE owner_attempt_id IS NOT NULL
+    `);
   });
 
   async function seedExpiredSlot(input: {
@@ -647,6 +653,87 @@ describe("resource slot reconciliation concurrency", () => {
     `).get(seeded.jobId)).toEqual({ count: 1 });
     const next = await attachAndAcquireNextAttempt(seeded);
     expect(next.lease.slotNo).toBe(1);
+  });
+
+  it("quarantines a RUNNING attempt with legacy duplicate owned slots before begin-submission", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "RUNNING",
+    });
+    scannerConnection.exec("DROP INDEX resource_pool_slots_owner_attempt_unique");
+    await db.insert(resourcePoolSlots).values({
+      resourcePoolId: seeded.poolId,
+      slotNo: 2,
+      ownerAttemptId: seeded.attemptId,
+      leaseToken: `legacy-extra-${seeded.attemptId}`,
+      fencingToken: 19,
+      expiresAtMs: NOW + 60_000,
+      updatedAtMs: NOW,
+    });
+    await db.update(resourcePoolSlots).set({ expiresAtMs: NOW + 60_000 })
+      .where(and(eq(resourcePoolSlots.resourcePoolId, seeded.poolId), eq(resourcePoolSlots.slotNo, 1)));
+
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: seeded.lease.leaseToken,
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, scannerDb)).toEqual({ status: "invalid-resource-cardinality" });
+
+    expect(scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string; errorCode: string }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase, a.error_code AS errorCode
+      FROM generation_jobs j JOIN generation_attempts a ON a.id=j.current_attempt_id WHERE j.id=?
+    `).get(seeded.jobId)).toEqual({
+      jobStatus: "NEEDS_ATTENTION",
+      attemptPhase: "ORPHANED",
+      errorCode: "invalid_resource_cardinality",
+    });
+    expect(scannerConnection.prepare<[string], { count: number }>(
+      "SELECT COUNT(*) AS count FROM resource_pool_slots WHERE owner_attempt_id=?",
+    ).get(seeded.attemptId)).toEqual({ count: 2 });
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_events
+      WHERE job_id=? AND event_type='invalid_resource_cardinality'
+    `).get(seeded.jobId)).toEqual({ count: 1 });
+  });
+
+  it("quarantines a CANCEL_REQUESTED placeholder with legacy duplicate slots before terminal cancellation", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    scannerConnection.exec("DROP INDEX resource_pool_slots_owner_attempt_unique");
+    await db.insert(resourcePoolSlots).values({
+      resourcePoolId: seeded.poolId,
+      slotNo: 2,
+      ownerAttemptId: seeded.attemptId,
+      leaseToken: `legacy-cancel-extra-${seeded.attemptId}`,
+      fencingToken: 23,
+      expiresAtMs: NOW + 60_000,
+      updatedAtMs: NOW,
+    });
+
+    expect(cancelBeforeSlot({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, scannerDb, () => NOW)).toEqual({ status: "invalid-resource-cardinality" });
+    expect(scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase
+      FROM generation_jobs j JOIN generation_attempts a ON a.id=j.current_attempt_id WHERE j.id=?
+    `).get(seeded.jobId)).toEqual({ jobStatus: "NEEDS_ATTENTION", attemptPhase: "ORPHANED" });
+    expect(scannerConnection.prepare<[string], { count: number }>(
+      "SELECT COUNT(*) AS count FROM resource_pool_slots WHERE owner_attempt_id=?",
+    ).get(seeded.attemptId)).toEqual({ count: 2 });
   });
 
   it("cancels an owned request before attempt attachment exactly once", async () => {

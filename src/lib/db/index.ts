@@ -11,6 +11,11 @@ import {
 } from "./migration-journal";
 import { detectJournalLessBaselineMigrationCount } from "./migration-schema-evidence";
 import { validateMigrationExecutionStatements } from "./migration-data-evidence";
+import {
+  MIGRATION_PRECONDITION_REGISTRY,
+  runMigrationPrecondition,
+  validateMigrationPreconditionRegistry,
+} from "./migration-preconditions";
 
 type DrizzleDB = ReturnType<typeof drizzle<typeof schema>>;
 type SqliteConnection = import("better-sqlite3").Database;
@@ -298,6 +303,7 @@ function readValidatedMigrationBundle(folder: string, expectedManifestDigest?: s
     }
   }
   validateMigrationExecutionStatements(migrations);
+  validateMigrationPreconditionRegistry(migrations, MIGRATION_PRECONDITION_REGISTRY);
   const bundle = Object.freeze({ folder, manifestDigest, migrations: Object.freeze(migrations) });
   validatedMigrationBundles.add(bundle);
   return bundle;
@@ -337,6 +343,7 @@ export function applyPendingMigrations(
     );
     for (const migration of migrations.slice(recordedCount)) {
       if (!migration.sql) throw new Error(`Migration ${migration.folderMillis} has no SQL metadata`);
+      runMigrationPrecondition(sqlite, migration);
       for (const statement of migration.sql) sqlite.exec(statement);
       insert.run(migration.hash, migration.folderMillis);
       applied += 1;

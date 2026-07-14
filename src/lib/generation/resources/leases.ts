@@ -34,6 +34,64 @@ export const LEASE_CONFIG = {
   GRACE_PERIOD_MS: 5_000,
 } as const;
 
+class ResourceCardinalityRollback extends Error {}
+
+export class InvalidResourceCardinalityError extends Error {
+  readonly name = "InvalidResourceCardinalityError";
+  readonly code = "invalid_resource_cardinality";
+
+  constructor(
+    readonly attemptId: string,
+    readonly slotCount: number,
+  ) {
+    super(`Attempt ${attemptId} owns ${slotCount} physical resource slots; all leases were retained`);
+  }
+}
+
+function quarantineInvalidResourceCardinality(
+  database: DB,
+  attempt: typeof generationAttempts.$inferSelect,
+  job: typeof generationJobs.$inferSelect,
+  now: number,
+): void {
+  const attemptChanged = database.update(generationAttempts).set({
+    phase: "ORPHANED",
+    errorClass: "invalid_resource_cardinality",
+    errorCode: "invalid_resource_cardinality",
+    errorMessageSafe: "The attempt owns an invalid number of physical resource slots",
+    finishedAtMs: now,
+    updatedAtMs: now,
+  }).where(and(
+    eq(generationAttempts.id, attempt.id),
+    eq(generationAttempts.phase, attempt.phase),
+    eq(generationAttempts.jobClaimFencingToken, attempt.jobClaimFencingToken),
+  )).run();
+  if (attemptChanged.changes !== 1) throw new ResourceCardinalityRollback();
+  const jobChanged = database.update(generationJobs).set({
+    status: "NEEDS_ATTENTION",
+    claimOwner: null,
+    claimUntilMs: null,
+    claimFencingToken: job.claimFencingToken + 1,
+    needsAttentionReason: "invalid_resource_cardinality",
+    updatedAtMs: now,
+  }).where(and(
+    eq(generationJobs.id, job.id),
+    eq(generationJobs.status, job.status),
+    eq(generationJobs.currentAttemptId, attempt.id),
+    eq(generationJobs.claimFencingToken, job.claimFencingToken),
+  )).run();
+  if (jobChanged.changes !== 1) throw new ResourceCardinalityRollback();
+  database.insert(generationEvents).values({
+    id: genId(),
+    jobId: job.id,
+    attemptId: attempt.id,
+    eventType: "invalid_resource_cardinality",
+    severity: "error",
+    safePayloadJson: {},
+    createdAtMs: now,
+  }).run();
+}
+
 /** 原子领取资源槽位 */
 export async function acquireResourceSlot(
   resourcePoolId: string,
@@ -48,7 +106,9 @@ export async function acquireResourceSlot(
   expiresAtMs: number;
 } | null> {
   // 原子领取：通过 rowid 子查询只更新第一个空闲或过期槽位，避免同时更新多个槽位导致 lease_token UNIQUE 冲突。
-  const slot = database.transaction((tx) => {
+  let slot: typeof resourcePoolSlots.$inferSelect | undefined;
+  try {
+    slot = database.transaction((tx) => {
     const now = clock();
     const leaseToken = `${workerId}_${attemptId}_${now}_${Math.random().toString(36).slice(2, 10)}`;
     const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
@@ -68,6 +128,19 @@ export async function acquireResourceSlot(
       || job.claimUntilMs === null
       || job.claimUntilMs <= now
       || job.claimFencingToken !== attempt.jobClaimFencingToken) return undefined;
+    const ownedSlots = tx.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attemptId)).all();
+    if (ownedSlots.length > 1) {
+      quarantineInvalidResourceCardinality(tx as unknown as DB, attempt, job, now);
+      return undefined;
+    }
+    if (ownedSlots.length === 1) {
+      const existing = ownedSlots[0];
+      if (existing.resourcePoolId !== resourcePoolId
+        || existing.leaseToken === null
+        || existing.expiresAtMs === null) return undefined;
+      return existing;
+    }
     return tx.update(resourcePoolSlots)
       .set({
         ownerAttemptId: attemptId,
@@ -87,7 +160,11 @@ export async function acquireResourceSlot(
         )`,
       ))
       .returning().get();
-  }, { behavior: "immediate" });
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (!(error instanceof ResourceCardinalityRollback)) throw error;
+    return null;
+  }
 
   if (!slot) return null;
 
@@ -109,7 +186,8 @@ export async function renewResourceSlot(
   database: DB = db,
   clock: () => number = Date.now,
 ): Promise<boolean> {
-  return database.transaction((tx) => {
+  try {
+    return database.transaction((tx) => {
     const now = clock();
     const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
     const slot = tx.select().from(resourcePoolSlots).where(and(
@@ -134,6 +212,12 @@ export async function renewResourceSlot(
       || job.claimUntilMs === null
       || job.claimUntilMs <= now
       || job.claimFencingToken !== attempt.jobClaimFencingToken) return false;
+    const ownedSlots = tx.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attempt.id)).all();
+    if (ownedSlots.length !== 1) {
+      quarantineInvalidResourceCardinality(tx as unknown as DB, attempt, job, now);
+      return false;
+    }
     const updated = tx.update(resourcePoolSlots)
       .set({ expiresAtMs, updatedAtMs: now })
       .where(and(
@@ -145,7 +229,11 @@ export async function renewResourceSlot(
       ))
       .returning({ slotNo: resourcePoolSlots.slotNo }).all();
     return updated.length === 1;
-  }, { behavior: "immediate" });
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (error instanceof ResourceCardinalityRollback) return false;
+    throw error;
+  }
 }
 
 /** 释放资源槽位 */
@@ -156,11 +244,23 @@ export async function releaseResourceSlot(
   leaseToken: string,
   fencingToken: number,
 ): Promise<boolean> {
-  return db.transaction((tx) => {
+  try {
+    return db.transaction((tx) => {
     const now = Date.now();
     const attempt = tx.select().from(generationAttempts)
       .where(eq(generationAttempts.id, ownerAttemptId)).get();
     if (!attempt) return false;
+    const job = tx.select().from(generationJobs).where(eq(generationJobs.id, attempt.jobId)).get();
+    if (!job || job.currentAttemptId !== attempt.id) return false;
+    const ownedSlots = tx.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attempt.id)).all();
+    if (ownedSlots.length !== 1) {
+      if (["SUCCEEDED", "CANCELLED", "FAILED", "NEEDS_ATTENTION"].includes(job.status)) {
+        throw new InvalidResourceCardinalityError(attempt.id, ownedSlots.length);
+      }
+      quarantineInvalidResourceCardinality(tx as unknown as DB, attempt, job, now);
+      return false;
+    }
     const safeBeforeSubmission = ["CREATED", "LEASED", "PREPARING"].includes(attempt.phase)
       && attempt.externalJobId === null;
     const proof = !attempt?.externalJobId ? undefined : tx.select().from(resourceReconciliationProofs)
@@ -199,7 +299,11 @@ export async function releaseResourceSlot(
       if (reconciled.length !== 1) throw new SlotReconciliationRollback();
     }
     return true;
-  }, { behavior: "immediate" });
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (error instanceof ResourceCardinalityRollback) return false;
+    throw error;
+  }
 }
 
 export interface ResourceTerminationProofInput {

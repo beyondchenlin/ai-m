@@ -3,8 +3,11 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { spawn } from "node:child_process";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { eq, and } from "drizzle-orm";
-import { db } from "@/lib/db";
+import { db, getSqlite } from "@/lib/db";
 import {
   resourcePools,
   resourcePoolSlots,
@@ -15,6 +18,7 @@ import {
 import { setupTestDb } from "@/lib/test-helpers/db";
 import {
   acquireResourceSlot,
+  InvalidResourceCardinalityError,
   renewResourceSlot,
   releaseResourceSlot,
   claimJob,
@@ -32,6 +36,56 @@ const renewOwnedResourceSlot = renewResourceSlot as unknown as (
   fencingToken: number,
   workerId: string,
 ) => Promise<boolean>;
+
+function spawnAcquireProcess(input: {
+  dbPath: string;
+  poolId: string;
+  attemptId: string;
+  workerId: string;
+  readyPath: string;
+  goPath: string;
+}): Promise<Awaited<ReturnType<typeof acquireResourceSlot>>> {
+  const script = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { acquireResourceSlot } from "./src/lib/generation/resources/leases.ts";
+    void (async () => {
+      writeFileSync(${JSON.stringify(input.readyPath)}, "ready");
+      while (!existsSync(${JSON.stringify(input.goPath)})) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+      const result = await acquireResourceSlot(
+        ${JSON.stringify(input.poolId)},
+        ${JSON.stringify(input.attemptId)},
+        ${JSON.stringify(input.workerId)},
+      );
+      process.stdout.write(JSON.stringify(result));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.resolve("node_modules/tsx/dist/cli.mjs"), "-e", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, DATABASE_URL: `file:${input.dbPath}` },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0) reject(new Error(`acquire child exited ${code}: ${stderr}`));
+      else resolve(JSON.parse(stdout) as Awaited<ReturnType<typeof acquireResourceSlot>>);
+    });
+  });
+}
+
+async function waitForFiles(paths: string[], timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!paths.every(existsSync)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for acquire barriers: ${paths.join(", ")}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 async function createPoolWithSlots(capacity: number) {
   const poolId = crypto.randomUUID();
@@ -179,6 +233,10 @@ describe("PR-11: 资源槽位租约", () => {
     await db.delete(generationAttempts);
     await db.delete(executionBackends);
     await db.delete(resourcePools);
+    getSqlite().exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS resource_pool_slots_owner_attempt_unique
+      ON resource_pool_slots (owner_attempt_id) WHERE owner_attempt_id IS NOT NULL
+    `);
   });
 
   it("rejects an old resource acquisition after job recovery commits first", async () => {
@@ -255,6 +313,55 @@ describe("PR-11: 资源槽位租约", () => {
     expect(row.fencingToken).toBe(1);
   });
 
+  it("returns the same physical lease when one attempt acquires twice sequentially", async () => {
+    const { poolId, backendId } = await createBackendAndPool("image", 2);
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId, { phase: "PREPARING" });
+
+    const first = await acquireResourceSlot(poolId, attemptId, "worker-1");
+    const second = await acquireResourceSlot(poolId, attemptId, "worker-1");
+
+    expect(second).toEqual(first);
+    const owned = await db.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attemptId));
+    expect(owned).toHaveLength(1);
+
+    const nextJobId = await createQueuedJob();
+    const nextAttemptId = await createAttempt(nextJobId, backendId, poolId, {}, "worker-2");
+    const next = await acquireResourceSlot(poolId, nextAttemptId, "worker-2");
+    expect(next?.slotNo).toBe(2);
+  });
+
+  it("returns exactly one physical lease across truly concurrent process acquisitions", async () => {
+    const { poolId, backendId } = await createBackendAndPool("image", 2);
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId, { phase: "PREPARING" });
+    const barrierId = crypto.randomUUID();
+    const goPath = `${ctx.dbPath}.${barrierId}.go`;
+    const readyPaths = [1, 2].map((number) => `${ctx.dbPath}.${barrierId}.ready-${number}`);
+    try {
+      const acquisitions = readyPaths.map((readyPath) => spawnAcquireProcess({
+        dbPath: ctx.dbPath,
+        poolId,
+        attemptId,
+        workerId: "worker-1",
+        readyPath,
+        goPath,
+      }));
+      await waitForFiles(readyPaths);
+      writeFileSync(goPath, "go");
+      const [left, right] = await Promise.all(acquisitions);
+
+      expect(left).toEqual(right);
+      const owned = await db.select().from(resourcePoolSlots)
+        .where(eq(resourcePoolSlots.ownerAttemptId, attemptId));
+      expect(owned).toHaveLength(1);
+    } finally {
+      rmSync(goPath, { force: true });
+      for (const readyPath of readyPaths) rmSync(readyPath, { force: true });
+    }
+  });
+
   it("槽位占满后应返回 null", async () => {
     const { poolId, backendId } = await createBackendAndPool("image", 1);
     const jobId1 = await createQueuedJob();
@@ -312,6 +419,101 @@ describe("PR-11: 资源槽位租约", () => {
 
     const wrongFencing = await renewResourceSlot(poolId, slot.slotNo, slot.leaseToken, 999, "worker-1");
     expect(wrongFencing).toBe(false);
+  });
+
+  it("quarantines and retains every legacy duplicate slot instead of renewing one", async () => {
+    const { poolId, backendId } = await createBackendAndPool("image", 2);
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId);
+    const slot = (await acquireResourceSlot(poolId, attemptId, "worker-1"))!;
+    await db.update(generationAttempts).set({
+      resourceSlotNo: slot.slotNo,
+      resourceLeaseToken: slot.leaseToken,
+      resourceFencingToken: slot.fencingToken,
+    }).where(eq(generationAttempts.id, attemptId));
+    getSqlite().exec("DROP INDEX resource_pool_slots_owner_attempt_unique");
+    await db.update(resourcePoolSlots).set({
+      ownerAttemptId: attemptId,
+      leaseToken: `legacy-renew-extra-${attemptId}`,
+      fencingToken: 31,
+      expiresAtMs: Date.now() + 60_000,
+    }).where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 2)));
+
+    expect(await renewResourceSlot(
+      poolId, slot.slotNo, slot.leaseToken, slot.fencingToken, "worker-1",
+    )).toBe(false);
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe("NEEDS_ATTENTION");
+    expect(attempt).toMatchObject({ phase: "ORPHANED", errorCode: "invalid_resource_cardinality" });
+    expect(await db.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attemptId))).toHaveLength(2);
+  });
+
+  it("quarantines and retains every legacy duplicate slot instead of releasing one", async () => {
+    const { poolId, backendId } = await createBackendAndPool("image", 2);
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId);
+    const slot = (await acquireResourceSlot(poolId, attemptId, "worker-1"))!;
+    getSqlite().exec("DROP INDEX resource_pool_slots_owner_attempt_unique");
+    await db.update(resourcePoolSlots).set({
+      ownerAttemptId: attemptId,
+      leaseToken: `legacy-release-extra-${attemptId}`,
+      fencingToken: 37,
+      expiresAtMs: Date.now() + 60_000,
+    }).where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 2)));
+
+    expect(await releaseResourceSlot(
+      poolId, slot.slotNo, attemptId, slot.leaseToken, slot.fencingToken,
+    )).toBe(false);
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe("NEEDS_ATTENTION");
+    expect(attempt).toMatchObject({ phase: "ORPHANED", errorCode: "invalid_resource_cardinality" });
+    expect(await db.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attemptId))).toHaveLength(2);
+  });
+
+  it.each([
+    ["SUCCEEDED", "SUCCEEDED"],
+    ["CANCELLED", "CANCELLED"],
+    ["FAILED", "FAILED"],
+  ] as const)("retains terminal %s state and every legacy duplicate slot on release", async (jobStatus, attemptPhase) => {
+    const { poolId, backendId } = await createBackendAndPool("image", 2);
+    const jobId = await createQueuedJob();
+    const attemptId = await createAttempt(jobId, backendId, poolId);
+    const slot = (await acquireResourceSlot(poolId, attemptId, "worker-1"))!;
+    getSqlite().exec("DROP INDEX resource_pool_slots_owner_attempt_unique");
+    await db.update(resourcePoolSlots).set({
+      ownerAttemptId: attemptId,
+      leaseToken: `legacy-terminal-extra-${attemptId}`,
+      fencingToken: 41,
+      expiresAtMs: Date.now() + 60_000,
+    }).where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 2)));
+    await db.update(generationAttempts).set({
+      phase: attemptPhase,
+      resourceSlotNo: slot.slotNo,
+      resourceLeaseToken: slot.leaseToken,
+      resourceFencingToken: slot.fencingToken,
+      finishedAtMs: Date.now(),
+    }).where(eq(generationAttempts.id, attemptId));
+    await db.update(generationJobs).set({ status: jobStatus, completedAtMs: Date.now() })
+      .where(eq(generationJobs.id, jobId));
+
+    await expect(releaseResourceSlot(
+      poolId, slot.slotNo, attemptId, slot.leaseToken, slot.fencingToken,
+    )).rejects.toMatchObject({
+      name: "InvalidResourceCardinalityError",
+      code: "invalid_resource_cardinality",
+      attemptId,
+      slotCount: 2,
+    } satisfies Partial<InvalidResourceCardinalityError>);
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe(jobStatus);
+    expect(attempt.phase).toBe(attemptPhase);
+    expect(await db.select().from(resourcePoolSlots)
+      .where(eq(resourcePoolSlots.ownerAttemptId, attemptId))).toHaveLength(2);
   });
 
   it("释放槽位必须使用正确的令牌", async () => {

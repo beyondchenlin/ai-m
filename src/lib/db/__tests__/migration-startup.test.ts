@@ -18,10 +18,32 @@ import {
   prepareMigrationJournal,
   resolveMigrationsFolder,
 } from "../index";
+import {
+  MIGRATION_PRECONDITION_REGISTRY,
+  validateMigrationPreconditionRegistry,
+} from "../migration-preconditions";
 
 describe("migration journal startup ordering", () => {
   const repositoryMigrations = readMigrationFiles({ migrationsFolder: path.resolve("drizzle") });
   const repositoryBundle = loadValidatedMigrationBundle(path.resolve("drizzle"));
+
+  it("binds the migration precondition registry one-to-one to exact 0060 identity", () => {
+    expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hash }) => ({ folderMillis, hash })))
+      .toEqual([{
+        folderMillis: repositoryBundle.migrations[60].folderMillis,
+        hash: repositoryBundle.migrations[60].hash,
+      }]);
+    expect(() => validateMigrationPreconditionRegistry(
+      repositoryBundle.migrations,
+      MIGRATION_PRECONDITION_REGISTRY,
+    )).not.toThrow();
+    expect(() => validateMigrationPreconditionRegistry(
+      repositoryBundle.migrations.map((migration, index) => index === 60
+        ? { ...migration, hash: "changed-0060-hash" }
+        : migration),
+      MIGRATION_PRECONDITION_REGISTRY,
+    )).toThrow(/precondition registry.*exact migration identity/i);
+  });
 
   function legacyVisualDatabase(rows: Array<{ hash: string; createdAt: number }>): Database.Database {
     const sqlite = new Database(":memory:");
@@ -459,6 +481,60 @@ describe("migration journal startup ordering", () => {
           .toBeUndefined();
       } finally { sqlite.close(); }
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("aborts 0060 with actionable evidence when legacy slots duplicate one attempt owner", () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const insertMigration = sqlite.prepare(
+      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
+    );
+    try {
+      for (const migration of repositoryBundle.migrations.slice(0, 60)) {
+        for (const statement of migration.sql ?? []) sqlite.exec(statement);
+        insertMigration.run(migration.hash, migration.folderMillis);
+      }
+      sqlite.pragma("foreign_keys = OFF");
+      sqlite.exec(`
+        INSERT INTO resource_pool_slots
+          (resource_pool_id, slot_no, owner_attempt_id, lease_token, fencing_token, expires_at_ms, updated_at_ms)
+        VALUES
+          ('legacy-pool-a', 1, 'legacy-attempt-duplicate', 'legacy-token-a', 7, 999999, 1),
+          ('legacy-pool-b', 2, 'legacy-attempt-duplicate', 'legacy-token-b', 9, 999999, 1)
+      `);
+
+      expect(() => applyPendingMigrations(sqlite, repositoryBundle)).toThrow(
+        /legacy-attempt-duplicate[\s\S]*legacy-pool-a[\s\S]*slot(?:_no)?=1[\s\S]*legacy-pool-b[\s\S]*slot(?:_no)?=2/i,
+      );
+      expect(sqlite.prepare(
+        "SELECT resource_pool_id, slot_no, lease_token FROM resource_pool_slots ORDER BY resource_pool_id",
+      ).all()).toEqual([
+        { resource_pool_id: "legacy-pool-a", slot_no: 1, lease_token: "legacy-token-a" },
+        { resource_pool_id: "legacy-pool-b", slot_no: 2, lease_token: "legacy-token-b" },
+      ]);
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='resource_reconciliation_proofs'",
+      ).get()).toBeUndefined();
+    } finally { sqlite.close(); }
+  });
+
+  it("installs a partial unique owner index used by resource-slot owner lookups", () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      applyPendingMigrations(sqlite, repositoryBundle);
+      const ownerIndex = sqlite.prepare<[], { name: string; unique: number; partial: number }>(
+        'PRAGMA index_list("resource_pool_slots")',
+      ).all().find((candidate) => candidate.name === "resource_pool_slots_owner_attempt_unique");
+      expect(ownerIndex).toMatchObject({ unique: 1, partial: 1 });
+      expect(sqlite.prepare<[], { name: string; key: number }>(
+        'PRAGMA index_xinfo("resource_pool_slots_owner_attempt_unique")',
+      ).all().filter((column) => column.key === 1).map((column) => column.name)).toEqual(["owner_attempt_id"]);
+      const plan = sqlite.prepare<[], { detail: string }>(
+        "EXPLAIN QUERY PLAN SELECT slot_no FROM resource_pool_slots WHERE owner_attempt_id='attempt-index-probe'",
+      ).all().map((row) => row.detail).join(" ");
+      expect(plan).toMatch(/resource_pool_slots_owner_attempt_unique/i);
+    } finally { sqlite.close(); }
   });
 
   it.each(["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT x", "RELEASE x", "END", "ATTACH ':memory:' AS x", "DETACH x", "VACUUM", "PRAGMA journal_mode=DELETE"])(
