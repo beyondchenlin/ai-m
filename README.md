@@ -94,6 +94,23 @@ corepack pnpm worker:build
 corepack pnpm worker
 ```
 
+### 构建版本信息
+
+设置页会显示可用于支持与问题诊断的版本、提交和构建时间。`package.json` 中的 `version` 是应用版本的唯一来源，不能通过环境变量覆盖。部署系统只可在执行 Next.js 构建时提供以下两个可选输入：
+
+- `AI_M_BUILD_COMMIT`：7–64 位十六进制 Git 提交标识（兼容 SHA-1 与 SHA-256）；构建时会规范为小写。
+- `AI_M_BUILD_TIME`：精确到毫秒的规范 UTC ISO 8601 时间，格式必须为 `YYYY-MM-DDTHH:mm:ss.sssZ`，不接受时区偏移或会被日期解析器自动修正的值。
+
+示例中的提交值是占位符，不代表真实部署：
+
+```bash
+AI_M_BUILD_COMMIT=<7-to-64-hex-commit> \
+AI_M_BUILD_TIME=2026-01-01T00:00:00.000Z \
+corepack pnpm build
+```
+
+未提供提交或时间时，界面分别显示本地化的“开发版本”和“未提供”。`AI_M_INTERNAL_EMBEDDED_VERSION`、`AI_M_INTERNAL_EMBEDDED_COMMIT`、`AI_M_INTERNAL_EMBEDDED_BUILD_TIME` 是构建系统保留字段，不应由部署环境设置；应用也不会从 Git 工作树、主机名、文件路径或运行时时钟推导这些信息。
+
 ## Docker 部署
 
 ### 快速启动
