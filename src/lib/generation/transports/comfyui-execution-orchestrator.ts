@@ -179,6 +179,7 @@ export class ComfyUIExecutionOrchestrator {
   private readonly config: ExecutionConfig;
   private readonly callbacks: ExecutionCallbacks;
   private readonly connectionMgr: ComfyUIConnectionManager;
+  private readonly releaseConnection: () => void;
   private readonly clientId: string;
   private readonly correlationId?: string;
 
@@ -199,7 +200,7 @@ export class ComfyUIExecutionOrchestrator {
   private progressListener: (() => void) | null = null;
 
   constructor(
-    transport: ComfyUITransport & { getClientId?: () => string },
+    transport: ComfyUITransport,
     features: BackendFeatureSnapshot,
     callbacks: ExecutionCallbacks = {},
     config: Partial<ExecutionConfig> = {},
@@ -209,11 +210,12 @@ export class ComfyUIExecutionOrchestrator {
     this.features = features;
     this.callbacks = callbacks;
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.clientId =
-      (transport as { getClientId?: () => string }).getClientId?.() ??
-      `orchestrator-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const socketFactory = transport.getWebSocketFactory();
+    this.clientId = socketFactory.clientId;
     this.correlationId = correlationId;
-    this.connectionMgr = connectionManagerRegistry.getOrCreate(transport.getWebSocketFactory());
+    const lease = connectionManagerRegistry.acquire(socketFactory);
+    this.connectionMgr = lease.manager;
+    this.releaseConnection = lease.release;
   }
 
   /**
@@ -797,6 +799,7 @@ export class ComfyUIExecutionOrchestrator {
       this.progressListener();
       this.progressListener = null;
     }
+    this.releaseConnection();
   }
 
   private buildResult(errorMessage?: string, errorClass?: string): OrchestratorResult {

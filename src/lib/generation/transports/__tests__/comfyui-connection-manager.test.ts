@@ -24,27 +24,27 @@ afterEach(() => {
 });
 
 describe("ComfyUI connection manager lifecycle", () => {
-  it("does not reuse a manager across credential or policy identities and drains the replaced manager", () => {
+  it("shares equivalent identities while isolating credential and policy identities", () => {
     const firstFactory = {
       canonicalEndpoint: "http://comfy.policy.test:8188",
       registryKey: "endpoint:credential-a:policy-1",
+      clientId: "client-a",
       open: () => socket(),
     };
     const sameFactory = { ...firstFactory, open: () => socket() };
     const rotatedCredential = { ...firstFactory, registryKey: "endpoint:credential-b:policy-1", open: () => socket() };
     const revisedPolicy = { ...firstFactory, registryKey: "endpoint:credential-b:policy-2", open: () => socket() };
 
-    const first = connectionManagerRegistry.getOrCreate(firstFactory);
-    const concurrent = Array.from({ length: 20 }, () => connectionManagerRegistry.getOrCreate(sameFactory));
-    expect(new Set(concurrent)).toEqual(new Set([first]));
+    const first = connectionManagerRegistry.acquire(firstFactory);
+    const concurrent = Array.from({ length: 20 }, () => connectionManagerRegistry.acquire(sameFactory));
+    expect(new Set(concurrent.map((lease) => lease.manager))).toEqual(new Set([first.manager]));
 
-    const second = connectionManagerRegistry.getOrCreate(rotatedCredential);
-    expect(second).not.toBe(first);
-    expect(first.getState()).toBe("disconnected");
+    const second = connectionManagerRegistry.acquire(rotatedCredential);
+    expect(second.manager).not.toBe(first.manager);
 
-    const third = connectionManagerRegistry.getOrCreate(revisedPolicy);
-    expect(third).not.toBe(second);
-    expect(second.getState()).toBe("disconnected");
+    const third = connectionManagerRegistry.acquire(revisedPolicy);
+    expect(third.manager).not.toBe(second.manager);
+    for (const lease of [first, ...concurrent, second, third]) lease.release();
   });
 
   it("bounds default reconnect attempts and disconnect clears timers and socket handlers", async () => {
@@ -97,6 +97,60 @@ describe("ComfyUI connection manager lifecycle", () => {
     expect(created).toBeLessThanOrEqual(6);
     expect(manager.getState()).toBe("disconnected");
     manager.disconnect();
+  });
+
+  it("cancels a pending reconnect before an explicit connect creates a healthy socket", async () => {
+    vi.useFakeTimers();
+    const created: TestSocket[] = [];
+    const manager = new ComfyUIConnectionManager(() => {
+      const next = socket();
+      created.push(next);
+      return next;
+    }, { initialDelayMs: 10, maxDelayMs: 10, jitterFactor: 0 });
+
+    manager.connect();
+    created[0].onclose?.call(created[0], { code: 1006 } as CloseEvent);
+    manager.connect();
+    created[1].onopen?.call(created[1], new Event("open"));
+    await vi.runAllTimersAsync();
+
+    expect(created).toHaveLength(2);
+    expect(created[1].close).not.toHaveBeenCalled();
+    expect(manager.getState()).toBe("connected");
+    manager.disconnect();
+  });
+
+  it("retires a rotated identity only after every existing lease releases", () => {
+    const oldFactory = {
+      canonicalEndpoint: "http://comfy.policy.test:8188",
+      registryKey: "endpoint:credential-a:policy-1",
+      clientId: "client-a",
+      open: () => socket(),
+    };
+    const rotatedFactory = {
+      ...oldFactory,
+      registryKey: "endpoint:credential-b:policy-2",
+      open: () => socket(),
+    };
+    type Lease = { manager: ComfyUIConnectionManager; release(): void };
+    const registry = connectionManagerRegistry as unknown as {
+      acquire(factory: typeof oldFactory): Lease;
+    };
+
+    const oldA = registry.acquire(oldFactory);
+    const oldB = registry.acquire(oldFactory);
+    oldA.manager.connect();
+    const rotated = registry.acquire(rotatedFactory);
+
+    expect(rotated.manager).not.toBe(oldA.manager);
+    expect(oldA.manager.getState()).toBe("connecting");
+    oldA.release();
+    oldA.release();
+    expect(oldA.manager.getState()).toBe("connecting");
+    oldB.release();
+    expect(oldA.manager.getState()).toBe("disconnected");
+    rotated.release();
+    expect(connectionManagerRegistry.getAll()).toHaveLength(0);
   });
 
   it("ignores delayed events from a socket replaced by reconnect", async () => {

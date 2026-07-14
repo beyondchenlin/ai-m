@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import http from "node:http";
-import type { AddressInfo, Socket } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
-import { defaultBackendFeatures } from "@/lib/test-helpers/fake-comfyui";
+import net, { type AddressInfo, type Socket } from "node:net";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { defaultBackendFeatures, FakeComfyUITransport } from "@/lib/test-helpers/fake-comfyui";
 import { ComfyUIExecutionOrchestrator } from "../comfyui-execution-orchestrator";
 import { connectionManagerRegistry } from "../comfyui-connection-manager";
-import { ComfyUIHttpTransport, isApprovedRemoteAddress } from "../comfyui";
+import { ComfyUIHttpTransport, createComfyUITransport, isApprovedRemoteAddress } from "../comfyui";
 
 const sockets = new Set<Socket>();
 
@@ -23,12 +23,117 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     expect(isApprovedRemoteAddress(undefined, ["127.0.0.1"])).toBe(false);
   });
 
+  it("bounds a blackholed TLS dial and omits SNI for an IPv6 literal", async () => {
+    const blackhole = new net.Socket();
+    const destroy = vi.spyOn(blackhole, "destroy");
+    let servername: string | undefined;
+    const socketFactory = vi.fn((dial: { servername?: string }) => {
+      servername = dial.servername;
+      return blackhole;
+    });
+    const transport = new ComfyUIHttpTransport(
+      "https://[::1]:8188",
+      {},
+      ["::1"],
+      {
+        policyRevision: "revision-timeout",
+        connectTimeoutMs: 10,
+        socketFactory,
+      },
+    );
+
+    try {
+      await expect(transport.get("/queue")).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: expect.stringMatching(/timed out/i) }),
+      });
+      expect(socketFactory).toHaveBeenCalledOnce();
+      expect(servername).toBeUndefined();
+      expect(destroy).toHaveBeenCalledOnce();
+    } finally {
+      transport.close();
+      blackhole.destroy();
+    }
+  });
+
+  it("fails over from a refused approved address to a healthy approved address", async () => {
+    const server = http.createServer((_request, response) => {
+      response.setHeader("content-type", "application/json");
+      response.end("{}");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const attempted: string[] = [];
+    const transport = new ComfyUIHttpTransport(
+      `http://comfy.policy.test:${port}`,
+      {},
+      ["127.0.0.2", "127.0.0.1"],
+      {
+        policyRevision: "revision-failover",
+        connectTimeoutMs: 1_000,
+        socketFactory: (dial) => {
+          attempted.push(dial.address);
+          return net.connect({ host: dial.address, port: dial.port, family: dial.family });
+        },
+      },
+    );
+
+    try {
+      expect((await transport.get("/queue")).ok).toBe(true);
+      expect(attempted).toEqual(["127.0.0.2", "127.0.0.1"]);
+    } finally {
+      transport.close();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("gives separate fake jobs on one backend the same submission and socket client ID", () => {
+    const first = new FakeComfyUITransport({ promptId: "job-a", connectionIdentity: "shared" });
+    const second = new FakeComfyUITransport({ promptId: "job-b", connectionIdentity: "shared" });
+    const firstFactory = first.getWebSocketFactory();
+    const secondFactory = second.getWebSocketFactory();
+
+    expect(firstFactory.clientId).toBe(secondFactory.clientId);
+    expect(firstFactory.open().url).toContain(`clientId=${encodeURIComponent(firstFactory.clientId)}`);
+  });
+
+  it("canonicalizes mapped IPv4 addresses when checking an approved DNS revision", async () => {
+    const previous = process.env.FF_V2_COMFYUI_TRANSPORT;
+    const previousHosts = process.env.AI_M_CONTAINER_HOST_ALLOWLIST;
+    process.env.FF_V2_COMFYUI_TRANSPORT = "1";
+    process.env.AI_M_CONTAINER_HOST_ALLOWLIST = "comfy.policy.test";
+    try {
+      const transport = await createComfyUITransport(
+        "http://comfy.policy.test:8188",
+        "container-to-host",
+        {},
+        ["::ffff:127.0.0.1"],
+        {
+          policyRevision: "revision-mapped-address",
+          resolver: async () => [{ address: "127.0.0.1", family: 4 }],
+        },
+      );
+      transport.close();
+    } finally {
+      if (previous === undefined) delete process.env.FF_V2_COMFYUI_TRANSPORT;
+      else process.env.FF_V2_COMFYUI_TRANSPORT = previous;
+      if (previousHosts === undefined) delete process.env.AI_M_CONTAINER_HOST_ALLOWLIST;
+      else process.env.AI_M_CONTAINER_HOST_ALLOWLIST = previousHosts;
+    }
+  });
+
   it("makes the orchestrator dial the approved address with the approved authority and authentication", async () => {
     let upgradeHeaders: http.IncomingHttpHeaders | null = null;
+    let upgradeUrl = "";
+    let submittedClientId = "";
     const server = http.createServer((request, response) => {
       response.setHeader("content-type", "application/json");
       if (request.method === "POST" && request.url === "/prompt") {
-        response.end(JSON.stringify({ prompt_id: "pinned-prompt" }));
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => {
+          submittedClientId = (JSON.parse(Buffer.concat(chunks).toString("utf8")) as { client_id: string }).client_id;
+          response.end(JSON.stringify({ prompt_id: "pinned-prompt" }));
+        });
         return;
       }
       if (request.url === "/queue") {
@@ -61,6 +166,7 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     });
     server.on("upgrade", (request, socket) => {
       upgradeHeaders = request.headers;
+      upgradeUrl = request.url ?? "";
       const key = request.headers["sec-websocket-key"] ?? "";
       const accept = createHash("sha1")
         .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -106,6 +212,7 @@ describe("ComfyUI WebSocket endpoint policy", () => {
         host: authority,
         origin: `http://${authority}`,
       });
+      expect(new URL(upgradeUrl, `http://${authority}`).searchParams.get("clientId")).toBe(submittedClientId);
     } finally {
       connectionManagerRegistry.closeAll();
       for (const socket of sockets) socket.destroy();
@@ -154,6 +261,7 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     );
     try {
       const identity = first.getWebSocketFactory();
+      expect(first.getClientId()).toBe(equivalent.getClientId());
       expect(identity.registryKey).toBe(equivalent.getWebSocketFactory().registryKey);
       expect(identity.registryKey).not.toBe(rotatedCredential.getWebSocketFactory().registryKey);
       expect(identity.registryKey).not.toBe(revisedPolicy.getWebSocketFactory().registryKey);
@@ -211,7 +319,7 @@ describe("ComfyUI WebSocket endpoint policy", () => {
       const httpResponse = await transport.get("/queue");
       expect(httpResponse.status).toBe(302);
       expect(alternateHttpHits).toBe(0);
-      const ws = transport.connectWebSocket();
+      const ws = transport.getWebSocketFactory().open();
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("redirecting WebSocket did not terminate")), 1_000);
         const done = () => {

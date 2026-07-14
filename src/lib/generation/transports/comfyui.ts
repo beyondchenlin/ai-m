@@ -7,6 +7,8 @@
 
 import { isEnabled, FF } from "@/lib/feature-flags";
 import {
+  canonicalizeSocketAddress,
+  canonicalizeUrlHostname,
   validateBackendUrlResolved,
   type BackendAddressResolver,
 } from "@/lib/security/network-policy";
@@ -24,18 +26,11 @@ import type { ComfyUIWebSocketFactory } from "./comfyui-connection-manager";
 
 const CREDENTIAL_IDENTITY_KEY = randomBytes(32);
 
-function canonicalizeSocketAddress(address: string): string {
-  const value = address.trim().toLowerCase().replace(/^\[|\]$/g, "");
-  if (net.isIP(value) === 4) return value;
-  if (net.isIP(value) !== 6) throw new Error(`Invalid approved backend address: ${address}`);
-  const canonical = new URL(`http://[${value}]/`).hostname.slice(1, -1);
-  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
-  if (mapped) {
-    const high = Number.parseInt(mapped[1], 16);
-    const low = Number.parseInt(mapped[2], 16);
-    return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
-  }
-  return canonical;
+function clientIdForConnectionIdentity(identity: string): string {
+  return `ai-m-${createHmac("sha256", CREDENTIAL_IDENTITY_KEY)
+    .update(`client-id\0${identity}`)
+    .digest("hex")
+    .slice(0, 24)}`;
 }
 
 export function isApprovedRemoteAddress(
@@ -67,6 +62,17 @@ function credentialIdentity(headers: Readonly<Record<string, string>>): string {
 export interface ComfyUIEndpointPolicyOptions {
   policyRevision: string;
   resolver?: BackendAddressResolver;
+  connectTimeoutMs?: number;
+  socketFactory?: (options: ComfyUIEndpointDialOptions) => net.Socket | tls.TLSSocket;
+}
+
+export interface ComfyUIEndpointDialOptions {
+  protocol: "http:" | "https:";
+  address: string;
+  port: number;
+  family: 4 | 6;
+  localAddress?: string;
+  servername?: string;
 }
 
 /** ComfyUI 提示词提交请求 */
@@ -190,7 +196,6 @@ export interface ComfyUITransport {
   /** 获取文件 */
   getFile(params: { filename: string; subfolder: string; type: string }): Promise<Response>;
   /** 建立 WebSocket 连接 */
-  connectWebSocket(): WebSocket;
   /** Immutable identity and constructor for the shared realtime connection. */
   getWebSocketFactory(): ComfyUIWebSocketFactory;
   /** 取消当前提示词 */
@@ -237,59 +242,130 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     this.baseUrl = canonicalEndpoint(baseUrl);
     this.controller = new AbortController();
     this.headers = Object.freeze({ ...headers });
-    const canonicalAddresses = [...new Set(approvedAddresses.map(canonicalizeSocketAddress))].sort();
+    const canonicalAddresses = [...new Set(approvedAddresses.map(canonicalizeSocketAddress))];
     const addresses = canonicalAddresses.map((address) => ({
       address, family: net.isIP(address) as 4 | 6,
     }));
     if (addresses.length === 0) throw new Error("ComfyUI transport requires approved backend addresses");
+    const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
+    if (!Number.isSafeInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 60_000) {
+      throw new Error("ComfyUI connect timeout must be between 1 and 60000 milliseconds");
+    }
+    const authorityHostname = canonicalizeUrlHostname(new URL(this.baseUrl).hostname);
     let nextAddress = 0;
     const connector: ReturnType<typeof buildConnector> = (connectOptions, callback) => {
-      const approved = addresses[nextAddress++ % addresses.length];
       const port = Number(connectOptions.port) || (connectOptions.protocol === "https:" ? 443 : 80);
+      const startIndex = nextAddress++ % addresses.length;
+      const candidates = addresses.map((_, index) => addresses[(startIndex + index) % addresses.length]);
       let callbackPending = true;
+      const deadline = Date.now() + connectTimeoutMs;
+      const connectorState: {
+        timeout?: ReturnType<typeof setTimeout>;
+        currentSocket?: net.Socket | tls.TLSSocket;
+        cancelCurrent?: () => void;
+      } = {};
       const finish = (error: Error | null, socket: net.Socket | tls.TLSSocket | null) => {
         if (!callbackPending) return;
         callbackPending = false;
+        if (connectorState.timeout) clearTimeout(connectorState.timeout);
+        connectorState.cancelCurrent?.();
+        if (error) connectorState.currentSocket?.destroy();
         if (error) callback(error, null);
         else if (socket) callback(null, socket);
         else callback(new Error("Backend connector returned no socket"), null);
       };
-      const tlsOptions: tls.ConnectionOptions = {
-        servername: connectOptions.servername || new URL(this.baseUrl).hostname,
-      };
-      const socket = connectOptions.protocol === "https:"
-        ? tls.connect(port, approved.address, tlsOptions)
-        : net.connect({
-            host: approved.address,
-            port,
-            family: approved.family,
-            localAddress: connectOptions.localAddress ?? undefined,
-          });
-      socket.setNoDelay(true);
-      socket.setKeepAlive(true, 60_000);
-      socket.once("error", (error) => finish(error, null));
-      socket.once(connectOptions.protocol === "https:" ? "secureConnect" : "connect", () => {
-        if (!isApprovedRemoteAddress(socket.remoteAddress, canonicalAddresses)) {
-          socket.destroy();
-          finish(new Error("Backend socket remote address is outside the approved endpoint policy"), null);
+      const requestedServername = canonicalizeUrlHostname(connectOptions.servername || authorityHostname);
+      const servername = net.isIP(requestedServername) === 0 ? requestedServername : undefined;
+      let candidateIndex = 0;
+      const tryNext = (lastError?: Error): void => {
+        if (!callbackPending) return;
+        const remainingMs = deadline - Date.now();
+        if (candidateIndex >= candidates.length || remainingMs <= 0) {
+          finish(lastError ?? new Error(`Backend connection timed out after ${connectTimeoutMs}ms`), null);
           return;
         }
-        finish(null, socket);
-      });
+        const approved = candidates[candidateIndex++];
+        const dialOptions: ComfyUIEndpointDialOptions = {
+          protocol: connectOptions.protocol === "https:" ? "https:" : "http:",
+          address: approved.address,
+          port,
+          family: approved.family,
+          localAddress: connectOptions.localAddress ?? undefined,
+          servername,
+        };
+        let socket: net.Socket | tls.TLSSocket;
+        try {
+          socket = options.socketFactory?.(dialOptions) ?? (connectOptions.protocol === "https:"
+            ? tls.connect(port, approved.address, { servername })
+            : net.connect({
+                host: approved.address,
+                port,
+                family: approved.family,
+                localAddress: connectOptions.localAddress ?? undefined,
+              }));
+        } catch (error) {
+          tryNext(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        connectorState.currentSocket = socket;
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 60_000);
+        const eventName = connectOptions.protocol === "https:" ? "secureConnect" : "connect";
+        const attemptState: { timer?: ReturnType<typeof setTimeout> } = {};
+        const cleanupAttempt = () => {
+          if (attemptState.timer) clearTimeout(attemptState.timer);
+          socket.removeListener("error", onError);
+          socket.removeListener(eventName, onConnect);
+          if (connectorState.cancelCurrent === cleanupAttempt) connectorState.cancelCurrent = undefined;
+        };
+        const failAttempt = (error: Error) => {
+          cleanupAttempt();
+          socket.destroy();
+          if (connectorState.currentSocket === socket) connectorState.currentSocket = undefined;
+          tryNext(error);
+        };
+        const onError = (error: Error) => failAttempt(error);
+        const onConnect = () => {
+          cleanupAttempt();
+          if (!isApprovedRemoteAddress(socket.remoteAddress, canonicalAddresses)) {
+            socket.destroy();
+            if (connectorState.currentSocket === socket) connectorState.currentSocket = undefined;
+            tryNext(new Error("Backend socket remote address is outside the approved endpoint policy"));
+            return;
+          }
+          connectorState.currentSocket = undefined;
+          finish(null, socket);
+        };
+        connectorState.cancelCurrent = cleanupAttempt;
+        socket.once("error", onError);
+        socket.once(eventName, onConnect);
+        const attemptsRemaining = candidates.length - candidateIndex + 1;
+        const attemptBudgetMs = Math.max(1, Math.floor(remainingMs / attemptsRemaining));
+        attemptState.timer = setTimeout(
+          () => failAttempt(new Error(`Backend connection timed out after ${connectTimeoutMs}ms`)),
+          attemptBudgetMs,
+        );
+      };
+      connectorState.timeout = setTimeout(() => {
+        const error = new Error(`Backend connection timed out after ${connectTimeoutMs}ms`);
+        finish(error, null);
+      }, connectTimeoutMs);
+      tryNext();
     };
     this.dispatcher = new Agent({
       connect: connector,
     });
-    this.clientId = this.generateClientId();
     const policyDigest = createHash("sha256").update(JSON.stringify({
       endpoint: this.baseUrl,
-      addresses: canonicalAddresses,
+      addresses: [...canonicalAddresses].sort(),
       revision: options.policyRevision,
     })).digest("hex");
     const registryKey = `${this.baseUrl}#credential=${credentialIdentity(this.headers)}&policy=${policyDigest}`;
+    this.clientId = clientIdForConnectionIdentity(registryKey);
     this.webSocketFactory = Object.freeze({
       canonicalEndpoint: this.baseUrl,
       registryKey,
+      clientId: this.clientId,
       open: () => {
         const dispatcher = new Agent({ connect: connector });
         const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(this.clientId)}`;
@@ -302,10 +378,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
         return ws as unknown as WebSocket;
       },
     });
-  }
-
-  private generateClientId(): string {
-    return `ai-m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
   private url(path: string): string {
@@ -378,10 +450,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       redirect: "manual",
       dispatcher: this.dispatcher,
     }) as unknown as Promise<Response>;
-  }
-
-  connectWebSocket(): WebSocket {
-    return this.webSocketFactory.open();
   }
 
   getWebSocketFactory(): ComfyUIWebSocketFactory {
@@ -626,8 +694,8 @@ export async function createComfyUITransport(
     throw new Error(`Invalid ComfyUI backend URL: ${validation.errors.join("; ")}`);
   }
   if (expectedResolvedAddresses.length) {
-    const expected = [...new Set(expectedResolvedAddresses)].sort();
-    const actual = [...new Set(validation.resolvedAddresses)].sort();
+    const expected = [...new Set(expectedResolvedAddresses.map(canonicalizeSocketAddress))].sort();
+    const actual = [...new Set(validation.resolvedAddresses.map(canonicalizeSocketAddress))].sort();
     if (expected.length !== actual.length || expected.some((address, index) => address !== actual[index])) {
       throw new Error("ComfyUI backend DNS resolution differs from the approved backend revision");
     }

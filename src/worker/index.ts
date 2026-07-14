@@ -17,6 +17,7 @@ import { waitForCurrentMigrationBundle } from "@/lib/db";
 import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-adapter";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { settleClaimedJob } from "./claim-settlement";
+import { connectionManagerRegistry } from "@/lib/generation/transports/comfyui-connection-manager";
 
 // Worker 标识
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
@@ -235,6 +236,7 @@ async function gracefulShutdown(signal: string) {
       console.warn(`[${WORKER_ID}] Graceful shutdown timed out; durable recovery will reconcile the retained claim`);
     }
   }
+  connectionManagerRegistry.closeAll();
   stopHeartbeat();
   console.log(`[${WORKER_ID}] Shutdown coordination complete`);
   process.exitCode = 0;

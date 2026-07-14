@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isEnabledMock = vi.fn();
+const closeAllConnectionsMock = vi.fn();
 
 vi.mock("@/lib/feature-flags", () => ({
   isEnabled: (...args: unknown[]) => isEnabledMock(...args),
@@ -57,6 +58,9 @@ vi.mock("@/lib/generation/source-assets", () => ({
 vi.mock("@/lib/generation/business-adapter", () => ({
   reconcileBusinessArtifactProjections: vi.fn(() => Promise.resolve({ projected: 0, failed: 0 })),
 }));
+vi.mock("@/lib/generation/transports/comfyui-connection-manager", () => ({
+  connectionManagerRegistry: { closeAll: closeAllConnectionsMock },
+}));
 
 describe("PR-11: Worker 信号处理", () => {
   beforeEach(() => {
@@ -80,6 +84,7 @@ describe("PR-11: Worker 信号处理", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(process.exitCode).toBe(0);
+    expect(closeAllConnectionsMock).toHaveBeenCalledOnce();
   });
 
   it("收到 SIGTERM 应调用 process.exit", async () => {

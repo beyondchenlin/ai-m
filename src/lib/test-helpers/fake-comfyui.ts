@@ -17,6 +17,8 @@ import type {
 import type { BackendFeatureSnapshot } from "@/lib/generation/transports/comfyui-behavior-probe";
 
 export interface FakeTransportScenario {
+  /** Stable fake backend identity; different prompt IDs may share one connection. */
+  connectionIdentity?: string;
   /** 提交 /prompt 时抛出的错误，优先级最高 */
   submitError?: Error;
   /** 提交返回的 promptId */
@@ -215,15 +217,14 @@ export class FakeComfyUITransport implements ComfyUITransport {
     return new Response(bytes, { status: this.scenario.fileStatus ?? 200, headers: this.scenario.fileHeaders });
   }
 
-  connectWebSocket(): WebSocket {
-    return new FakeWebSocket();
-  }
-
   getWebSocketFactory() {
+    const identity = this.scenario.connectionIdentity ?? "default";
+    const clientId = `fake-comfyui-${identity}`;
     return Object.freeze({
       canonicalEndpoint: "http://fake-comfyui.test",
-      registryKey: `fake-comfyui:${this.scenario.promptId ?? "default"}`,
-      open: () => this.connectWebSocket(),
+      registryKey: `fake-comfyui:${identity}`,
+      clientId,
+      open: () => new FakeWebSocket(`ws://fake-comfyui.test/ws?clientId=${encodeURIComponent(clientId)}`),
     });
   }
 

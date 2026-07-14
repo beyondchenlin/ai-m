@@ -56,10 +56,10 @@ describe("PR-05: 取消策略", () => {
     post: async (_path: string, _body: unknown) => new Response("{}", { status: 200 }),
     uploadImage: async (input: { filename: string }) => ({ name: input.filename, subfolder: "", type: "input" }),
     getFile: async () => new Response(),
-    connectWebSocket: () => new WebSocket("ws://localhost"),
     getWebSocketFactory: () => ({
       canonicalEndpoint: "http://localhost:8188",
       registryKey: "pr05-test",
+      clientId: "pr05-client",
       open: () => new WebSocket("ws://localhost"),
     }),
     cancel: async () => {},

@@ -68,10 +68,21 @@ describe("PR-12: 后端拓扑校验", () => {
     ]);
   });
 
+  it("treats a resolver's mapped IPv4 loopback as the canonical loopback address", async () => {
+    const result = await validateBackendUrlResolved(
+      "http://localhost:8188",
+      "same-host",
+      async () => [{ address: "::ffff:127.0.0.1", family: 6 }],
+    );
+
+    expect(result).toEqual({ valid: true, resolvedAddresses: ["127.0.0.1"], errors: [] });
+  });
+
   it("same-host 只允许回环主机", () => {
     expect(validateBackendUrl("http://localhost:8188", "same-host").valid).toBe(true);
     expect(validateBackendUrl("http://127.0.0.1:8188", "same-host").valid).toBe(true);
     expect(validateBackendUrl("http://192.168.1.1:8188", "same-host").valid).toBe(false);
+    expect(validateBackendUrl("http://[::1]:8188", "same-host").valid).toBe(true);
   });
 
   it("container-to-host 与同容器网络必须使用显式主机白名单", () => {

@@ -50,6 +50,7 @@ export interface ReconnectConfig {
 export interface ComfyUIWebSocketFactory {
   readonly canonicalEndpoint: string;
   readonly registryKey: string;
+  readonly clientId: string;
   open(): WebSocket;
 }
 
@@ -145,6 +146,10 @@ export class ComfyUIConnectionManager {
       return;
     }
 
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.shouldReconnect = true;
     this.doConnect();
   }
@@ -389,35 +394,57 @@ export class ComfyUIConnectionManager {
  * 连接管理器注册表
  * 每个后端 URL 对应一个共享连接管理器
  */
-class ConnectionManagerRegistry {
-  private managers = new Map<string, ComfyUIConnectionManager>();
-  private activeKeyByEndpoint = new Map<string, string>();
+export interface ComfyUIConnectionLease {
+  readonly manager: ComfyUIConnectionManager;
+  release(): void;
+}
 
-  getOrCreate(factory: ComfyUIWebSocketFactory): ComfyUIConnectionManager {
-    let mgr = this.managers.get(factory.registryKey);
-    if (!mgr) {
-      const previousKey = this.activeKeyByEndpoint.get(factory.canonicalEndpoint);
-      if (previousKey && previousKey !== factory.registryKey) {
-        this.managers.get(previousKey)?.disconnect();
-        this.managers.delete(previousKey);
-      }
-      mgr = new ComfyUIConnectionManager(() => factory.open());
-      this.managers.set(factory.registryKey, mgr);
-      this.activeKeyByEndpoint.set(factory.canonicalEndpoint, factory.registryKey);
+interface RegistryEntry {
+  readonly registryKey: string;
+  readonly manager: ComfyUIConnectionManager;
+  leases: number;
+}
+
+class ConnectionManagerRegistry {
+  private entries = new Map<string, RegistryEntry>();
+
+  acquire(factory: ComfyUIWebSocketFactory): ComfyUIConnectionLease {
+    let entry = this.entries.get(factory.registryKey);
+    if (!entry) {
+      entry = {
+        registryKey: factory.registryKey,
+        manager: new ComfyUIConnectionManager(() => factory.open()),
+        leases: 0,
+      };
+      this.entries.set(factory.registryKey, entry);
     }
-    return mgr;
+    entry.leases++;
+    let released = false;
+    return {
+      manager: entry.manager,
+      release: () => {
+        if (released) return;
+        released = true;
+        entry!.leases--;
+        if (entry!.leases === 0) this.dispose(entry!);
+      },
+    };
+  }
+
+  private dispose(entry: RegistryEntry): void {
+    entry.manager.disconnect();
+    if (this.entries.get(entry.registryKey) === entry) this.entries.delete(entry.registryKey);
   }
 
   getAll(): ComfyUIConnectionManager[] {
-    return Array.from(this.managers.values());
+    return Array.from(this.entries.values(), (entry) => entry.manager);
   }
 
   closeAll(): void {
-    for (const mgr of this.managers.values()) {
-      mgr.disconnect();
+    for (const manager of this.getAll()) {
+      manager.disconnect();
     }
-    this.managers.clear();
-    this.activeKeyByEndpoint.clear();
+    this.entries.clear();
   }
 }
 
