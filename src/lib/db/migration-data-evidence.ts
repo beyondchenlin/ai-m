@@ -53,6 +53,11 @@ export const DATA_POSTCONDITION_REGISTRY: readonly DataPostconditionRegistration
     hash: "a89bf74586f7cc217f73a2440893e8532e04d3fd17c12dce1886b3a80b4c6019",
     verify: () => "0058 dropped its copy source; copy provenance is never independently provable",
   },
+  {
+    folderMillis: 1778600000000,
+    hash: "e1a411e86bbe892f38db6d2388acc65e3a44a92afe28b83f8518170c8d6e60eb",
+    verify: () => "0051 dropped legacy shot columns; their historical values are never independently provable",
+  },
 ] as const;
 
 /** Return the outer statement kind, ignoring comments, quoted bytes, and trigger bodies. */
@@ -63,7 +68,7 @@ export function topLevelStatementKind(sql: string): string {
   return tokens.find((token) => ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(token)) ?? "WITH";
 }
 
-function topLevelTokens(sql: string): string[] {
+export function topLevelTokens(sql: string): string[] {
   const tokens: Array<{ value: string; depth: number }> = [];
   let depth = 0;
   for (let index = 0; index < sql.length;) {
@@ -104,9 +109,43 @@ function topLevelTokens(sql: string): string[] {
   return tokens.filter((token) => token.depth === 0).map((token) => token.value);
 }
 
-function migrationsWithDml(migrations: MigrationMetadata[]): MigrationMetadata[] {
+export function validateMigrationExecutionStatements(migrations: readonly Readonly<MigrationMetadata>[]): void {
+  const allowed = new Set(["CREATE", "ALTER", "INSERT", "UPDATE", "DELETE", "REPLACE", "DROP"]);
+  for (const migration of migrations) {
+    for (const statement of (migration.sql ?? []).flatMap(splitSqlStatements)) {
+      const kind = topLevelStatementKind(statement);
+      if (!kind) continue;
+      if (!allowed.has(kind)) {
+        throw new Error(`Migration ${migration.folderMillis} contains unsupported transaction or connection SQL: ${kind || "UNKNOWN"}`);
+      }
+      const tokens = topLevelTokens(statement);
+      if (kind === "CREATE") {
+        let cursor = 1;
+        if (["TEMP", "TEMPORARY"].includes(tokens[cursor] ?? "")) cursor += 1;
+        if (tokens[cursor] === "UNIQUE") cursor += 1;
+        const objectKind = tokens[cursor];
+        if (!["TABLE", "INDEX", "TRIGGER", "VIEW"].includes(objectKind ?? "")
+          || (objectKind === "TABLE" && tokens.includes("AS"))) {
+          throw new Error(`Migration ${migration.folderMillis} contains unsupported CREATE category`);
+        }
+      } else if (kind === "ALTER" && tokens[1] !== "TABLE") {
+        throw new Error(`Migration ${migration.folderMillis} contains unsupported ALTER category`);
+      } else if (kind === "DROP" && !["TABLE", "INDEX", "TRIGGER", "VIEW"].includes(tokens[1] ?? "")) {
+        throw new Error(`Migration ${migration.folderMillis} contains unsupported DROP category`);
+      }
+    }
+  }
+}
+
+function isDestructive(statement: string): boolean {
+  const tokens = topLevelTokens(statement);
+  return tokens[0] === "DROP" || (tokens[0] === "ALTER" && tokens.includes("DROP"));
+}
+
+function migrationsRequiringDataEvidence(migrations: MigrationMetadata[]): MigrationMetadata[] {
   return migrations.filter((migration) => (migration.sql ?? []).flatMap(splitSqlStatements).some((statement) =>
-    ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(topLevelStatementKind(statement))));
+    ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(topLevelStatementKind(statement))
+      || isDestructive(statement)));
 }
 
 /** Split SQL without treating semicolons in strings/comments/trigger bodies as boundaries. */
@@ -174,6 +213,7 @@ export function validateMigrationStatementEvidence(
   for (const migration of migrations) {
     for (const statement of (migration.sql ?? []).flatMap(splitSqlStatements)) {
       const kind = topLevelStatementKind(statement);
+      if (!kind) continue;
       if (["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(kind)) continue;
       if (kind === "CREATE") {
         const tokens = topLevelTokens(statement);
@@ -205,11 +245,11 @@ export function validateDataPostconditionRegistry(
     if (registrationKeys.has(key)) throw new Error(`Duplicate DML postcondition registration ${key}`);
     registrationKeys.add(key);
   }
-  const detectedKeys = new Set(migrationsWithDml(migrations)
+  const detectedKeys = new Set(migrationsRequiringDataEvidence(migrations)
     .map((migration) => `${migration.folderMillis}:${migration.hash}`));
   if (detectedKeys.size !== registrationKeys.size
     || [...detectedKeys].some((key) => !registrationKeys.has(key))) {
-    throw new Error("DML postcondition registry does not exactly match detected migration DML");
+    throw new Error("Data/destructive postcondition registry does not exactly match detected migration effects");
   }
 }
 
@@ -231,10 +271,10 @@ export function verifyDataPostconditions(
   const relevant = DATA_POSTCONDITION_REGISTRY.filter((registration) =>
     migrations.some((migration) => migration.folderMillis === registration.folderMillis));
   validateMigrationStatementEvidence(migrations, relevant);
-  for (const migration of migrationsWithDml(migrations.slice(0, boundaryCount))) {
+  for (const migration of migrationsRequiringDataEvidence(migrations.slice(0, boundaryCount))) {
     const registration = DATA_POSTCONDITION_REGISTRY.find((candidate) =>
       candidate.folderMillis === migration.folderMillis && candidate.hash === migration.hash);
-    if (!registration) throw new Error(`Journal-less recovery requires operator action: unregistered DML ${migration.folderMillis}`);
+    if (!registration) throw new Error(`Journal-less recovery requires operator action: unregistered data/destructive migration ${migration.folderMillis}`);
     const failure = runDataPostconditionReadOnly(sqlite, registration);
     if (failure) throw new Error(`Journal-less recovery requires an operator action: ${failure}`);
   }

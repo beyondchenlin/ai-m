@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
 export type BackupFileSecurityPolicy = {
+  verifyParent: (directory: string) => void;
   protect: (filename: string) => void;
   verify: (filename: string) => void;
 };
@@ -30,7 +31,7 @@ if ($payload.action -eq 'protect') {
   )
   [void]$security.AddAccessRule($rule)
   Set-Acl -LiteralPath $filename -AclObject $security
-} elseif ($payload.action -ne 'verify') {
+} elseif ($payload.action -ne 'verify' -and $payload.action -ne 'verifyParent') {
   throw 'Unknown file-security action'
 }
 $actual = Get-Acl -LiteralPath $filename
@@ -49,7 +50,7 @@ if (-not $ok) { throw 'Backup file DACL is not current-SID-only FullControl with
 `;
 
 function runWindowsSecurity(
-  action: "protect" | "verify",
+  action: "protect" | "verify" | "verifyParent",
   filename: string,
   run: typeof execFileSync,
 ): void {
@@ -81,6 +82,7 @@ export function createBackupFileSecurityPolicy(
   if (platform === "win32") {
     const run = dependencies.run ?? execFileSync;
     return {
+      verifyParent: (directory) => runWindowsSecurity("verifyParent", directory, run),
       protect: (filename) => runWindowsSecurity("protect", filename, run),
       verify: (filename) => runWindowsSecurity("verify", filename, run),
     };
@@ -92,6 +94,13 @@ export function createBackupFileSecurityPolicy(
     if (mode !== 0o600) throw new Error(`Backup file mode must be 0600, received 0${mode.toString(8)}`);
   };
   return {
+    verifyParent: (directory) => {
+      const info = fs.lstatSync(directory);
+      const getuid = process.getuid;
+      if (!info.isDirectory() || typeof getuid !== "function" || info.uid !== getuid() || (info.mode & 0o022) !== 0) {
+        throw new Error("Backup parent directory must be owned by the current uid and not group/other writable");
+      }
+    },
     protect: (filename) => { chmod(filename, 0o600); verify(filename); },
     verify,
   };

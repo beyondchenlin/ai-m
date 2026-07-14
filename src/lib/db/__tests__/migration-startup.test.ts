@@ -21,6 +21,7 @@ import {
 
 describe("migration journal startup ordering", () => {
   const repositoryMigrations = readMigrationFiles({ migrationsFolder: path.resolve("drizzle") });
+  const repositoryBundle = loadValidatedMigrationBundle(path.resolve("drizzle"));
 
   function legacyVisualDatabase(rows: Array<{ hash: string; createdAt: number }>): Database.Database {
     const sqlite = new Database(":memory:");
@@ -172,7 +173,7 @@ describe("migration journal startup ordering", () => {
     sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
     try {
       prepareMigrationJournal(sqlite, repositoryMigrations);
-      expect(applyPendingMigrations(sqlite, repositoryMigrations)).toBe(60);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(60);
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
     } finally { sqlite.close(); }
   });
@@ -181,11 +182,11 @@ describe("migration journal startup ordering", () => {
     const sqlite = new Database(":memory:");
     sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
     try {
-      expect(() => applyPendingMigrations(sqlite, [{
+      expect(() => applyPendingMigrations(sqlite, { migrations: [{
         folderMillis: 1,
         hash: "broken",
         sql: ["CREATE TABLE rolled_back (id text)", "INSERT INTO missing_table VALUES (1)"],
-      }])).toThrow();
+      }], folder: "fake", manifestDigest: "fake" })).toThrow(/validated loader/i);
       expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='rolled_back'").get()).toBeUndefined();
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
     } finally { sqlite.close(); }
@@ -210,7 +211,7 @@ describe("migration journal startup ordering", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-baseline-race-"));
     const filename = path.join(directory, "legacy.sqlite");
     const first = new Database(filename);
-    for (const migration of repositoryMigrations.slice(0, 54)) {
+    for (const migration of repositoryMigrations.slice(0, 51)) {
       for (const statement of migration.sql) first.exec(statement);
     }
     first.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
@@ -220,10 +221,10 @@ describe("migration journal startup ordering", () => {
     try {
       prepareMigrationJournal(first, repositoryMigrations);
       prepareMigrationJournal(second, repositoryMigrations);
-      expect(baselineJournalLessDatabase(first, repositoryMigrations)).toBe(54);
+      expect(baselineJournalLessDatabase(first, repositoryMigrations)).toBe(51);
       expect(baselineJournalLessDatabase(second, repositoryMigrations)).toBe(0);
       expect(second.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
-        .toEqual({ count: 54 });
+        .toEqual({ count: 51 });
       expect(second.prepare(`
         SELECT COUNT(*) count FROM (
           SELECT created_at FROM "__drizzle_migrations" GROUP BY created_at HAVING COUNT(*) > 1
@@ -240,7 +241,7 @@ describe("migration journal startup ordering", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-baseline-process-race-"));
     const filename = path.join(directory, "legacy.sqlite");
     const setup = new Database(filename);
-    for (const migration of repositoryMigrations.slice(0, 54)) {
+    for (const migration of repositoryMigrations.slice(0, 51)) {
       for (const statement of migration.sql) setup.exec(statement);
     }
     setup.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
@@ -293,11 +294,11 @@ describe("migration journal startup ordering", () => {
         }, 20);
       });
       fs.writeFileSync(releaseFile, "go");
-      expect((await Promise.all(contenders)).sort()).toEqual(["0", "54"]);
+      expect((await Promise.all(contenders)).sort()).toEqual(["0", "51"]);
       const verify = new Database(filename);
       try {
         expect(verify.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
-          .toEqual({ count: 54 });
+          .toEqual({ count: 51 });
       } finally {
         verify.close();
       }
@@ -451,10 +452,23 @@ describe("migration journal startup ordering", () => {
       const sqlite = new Database(":memory:");
       sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
       try {
-        expect(applyPendingMigrations(sqlite, bundle.migrations as unknown as typeof repositoryMigrations)).toBe(60);
+        expect(applyPendingMigrations(sqlite, bundle)).toBe(60);
         expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='disk_mutation_was_executed'").get())
           .toBeUndefined();
       } finally { sqlite.close(); }
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
+
+  it.each(["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT x", "RELEASE x", "END", "ATTACH ':memory:' AS x", "DETACH x", "VACUUM", "PRAGMA journal_mode=DELETE"])(
+    "rejects top-level migration connection control: %s",
+    (dangerous) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-dangerous-migration-"));
+      const copy = path.join(directory, "drizzle");
+      fs.cpSync(path.resolve("drizzle"), copy, { recursive: true });
+      fs.appendFileSync(path.join(copy, "0059_pr13_review2_hardening.sql"),
+        `\n--> statement-breakpoint\nCREATE TABLE escaped_before (id integer); ${dangerous}; CREATE TABLE escaped_after (id integer);`);
+      try { expect(() => loadValidatedMigrationBundle(copy)).toThrow(/unsupported|transaction|connection/i); }
+      finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    },
+  );
 });

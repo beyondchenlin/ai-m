@@ -56,6 +56,7 @@ describe("DML postcondition registry", () => {
       repositoryMigrations[10].folderMillis,
       repositoryMigrations[57].folderMillis,
       repositoryMigrations[58].folderMillis,
+      repositoryMigrations[51].folderMillis,
     ]);
   });
 
@@ -215,10 +216,10 @@ describe("journal-less full-schema evidence", () => {
     }, repositoryMigrations);
   }
 
-  it("recognizes a complete legacy 0053 boundary", () => {
+  it("refuses automatic recovery across destructive legacy migration 0051", () => {
     const sqlite = databaseAtBoundary(54);
     try {
-      expect(detect(sqlite)).toBe(54);
+      expect(() => detect(sqlite)).toThrow(/0051.*never independently provable/i);
     } finally {
       sqlite.close();
     }
@@ -403,7 +404,7 @@ describe("journal-less full-schema evidence", () => {
     }
   });
 
-  it("keeps the journal empty when nonempty 0058 copy provenance is unprovable", () => {
+  it("keeps the journal empty when a later boundary crosses destructive 0051", () => {
     const sqlite = databaseAtBoundary(59);
     sqlite.pragma("foreign_keys = OFF");
     sqlite.exec(`
@@ -416,10 +417,28 @@ describe("journal-less full-schema evidence", () => {
     try {
       prepareMigrationJournal(sqlite, repositoryMigrations);
       expect(() => baselineJournalLessDatabase(sqlite, repositoryMigrations))
-        .toThrow(/0058.*never independently provable/i);
+        .toThrow(/0051.*never independently provable/i);
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
     } finally {
       sqlite.close();
     }
+  });
+
+  it.each([
+    "DROP TABLE doomed",
+    "/* prefix */ DROP TABLE [doomed]",
+    "ALTER TABLE doomed DROP COLUMN secret",
+  ])("refuses a journal-less create-then-destructive boundary: %s", (destructive) => {
+    const migrations: MigrationMetadata[] = [
+      { folderMillis: 1, hash: "create", sql: ["CREATE TABLE doomed (id integer, secret text)"] },
+      { folderMillis: 2, hash: "destroy", sql: [destructive] },
+    ];
+    const sqlite = new Database(":memory:");
+    for (const migration of migrations) for (const statement of migration.sql ?? []) sqlite.exec(statement);
+    try {
+      expect(() => detectJournalLessBaselineMigrationCount({
+        journalRowCount: 0, appTableCount: 1, readActualInventory: () => sqlite,
+      }, migrations)).toThrow(/destructive|operator|registry/i);
+    } finally { sqlite.close(); }
   });
 });

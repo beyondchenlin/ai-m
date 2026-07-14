@@ -10,6 +10,7 @@ import {
   type MigrationMetadata,
 } from "./migration-journal";
 import { detectJournalLessBaselineMigrationCount } from "./migration-schema-evidence";
+import { validateMigrationExecutionStatements } from "./migration-data-evidence";
 
 type DrizzleDB = ReturnType<typeof drizzle<typeof schema>>;
 type SqliteConnection = import("better-sqlite3").Database;
@@ -246,6 +247,7 @@ export type ValidatedMigrationBundle = Readonly<{
   manifestDigest: string;
   migrations: readonly Readonly<MigrationMetadata>[];
 }>;
+const validatedMigrationBundles = new WeakSet<object>();
 
 function migrationFolderCandidate(): string {
   return process.env.AI_M_MIGRATIONS_DIR
@@ -295,7 +297,10 @@ function readValidatedMigrationBundle(folder: string, expectedManifestDigest?: s
       throw new Error("Configured migrations directory identity does not match AI_M_MIGRATIONS_SHA256");
     }
   }
-  return Object.freeze({ folder, manifestDigest, migrations: Object.freeze(migrations) });
+  validateMigrationExecutionStatements(migrations);
+  const bundle = Object.freeze({ folder, manifestDigest, migrations: Object.freeze(migrations) });
+  validatedMigrationBundles.add(bundle);
+  return bundle;
 }
 
 export function loadValidatedMigrationBundle(folder = migrationFolderCandidate()): ValidatedMigrationBundle {
@@ -319,8 +324,10 @@ export function computeMigrationsManifestDigest(folder: string): string {
 
 export function applyPendingMigrations(
   sqlite: SqliteConnection,
-  migrations: MigrationMetadata[],
+  bundle: ValidatedMigrationBundle,
 ): number {
+  if (!validatedMigrationBundles.has(bundle)) throw new Error("Migration bundle was not produced by validated loader");
+  const migrations = bundle.migrations as unknown as MigrationMetadata[];
   let applied = 0;
   sqlite.transaction(() => {
     validateRecordedMigrationJournal(sqlite, migrations);
@@ -351,7 +358,7 @@ export function runMigrations() {
     console.log(`[DB] Existing schema detected. Baselining ${confirmedBaselineCount} confirmed migrations...`);
   }
 
-  applyPendingMigrations(sqlite, migrations);
+  applyPendingMigrations(sqlite, bundle);
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access
