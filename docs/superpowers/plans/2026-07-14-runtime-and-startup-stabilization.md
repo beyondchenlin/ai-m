@@ -82,6 +82,39 @@ git add package.json pnpm-lock.yaml scripts/runtime-preflight.mjs scripts/__test
 git commit -m "build: enforce a single Node runtime"
 ```
 
+### Task 1.5: Align the static architecture gate with the runtime source of truth
+
+**Files:**
+- Modify: `tools/pr12_static_checks.py`
+
+- [ ] **Step 1: Reproduce the stale assertion**
+
+Run: `corepack pnpm test:pr12-static`
+
+Expected before the fix: FAIL because the checker requires `>=22.12.0 <25` while the reviewed runtime contract requires `>=22.16.0 <23`.
+
+- [ ] **Step 2: Derive the expected engine range from `.node-version`**
+
+Read the exact pinned version, parse and validate its numeric major, and require `package.json.engines.node` to equal `>=<pinned-version> <<next-major>`. Keep the exact pnpm package-manager assertion. Reject malformed or missing version files with a clear static-check failure instead of embedding a second Node version constant.
+
+- [ ] **Step 3: Verify the aligned gate**
+
+Run:
+
+```powershell
+corepack pnpm test:pr12-static
+corepack pnpm test:runtime
+```
+
+Expected: both commands pass; changing a temporary in-memory/package fixture is unnecessary because the runtime consistency suite already covers drift among `.node-version`, `packageManager`, `engines`, and the preflight pin.
+
+- [ ] **Step 4: Commit**
+
+```powershell
+git add tools/pr12_static_checks.py
+git commit -m "test: align runtime architecture gate"
+```
+
 ### Task 2: Make migration-journal validation explicit and testable
 
 **Files:**
@@ -226,4 +259,3 @@ Fetch `origin/dev`, reconcile without destructive reset, then rerun the commands
 - [ ] **Step 4: Merge into local `dev` and push remote `dev`**
 
 Only after the final gate is green, merge the reviewed branch into local `dev`, verify local and remote commit pointers, push `dev`, and keep a rollback reference.
-
