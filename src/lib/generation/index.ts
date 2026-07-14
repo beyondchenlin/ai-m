@@ -24,11 +24,13 @@ export {
   acquireResourceSlot,
   renewResourceSlot,
   releaseResourceSlot,
+  recordResourceTerminationProof,
   claimJob,
   renewJobClaim,
   releaseJobClaim,
   scanExpiredClaims,
 } from "./resources";
+export type { ResourceTerminationProofInput } from "./resources";
 export {
   validateWorkflowStructure,
   applyStaticPolicy,
@@ -95,6 +97,7 @@ export type {
   ReconciliationConfig,
   OrchestratorPhase,
   ExecutionCallbacks,
+  ExternalTerminationEvidence,
   ExecutionConfig,
   OrchestratorResult,
 } from "./transports";

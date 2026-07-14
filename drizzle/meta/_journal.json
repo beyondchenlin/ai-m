@@ -421,6 +421,13 @@
       "when": 1784122800000,
       "tag": "0059_pr13_review2_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1784209200000,
+      "tag": "0060_resource_reconciliation_proof",
+      "breakpoints": true
     }
   ]
 }

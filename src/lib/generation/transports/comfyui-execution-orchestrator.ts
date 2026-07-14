@@ -68,11 +68,19 @@ export interface ExecutionCallbacks {
   onCancellationResult?: (result: CancellationResult) => void | Promise<void>;
   /** Persists strong terminal evidence before the attempt may become CANCELLED. */
   onCancellationConfirmed?: (evidence: CancellationConfirmationEvidence) => void | Promise<void>;
+  /** Persists classifier-backed external terminal evidence before ownership may be released. */
+  onExternalTerminationEvidence?: (evidence: ExternalTerminationEvidence) => void | Promise<void>;
+}
+
+export interface ExternalTerminationEvidence {
+  proofKind: "history-completed" | "history-cancelled" | "history-failed";
+  externalJobId: string;
+  observedAtMs: number;
 }
 
 export interface CancellationConfirmationEvidence {
   outcome: "confirmed-cancelled";
-  source: "history-terminal-cancelled" | "strong-cancel-receipt";
+  source: "history-terminal-cancelled";
   externalJobId: string;
   method: CancellationResult["method"];
   observedAtMs: number;
@@ -177,6 +185,7 @@ export class ComfyUIExecutionOrchestrator {
 
   private phase: OrchestratorPhase = "CREATED";
   private externalJobId: string | null = null;
+  private terminalEvidenceRecorded = false;
   private cancelRequested = false;
   private cancellationDispatched = false;
   private cancellationWithoutIdReported = false;
@@ -395,6 +404,7 @@ export class ComfyUIExecutionOrchestrator {
           return true;
         }
         if (result.externalStatus === "completed") {
+          await this.recordHistoryTermination("completed");
           return true;
         }
         if (result.externalStatus === "cancelled") {
@@ -403,10 +413,12 @@ export class ComfyUIExecutionOrchestrator {
             await this.confirmCancellation(cancellation);
             return false;
           }
+          await this.recordHistoryTermination("cancelled");
           this.phase = "FAILED";
           return false;
         }
         if (result.externalStatus === "failed") {
+          await this.recordHistoryTermination("failed");
           this.phase = "FAILED";
           return false;
         }
@@ -436,8 +448,12 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation.outcome === "completed") return true;
+        if (cancellation.outcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
         if (cancellation.outcome === "failed") {
+          await this.recordHistoryTermination("failed");
           this.phase = "FAILED";
           return false;
         }
@@ -462,8 +478,12 @@ export class ComfyUIExecutionOrchestrator {
 
           const history = await probeHistory(this.transport, this.externalJobId);
           const historyOutcome = classifyComfyHistory(history[this.externalJobId!]);
-          if (historyOutcome === "completed") return true;
+          if (historyOutcome === "completed") {
+            await this.recordHistoryTermination("completed");
+            return true;
+          }
           if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+            await this.recordHistoryTermination(historyOutcome);
             this.phase = "FAILED";
             return false;
           }
@@ -491,8 +511,12 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation.outcome === "completed") return true;
+        if (cancellation.outcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
         if (cancellation.outcome === "failed") {
+          await this.recordHistoryTermination("failed");
           this.phase = "FAILED";
           return false;
         }
@@ -510,8 +534,12 @@ export class ComfyUIExecutionOrchestrator {
       try {
         const history = await probeHistory(this.transport, this.externalJobId);
         const historyOutcome = classifyComfyHistory(history[this.externalJobId]);
-        if (historyOutcome === "completed") return true;
+        if (historyOutcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
         if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+          await this.recordHistoryTermination(historyOutcome);
           this.phase = "FAILED";
           return false;
         }
@@ -717,8 +745,23 @@ export class ComfyUIExecutionOrchestrator {
   private async confirmCancellation(
     cancellation: Extract<CancellationOutcome, { outcome: "confirmed-cancelled" }>,
   ): Promise<void> {
+    await this.recordHistoryTermination("cancelled", cancellation.evidence.observedAtMs);
     await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
     this.phase = "CANCELLED";
+  }
+
+  private async recordHistoryTermination(
+    outcome: "completed" | "cancelled" | "failed",
+    observedAtMs = Date.now(),
+  ): Promise<void> {
+    if (this.terminalEvidenceRecorded) return;
+    if (!this.externalJobId) throw new Error("terminal_history_without_external_job_id");
+    await this.callbacks.onExternalTerminationEvidence?.({
+      proofKind: `history-${outcome}`,
+      externalJobId: this.externalJobId,
+      observedAtMs,
+    });
+    this.terminalEvidenceRecorded = true;
   }
 
   private async refreshCancellationState(): Promise<boolean> {

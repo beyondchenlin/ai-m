@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
   LEGACY_VISUAL_SUBJECT_PREVIOUS_MIGRATION_TIMESTAMP,
@@ -14,6 +16,21 @@ const migrations: MigrationMetadata[] = [
 ];
 
 describe("validateMigrationJournal", () => {
+  it("registers the resource reconciliation proof migration as the latest additive migration", () => {
+    const journal = JSON.parse(readFileSync(
+      resolve(process.cwd(), "drizzle/meta/_journal.json"),
+      "utf8",
+    )) as { entries: Array<{ idx: number; when: number; tag: string }> };
+    const latest = journal.entries.at(-1);
+    const previous = journal.entries.at(-2);
+
+    expect(latest).toMatchObject({
+      idx: 60,
+      tag: "0060_resource_reconciliation_proof",
+    });
+    expect(latest!.when).toBeGreaterThan(previous!.when);
+  });
+
   it("accepts valid rows independently of insertion order", () => {
     expect(() => validateMigrationJournal([
       { createdAt: 20, hash: "two" },

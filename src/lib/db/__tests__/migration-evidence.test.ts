@@ -266,7 +266,7 @@ describe("journal-less full-schema evidence", () => {
   it("does not expose mutable cached inventory internals", () => {
     const first = buildExpectedSchemaInventories(repositoryMigrations);
     first.boundaries.length = 0;
-    expect(buildExpectedSchemaInventories(repositoryMigrations).boundaries).toHaveLength(60);
+    expect(buildExpectedSchemaInventories(repositoryMigrations).boundaries).toHaveLength(repositoryMigrations.length);
   });
 
   it("invalidates the single-build cache when migration SQL changes", () => {

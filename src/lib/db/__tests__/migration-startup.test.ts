@@ -173,8 +173,9 @@ describe("migration journal startup ordering", () => {
     sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
     try {
       prepareMigrationJournal(sqlite, repositoryMigrations);
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(60);
-      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(repositoryMigrations.length);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+        .toEqual({ count: repositoryMigrations.length });
     } finally { sqlite.close(); }
   });
 
@@ -360,7 +361,8 @@ describe("migration journal startup ordering", () => {
       await Promise.all(runs);
       const sqlite = new Database(filename);
       try {
-        expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+        expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+          .toEqual({ count: repositoryMigrations.length });
       } finally { sqlite.close(); }
     } finally { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }, 30_000);
@@ -452,7 +454,7 @@ describe("migration journal startup ordering", () => {
       const sqlite = new Database(":memory:");
       sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
       try {
-        expect(applyPendingMigrations(sqlite, bundle)).toBe(60);
+        expect(applyPendingMigrations(sqlite, bundle)).toBe(bundle.migrations.length);
         expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='disk_mutation_was_executed'").get())
           .toBeUndefined();
       } finally { sqlite.close(); }

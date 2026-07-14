@@ -201,6 +201,7 @@ describe("PR-11: 编排器假后端集成", () => {
 
   it("提交丢失且始终无证据时应升级人工处理", async () => {
     const promptId = "sub-unknown-escalate";
+    const terminalEvidence: string[] = [];
     const transport = new FakeComfyUITransport({
       submitError: new Error("timeout"),
       promptId,
@@ -213,7 +214,7 @@ describe("PR-11: 编排器假后端集成", () => {
       transport,
       defaultBackendFeatures(),
       "http://localhost:8188",
-      {},
+      { onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); } },
       {
         ...fastConfig(),
         maxReconciliationAttempts: 1,
@@ -225,6 +226,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(false);
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(true);
+    expect(terminalEvidence).toEqual([]);
   });
 
 
@@ -363,6 +365,7 @@ describe("PR-11: 编排器假后端集成", () => {
   it("classifies an ordinary failed history terminal as failure, not cancellation", async () => {
     const promptId = "cancel-race-failed";
     const confirmations: string[] = [];
+    const terminalEvidence: string[] = [];
     let historyProbes = 0;
     class CountingTransport extends FakeComfyUITransport {
       override async get(path: string): Promise<Response> {
@@ -381,6 +384,7 @@ describe("PR-11: 编排器假后端集成", () => {
       "http://localhost:8188",
       {
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+        onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); },
       },
       { ...fastConfig(), totalExecutionTimeoutMs: 200 },
     );
@@ -390,6 +394,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(false);
     expect(confirmations).toEqual([]);
+    expect(terminalEvidence).toEqual(["history-failed"]);
     expect(historyProbes).toBe(1);
   });
 

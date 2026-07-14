@@ -18,6 +18,7 @@ import {
   probeBackendFeatures,
   probeModelFolder,
   releaseResourceSlot,
+  recordResourceTerminationProof,
   renewResourceSlot,
   streamCommitArtifact,
   materializeWorkflowInputs,
@@ -309,6 +310,20 @@ export async function executeGenerationJob(
           },
         ), "job_claim_lost_recording_cancellation_confirmation");
       },
+      onExternalTerminationEvidence: async (evidence) => {
+        if (!resourceSlot || !recordResourceTerminationProof({
+          attemptId,
+          backendId: backend.id,
+          externalJobId: evidence.externalJobId,
+          proofKind: evidence.proofKind,
+          observedAtMs: evidence.observedAtMs,
+          resourcePoolId: backend.resourcePoolId,
+          resourceSlotNo: resourceSlot.slotNo,
+          resourceLeaseToken: resourceSlot.leaseToken,
+          resourceFencingToken: resourceSlot.fencingToken,
+        })) throw new Error("external_termination_proof_persistence_failed");
+        retainResource = false;
+      },
       onOutputStream: async (output) => {
         requireApplied(applyAttemptTransition(
           job.id, attemptId, workerId, jobFencingToken, "commit-collected-output",
@@ -423,7 +438,7 @@ export async function executeGenerationJob(
       const snapshot = job.executionSnapshotJson as Record<string, unknown>;
       const backendId = snapshot.executionBackendId as string;
       const [backend] = backendId ? await db.select().from(executionBackends).where(eq(executionBackends.id, backendId)) : [];
-      if (backend) await releaseResourceSlot(backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken).catch(() => false);
+      if (backend) await releaseResourceSlot(backend.resourcePoolId, resourceSlot.slotNo, attemptId, resourceSlot.leaseToken, resourceSlot.fencingToken).catch(() => false);
     }
   }
 }

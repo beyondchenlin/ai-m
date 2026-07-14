@@ -54,6 +54,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "source_media_assets",
         "generation_job_source_assets",
         "visual_subjects",
+        "resource_reconciliation_proofs",
     }
     missing = sorted(name for name in required_tables if not table_exists(conn, name))
     if missing:
@@ -118,6 +119,9 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "generation_job_source_assets_asset_idx",
         "workflow_backend_validations_pair_unique",
         "source_media_assets_status_updated_idx",
+        "resource_reconciliation_proofs_lease_unique",
+        "resource_reconciliation_proofs_external_unique",
+        "resource_reconciliation_proofs_disposition_observed_idx",
     }
     missing_indexes = sorted(required_indexes - indexes)
     if missing_indexes:
@@ -128,6 +132,12 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
     }
     if pk_columns != {"job_id", "source_asset_id", "role"}:
         raise AssertionError(f"generation_job_source_assets composite primary key is invalid: {pk_columns}")
+
+    proof_columns = {
+        row[1]: row for row in conn.execute("PRAGMA table_info('resource_reconciliation_proofs')")
+    }
+    if proof_columns.get("external_job_id", (None, None, None, 0))[3] != 1:
+        raise AssertionError("resource reconciliation external identity must be NOT NULL")
 
     try:
         conn.execute(

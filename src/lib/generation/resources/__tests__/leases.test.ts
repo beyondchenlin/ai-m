@@ -138,7 +138,7 @@ describe("PR-11: 资源槽位租约", () => {
   it("空闲槽位应被原子领取", async () => {
     const { poolId, backendId } = await createBackendAndPool();
     const jobId = await createQueuedJob();
-    const attemptId = await createAttempt(jobId, backendId, poolId);
+    const attemptId = await createAttempt(jobId, backendId, poolId, { phase: "PREPARING" });
 
     const slot = await acquireResourceSlot(poolId, attemptId, "worker-1");
 
@@ -159,7 +159,7 @@ describe("PR-11: 资源槽位租约", () => {
   it("槽位占满后应返回 null", async () => {
     const { poolId, backendId } = await createBackendAndPool("image", 1);
     const jobId1 = await createQueuedJob();
-    const attemptId1 = await createAttempt(jobId1, backendId, poolId);
+    const attemptId1 = await createAttempt(jobId1, backendId, poolId, { phase: "PREPARING" });
     await acquireResourceSlot(poolId, attemptId1, "worker-1");
 
     const jobId2 = await createQueuedJob();
@@ -184,7 +184,6 @@ describe("PR-11: 资源槽位租约", () => {
         updatedAtMs: now,
       })
       .where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 1)));
-
     const newJobId = await createQueuedJob();
     const newAttempt = await createAttempt(newJobId, backendId, poolId);
     const slot = await acquireResourceSlot(poolId, newAttempt, "worker-2");
@@ -217,10 +216,11 @@ describe("PR-11: 资源槽位租约", () => {
     const attemptId = await createAttempt(jobId, backendId, poolId);
     const slot = (await acquireResourceSlot(poolId, attemptId, "worker-1"))!;
 
-    const wrong = await releaseResourceSlot(poolId, slot.slotNo, "wrong-token", slot.fencingToken);
+    await db.update(generationAttempts).set({ phase: "PREPARING" }).where(eq(generationAttempts.id, attemptId));
+    const wrong = await releaseResourceSlot(poolId, slot.slotNo, attemptId, "wrong-token", slot.fencingToken);
     expect(wrong).toBe(false);
 
-    const ok = await releaseResourceSlot(poolId, slot.slotNo, slot.leaseToken, slot.fencingToken);
+    const ok = await releaseResourceSlot(poolId, slot.slotNo, attemptId, slot.leaseToken, slot.fencingToken);
     expect(ok).toBe(true);
 
     const [row] = await db
@@ -238,7 +238,9 @@ describe("PR-11: 资源槽位租约", () => {
     const attemptId1 = await createAttempt(jobId1, backendId, poolId);
     const slot1 = (await acquireResourceSlot(poolId, attemptId1, "worker-1"))!;
 
-    await releaseResourceSlot(poolId, slot1.slotNo, slot1.leaseToken, slot1.fencingToken);
+    await db.update(generationAttempts).set({ phase: "PREPARING" }).where(eq(generationAttempts.id, attemptId1));
+
+    await releaseResourceSlot(poolId, slot1.slotNo, attemptId1, slot1.leaseToken, slot1.fencingToken);
 
     const jobId2 = await createQueuedJob();
     const attemptId2 = await createAttempt(jobId2, backendId, poolId);
@@ -412,6 +414,11 @@ describe("PR-11: 过期租约恢复扫描", () => {
         updatedAtMs: now,
       })
       .where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 1)));
+    await db.update(generationAttempts).set({
+      resourceSlotNo: 1,
+      resourceLeaseToken: "old-token",
+      resourceFencingToken: 0,
+    }).where(eq(generationAttempts.id, attemptId));
 
     const result = await scanExpiredClaims();
 

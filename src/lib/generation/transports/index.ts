@@ -74,6 +74,7 @@ export { ComfyUIExecutionOrchestrator, ExecutionCallbackPersistenceError } from 
 export type {
   OrchestratorPhase,
   ExecutionCallbacks,
+  ExternalTerminationEvidence,
   ExecutionConfig,
   OrchestratorResult,
 } from "./comfyui-execution-orchestrator";
