@@ -13,8 +13,10 @@ import {
 import {
   DATA_POSTCONDITION_REGISTRY,
   runDataPostconditionReadOnly,
+  splitSqlStatements,
   topLevelStatementKind,
   validateDataPostconditionRegistry,
+  validateMigrationStatementEvidence,
 } from "../migration-data-evidence";
 import {
   baselineJournalLessDatabase,
@@ -32,6 +34,14 @@ describe("SQL evidence normalization", () => {
   it("normalizes formatting and identifier quoting without changing literal semantics", () => {
     expect(normalizeSqlForComparison('CREATE VIEW "Example" AS SELECT "value" FROM "items"'))
       .toBe(normalizeSqlForComparison(" create   view [example] as select `value` from items "));
+  });
+
+  it("dequotes only safe simple identifiers and preserves spaced, keyword, and escaped identifiers", () => {
+    expect(normalizeSqlForComparison('SELECT "safe_name" FROM "items"'))
+      .toBe(normalizeSqlForComparison("select safe_name from items"));
+    expect(normalizeSqlForComparison('SELECT "a b" FROM items')).not.toBe(normalizeSqlForComparison("SELECT a b FROM items"));
+    expect(normalizeSqlForComparison('SELECT "select" FROM items')).not.toBe(normalizeSqlForComparison("SELECT select FROM items"));
+    expect(normalizeSqlForComparison('SELECT "a""b" FROM items')).toContain('"a""b"');
   });
 });
 
@@ -55,6 +65,23 @@ describe("DML postcondition registry", () => {
     expect(topLevelStatementKind("CREATE TABLE x ([update] text DEFAULT 'DELETE FROM x') -- INSERT"))
       .toBe("CREATE");
     expect(topLevelStatementKind("WITH source AS (SELECT 1) UPDATE x SET y=1")).toBe("UPDATE");
+  });
+
+  it("checks every statement and rejects CTAS, writable PRAGMA, and ambiguous state changes", () => {
+    expect(splitSqlStatements("CREATE TABLE x(id); INSERT INTO x VALUES(1)")).toHaveLength(2);
+    const registration = [{ folderMillis: 1, hash: "multi", verify: () => null }];
+    expect(() => validateMigrationStatementEvidence([{ folderMillis: 1, hash: "multi", sql: [
+      "CREATE TABLE x(id); INSERT INTO x VALUES(1)",
+    ] }], registration)).not.toThrow();
+    expect(() => validateMigrationStatementEvidence([{ folderMillis: 2, hash: "ctas", sql: [
+      "CREATE TABLE copied AS SELECT * FROM source",
+    ] }], [])).toThrow(/data-bearing create/i);
+    expect(() => validateMigrationStatementEvidence([{ folderMillis: 3, hash: "pragma", sql: [
+      "PRAGMA writable_schema=ON",
+    ] }], [])).toThrow(/unsupported state-changing/i);
+    expect(splitSqlStatements(`CREATE TRIGGER t AFTER INSERT ON x BEGIN
+      SELECT CASE WHEN NEW.id=1 THEN 'a; b' ELSE 'c' END;
+    END; PRAGMA writable_schema=ON`)).toHaveLength(2);
   });
 
   it("rejects unregistered, changed-hash, stale, and duplicate registrations", () => {
@@ -148,10 +175,11 @@ describe("DML postcondition registry", () => {
     const sqlite = new Database(":memory:");
     sqlite.exec("CREATE TABLE voice_profiles (id text)");
     try {
-      expect(runDataPostconditionReadOnly(sqlite, DATA_POSTCONDITION_REGISTRY[3])).toBeNull();
+      expect(runDataPostconditionReadOnly(sqlite, DATA_POSTCONDITION_REGISTRY[3]))
+        .toMatch(/never independently provable/i);
       sqlite.exec("INSERT INTO voice_profiles VALUES ('copied-but-unprovable')");
       expect(runDataPostconditionReadOnly(sqlite, DATA_POSTCONDITION_REGISTRY[3]))
-        .toMatch(/operator-only.*nonempty/i);
+        .toMatch(/never independently provable/i);
     } finally {
       sqlite.close();
     }
@@ -319,6 +347,38 @@ describe("journal-less full-schema evidence", () => {
     }
   });
 
+  it.each([
+    ["generated expression", "CREATE TABLE advanced (id integer PRIMARY KEY, value integer, derived integer GENERATED ALWAYS AS (value + 2) STORED)"],
+    ["inline unique", "CREATE TABLE advanced (id integer PRIMARY KEY, value text UNIQUE)"],
+    ["STRICT option", "CREATE TABLE advanced (id integer PRIMARY KEY, value text) STRICT"],
+    ["WITHOUT ROWID option", "CREATE TABLE advanced (id integer PRIMARY KEY, value text) WITHOUT ROWID"],
+    ["column collation", "CREATE TABLE advanced (id integer PRIMARY KEY, value text COLLATE NOCASE)"],
+    ["FK deferrability", "CREATE TABLE parent (id integer PRIMARY KEY); CREATE TABLE advanced (id integer PRIMARY KEY, parent_id integer REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)"],
+  ])("rejects changed %s semantics", (_label, changedSql) => {
+    const expectedSql = "CREATE TABLE parent (id integer PRIMARY KEY); CREATE TABLE advanced (id integer PRIMARY KEY, value text)";
+    const migrations: MigrationMetadata[] = [{ folderMillis: 1, hash: "advanced", sql: expectedSql.split("; ") }];
+    const sqlite = new Database(":memory:");
+    try {
+      sqlite.exec(changedSql);
+      expect(() => detectJournalLessBaselineMigrationCount({
+        journalRowCount: 0, appTableCount: 1, readActualInventory: () => sqlite,
+      }, migrations)).toThrow(/does not match any complete migration boundary/i);
+    } finally { sqlite.close(); }
+  });
+
+  it("captures virtual-table module arguments and index target tables", () => {
+    const migrations: MigrationMetadata[] = [{
+      folderMillis: 1, hash: "virtual", sql: ["CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='porter')"],
+    }];
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='unicode61')");
+    try {
+      expect(() => detectJournalLessBaselineMigrationCount({
+        journalRowCount: 0, appTableCount: 1, readActualInventory: () => sqlite,
+      }, migrations)).toThrow(/data-bearing create|complete migration boundary/i);
+    } finally { sqlite.close(); }
+  });
+
   it("keeps the journal empty when nonempty 0007 provenance requires operator action", () => {
     const sqlite = databaseAtBoundary(54);
     sqlite.exec(`
@@ -348,7 +408,7 @@ describe("journal-less full-schema evidence", () => {
     try {
       prepareMigrationJournal(sqlite, repositoryMigrations);
       expect(() => baselineJournalLessDatabase(sqlite, repositoryMigrations))
-        .toThrow(/0058.*operator-only/i);
+        .toThrow(/0058.*never independently provable/i);
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
     } finally {
       sqlite.close();

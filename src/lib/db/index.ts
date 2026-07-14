@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import {
   selectLegacyVisualSubjectJournalRepair,
   validateMigrationJournal,
@@ -40,11 +41,11 @@ export function getSqlite(): SqliteConnection {
   // access in production leaks file descriptors and defeats WAL coordination.
   globalForDb.sqlite = sqlite;
 
-  sqlite.pragma("journal_mode = WAL");
-  sqlite.pragma("foreign_keys = ON");
   // Web and worker processes share the same SQLite file. Give short-lived
   // writers time to finish instead of surfacing transient SQLITE_BUSY errors.
   sqlite.pragma("busy_timeout = 5000");
+  sqlite.pragma("journal_mode = WAL");
+  sqlite.pragma("foreign_keys = ON");
 
   return sqlite;
 }
@@ -190,10 +191,58 @@ export function prepareMigrationJournal(
     CREATE UNIQUE INDEX IF NOT EXISTS "__drizzle_migrations_created_at_unique"
     ON "__drizzle_migrations" (created_at)
   `);
+  const index = sqlite.prepare<[], { name: string; unique: number }>(
+    'PRAGMA index_list("__drizzle_migrations")',
+  ).all().find((candidate) => candidate.name === "__drizzle_migrations_created_at_unique");
+  const keyColumns = sqlite.prepare<[], { name: string | null; key: number }>(
+    'PRAGMA index_xinfo("__drizzle_migrations_created_at_unique")',
+  ).all().filter((column) => Number(column.key) === 1);
+  if (Number(index?.unique) !== 1 || keyColumns.length !== 1 || keyColumns[0].name !== "created_at") {
+    throw new Error("Migration timestamp index exists with an incompatible definition");
+  }
 }
 
 export function resolveMigrationsFolder(): string {
-  return path.resolve(__dirname, "../../../drizzle");
+  const configured = process.env.AI_M_MIGRATIONS_DIR;
+  const folder = configured ? path.resolve(configured) : path.resolve(__dirname, "../../../drizzle");
+  const journalPath = path.join(folder, "meta", "_journal.json");
+  if (!fs.existsSync(journalPath)) throw new Error(`Migration journal not found at ${journalPath}`);
+  const journalBytes = fs.readFileSync(journalPath);
+  if (configured) {
+    const expectedHash = process.env.AI_M_MIGRATIONS_JOURNAL_SHA256?.toLowerCase();
+    const actualHash = createHash("sha256").update(journalBytes).digest("hex");
+    if (!expectedHash || expectedHash !== actualHash) {
+      throw new Error("Configured migrations directory journal identity does not match AI_M_MIGRATIONS_JOURNAL_SHA256");
+    }
+  }
+  const journal = JSON.parse(journalBytes.toString("utf8")) as { entries?: Array<{ idx: number; tag: string }> };
+  if (!journal.entries?.length || journal.entries.some((entry, index) =>
+    entry.idx !== index || !fs.existsSync(path.join(folder, `${entry.tag}.sql`)))) {
+    throw new Error("Migration journal structure does not match its SQL files");
+  }
+  return folder;
+}
+
+export function applyPendingMigrations(
+  sqlite: SqliteConnection,
+  migrations: MigrationMetadata[],
+): number {
+  let applied = 0;
+  sqlite.transaction(() => {
+    validateRecordedMigrationJournal(sqlite, migrations);
+    const recordedCount = getRecordedMigrationCount(sqlite);
+    const insert = sqlite.prepare<[string, number]>(
+      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
+    );
+    for (const migration of migrations.slice(recordedCount)) {
+      if (!migration.sql) throw new Error(`Migration ${migration.folderMillis} has no SQL metadata`);
+      for (const statement of migration.sql) sqlite.exec(statement);
+      insert.run(migration.hash, migration.folderMillis);
+      applied += 1;
+    }
+    validateRecordedMigrationJournal(sqlite, migrations);
+  }).immediate();
+  return applied;
 }
 
 export function runMigrations() {
@@ -212,9 +261,7 @@ export function runMigrations() {
     console.log(`[DB] Existing schema detected. Baselining ${confirmedBaselineCount} confirmed migrations...`);
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { migrate } = require("drizzle-orm/better-sqlite3/migrator");
-  migrate(createDb(), { migrationsFolder });
+  applyPendingMigrations(sqlite, migrations);
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access

@@ -5,11 +5,14 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { buildSync } from "esbuild";
 import {
   LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
 } from "../migration-journal";
 import {
   baselineJournalLessDatabase,
+  applyPendingMigrations,
   prepareMigrationJournal,
   resolveMigrationsFolder,
 } from "../index";
@@ -86,6 +89,38 @@ describe("migration journal startup ordering", () => {
     } finally {
       sqlite.close();
     }
+  });
+
+  it("fails closed when the timestamp index name is occupied by a wrong definition", () => {
+    const sqlite = legacyVisualDatabase([]);
+    sqlite.exec('CREATE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (hash)');
+    try {
+      expect(() => prepareMigrationJournal(sqlite, repositoryMigrations)).toThrow(/incompatible definition/i);
+    } finally { sqlite.close(); }
+  });
+
+  it("applies a pending repository prefix atomically with the journal", () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      prepareMigrationJournal(sqlite, repositoryMigrations);
+      expect(applyPendingMigrations(sqlite, repositoryMigrations)).toBe(60);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+    } finally { sqlite.close(); }
+  });
+
+  it("rolls back schema and journal together when migration application fails", () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      expect(() => applyPendingMigrations(sqlite, [{
+        folderMillis: 1,
+        hash: "broken",
+        sql: ["CREATE TABLE rolled_back (id text)", "INSERT INTO missing_table VALUES (1)"],
+      }])).toThrow();
+      expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='rolled_back'").get()).toBeUndefined();
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
+    } finally { sqlite.close(); }
   });
 
   it("rejects a known migration gap before Drizzle can permanently skip it", () => {
@@ -214,5 +249,84 @@ describe("migration journal startup ordering", () => {
       process.chdir(originalCwd);
       fs.rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("runs real startup safely from six concurrent processes", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-run-six-"));
+    const filename = path.join(directory, "app.sqlite");
+    const release = path.join(directory, "release");
+    const migrationRoot = path.resolve("drizzle");
+    const journalHash = createHash("sha256")
+      .update(fs.readFileSync(path.join(migrationRoot, "meta", "_journal.json"))).digest("hex");
+    const run = (index: number) => new Promise<void>((resolve, reject) => {
+      const ready = path.join(directory, `ready-${index}`);
+      const script = `
+        const fs=require('node:fs');
+        fs.writeFileSync(${JSON.stringify(ready)},'ready');
+        while(!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);
+        require('./src/lib/db/index.ts').runMigrations();
+      `;
+      const child = spawn(process.execPath, [path.resolve("node_modules/tsx/dist/cli.mjs"), "-e", script], {
+        cwd: path.resolve("."),
+        env: {
+          ...process.env,
+          DATABASE_URL: filename,
+          AI_M_MIGRATIONS_DIR: migrationRoot,
+          AI_M_MIGRATIONS_JOURNAL_SHA256: journalHash,
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
+      child.on("error", reject);
+    });
+    try {
+      const runs = Array.from({ length: 6 }, (_, index) => run(index));
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline
+        && !Array.from({ length: 6 }, (_, index) => fs.existsSync(path.join(directory, `ready-${index}`))).every(Boolean)) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      fs.writeFileSync(release, "go");
+      await Promise.all(runs);
+      const sqlite = new Database(filename);
+      try {
+        expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+      } finally { sqlite.close(); }
+    } finally { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+  }, 30_000);
+
+  it("resolves and validates an explicit migration root from an actual bundle", () => {
+    const directory = fs.mkdtempSync(path.join(path.resolve("."), ".bundle-root-test-"));
+    const outfile = path.join(directory, "db.cjs");
+    const migrationRoot = path.resolve("drizzle");
+    const journalHash = createHash("sha256")
+      .update(fs.readFileSync(path.join(migrationRoot, "meta", "_journal.json"))).digest("hex");
+    try {
+      buildSync({
+        entryPoints: [path.resolve("src/lib/db/index.ts")],
+        outfile,
+        bundle: true,
+        platform: "node",
+        format: "cjs",
+        external: ["better-sqlite3"],
+      });
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const bundled = require(outfile) as { resolveMigrationsFolder: () => string };
+      const previousDir = process.env.AI_M_MIGRATIONS_DIR;
+      const previousHash = process.env.AI_M_MIGRATIONS_JOURNAL_SHA256;
+      const previousCwd = process.cwd();
+      try {
+        process.env.AI_M_MIGRATIONS_DIR = migrationRoot;
+        process.env.AI_M_MIGRATIONS_JOURNAL_SHA256 = journalHash;
+        process.chdir(directory);
+        expect(bundled.resolveMigrationsFolder()).toBe(migrationRoot);
+      } finally {
+        process.chdir(previousCwd);
+        if (previousDir === undefined) delete process.env.AI_M_MIGRATIONS_DIR; else process.env.AI_M_MIGRATIONS_DIR = previousDir;
+        if (previousHash === undefined) delete process.env.AI_M_MIGRATIONS_JOURNAL_SHA256; else process.env.AI_M_MIGRATIONS_JOURNAL_SHA256 = previousHash;
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 });

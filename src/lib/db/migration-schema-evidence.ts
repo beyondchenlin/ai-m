@@ -1,14 +1,21 @@
 import type { MigrationMetadata } from "./migration-journal";
-import { verifyDataPostconditions } from "./migration-data-evidence";
+import { createHash } from "node:crypto";
+import {
+  DATA_POSTCONDITION_REGISTRY,
+  validateMigrationStatementEvidence,
+  verifyDataPostconditions,
+} from "./migration-data-evidence";
 
 type SqliteDatabase = import("better-sqlite3").Database;
 type ColumnSignature = { name: string; type: string; notnull: number; defaultValue: string | number | null; primaryKey: number; hidden: number };
 type TableSignature = {
+  definition: string;
   columns: ColumnSignature[];
   foreignKeys: Array<{ id: number; sequence: number; table: string; from: string; to: string | null; onUpdate: string; onDelete: string; match: string }>;
   checks: string[];
 };
 type IndexSignature = {
+  table: string;
   unique: number;
   partial: number;
   columns: Array<{ sequence: number; columnId: number; name: string | null; descending: number; collation: string | null; key: number }>;
@@ -23,6 +30,8 @@ export type SchemaInventory = {
 type ManagedSchemaUniverse = { tables: Set<string>; indexes: Set<string>; triggers: Set<string>; views: Set<string> };
 export type ExpectedSchemaInventories = { boundaries: SchemaInventory[]; managed: ManagedSchemaUniverse };
 export type JournalLessBaselineFacts = { journalRowCount: number; appTableCount: number; readActualInventory: () => SqliteDatabase };
+
+const SQL_KEYWORDS = new Set(["select", "from", "where", "table", "index", "trigger", "view", "group", "order", "by", "as", "on", "create", "unique", "primary", "key", "check", "references", "strict", "without", "rowid"]);
 
 /** Collapse syntax whitespace and identifier quoting while preserving literal bytes. */
 export function normalizeSqlForComparison(sql: string | null): string {
@@ -48,13 +57,25 @@ export function normalizeSqlForComparison(sql: string | null): string {
       continue;
     }
     if (character === '"' || character === "`" || character === "[") {
+      const quoteStart = index;
       const close = character === "[" ? "]" : character;
       let identifier = "";
       index += 1;
-      while (index < source.length && source[index] !== close) identifier += source[index++];
+      while (index < source.length) {
+        if (source[index] === close) {
+          if (close !== "]" && source[index + 1] === close) {
+            identifier += close;
+            index += 2;
+            continue;
+          }
+          break;
+        }
+        identifier += source[index++];
+      }
       index += 1;
       if (pendingSpace && output && !tight(output.at(-1) ?? "")) output += " ";
-      output += identifier.toLowerCase();
+      const simple = /^[a-z_][a-z0-9_]*$/i.test(identifier) && !SQL_KEYWORDS.has(identifier.toLowerCase());
+      output += simple ? identifier.toLowerCase() : source.slice(quoteStart, index);
       pendingSpace = false;
       continue;
     }
@@ -93,7 +114,7 @@ function extractChecks(sql: string | null): string[] {
 export function readSchemaInventory(sqlite: SqliteDatabase): SchemaInventory {
   const objects = sqlite.prepare<[], { type: "table" | "index" | "trigger" | "view"; name: string; sql: string | null }>(`
     SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','index','trigger','view')
-    AND name NOT LIKE 'sqlite_%' AND name!='__drizzle_migrations' ORDER BY type,name
+    AND (type='index' OR name NOT LIKE 'sqlite_%') AND name!='__drizzle_migrations' ORDER BY type,name
   `).all();
   const result: SchemaInventory = { tables: {}, indexes: {}, triggers: {}, views: {} };
   for (const object of objects) {
@@ -113,14 +134,16 @@ export function readSchemaInventory(sqlite: SqliteDatabase): SchemaInventory {
         from: foreignKey.from.toLowerCase(), to: foreignKey.to?.toLowerCase() ?? null,
         onUpdate: foreignKey.on_update, onDelete: foreignKey.on_delete, match: foreignKey.match,
       }));
-      result.tables[object.name.toLowerCase()] = { columns, foreignKeys, checks: extractChecks(object.sql) };
-    } else if (object.type === "index" && object.sql) {
+      result.tables[object.name.toLowerCase()] = {
+        definition: normalizeSqlForComparison(object.sql), columns, foreignKeys, checks: extractChecks(object.sql),
+      };
+    } else if (object.type === "index") {
       const tableName = sqlite.prepare<[string], { tbl_name: string }>("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(object.name)?.tbl_name;
       if (!tableName) continue;
       const table = tableName.replace(/"/g, '""');
       const entry = sqlite.prepare<[], { name: string; unique: number; partial: number; origin: string }>(`PRAGMA index_list("${table}")`)
         .all().find((candidate) => candidate.name === object.name);
-      if (!entry || entry.origin !== "c") continue;
+      if (!entry) continue;
       const columns = sqlite.prepare<[], { seqno: number; cid: number; name: string | null; desc: number; coll: string | null; key: number }>(
         `PRAGMA index_xinfo("${escaped}")`,
       ).all().map((column) => ({
@@ -128,8 +151,8 @@ export function readSchemaInventory(sqlite: SqliteDatabase): SchemaInventory {
         descending: Number(column.desc), collation: column.coll?.toLowerCase() ?? null, key: Number(column.key),
       }));
       result.indexes[object.name.toLowerCase()] = {
-        unique: Number(entry.unique), partial: Number(entry.partial), columns,
-        ...(entry.partial || columns.some((column) => column.columnId === -2)
+        table: tableName.toLowerCase(), unique: Number(entry.unique), partial: Number(entry.partial), columns,
+        ...(object.sql && (entry.partial || columns.some((column) => column.columnId === -2))
           ? { expressionSql: normalizeSqlForComparison(object.sql) } : {}),
       };
     } else if (object.type === "trigger" && object.sql) result.triggers[object.name.toLowerCase()] = normalizeSqlForComparison(object.sql);
@@ -177,11 +200,28 @@ function matches(actual: SchemaInventory, expected: SchemaInventory, managed: Ma
   return true;
 }
 
+export function assertExactSchemaBoundary(
+  sqlite: SqliteDatabase,
+  migrations: MigrationMetadata[],
+  boundaryCount: number,
+): string {
+  if (boundaryCount < 1 || boundaryCount > migrations.length) throw new Error("Invalid migration boundary");
+  const expected = getExpected(migrations);
+  const actual = readSchemaInventory(sqlite);
+  if (!matches(actual, expected.boundaries[boundaryCount - 1], expected.managed)) {
+    throw new Error(`Database does not exactly match migration boundary ${boundaryCount}`);
+  }
+  return createHash("sha256").update(JSON.stringify(actual)).digest("hex");
+}
+
 export function detectJournalLessBaselineMigrationCount(
   facts: JournalLessBaselineFacts,
   migrations: MigrationMetadata[],
 ): number {
   if (facts.journalRowCount !== 0 || facts.appTableCount === 0) return 0;
+  const registrations = DATA_POSTCONDITION_REGISTRY.filter((registration) =>
+    migrations.some((migration) => migration.folderMillis === registration.folderMillis));
+  validateMigrationStatementEvidence(migrations, registrations);
   const expected = getExpected(migrations);
   const sqlite = facts.readActualInventory();
   const actual = readSchemaInventory(sqlite);

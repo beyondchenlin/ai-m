@@ -31,6 +31,7 @@ export const DATA_POSTCONDITION_REGISTRY: readonly DataPostconditionRegistration
   {
     folderMillis: 1783950000000,
     hash: "698bc1e043bb15c4ff1026535f08e6bcbf5eec32280b22ffd22938e8e4147b83",
+    // Selected current safety invariants, not proof of literal historical DML provenance.
     verify: (sqlite) => hasRows(sqlite, `SELECT 1 present FROM workflow_package_states s
       JOIN workflow_package_revisions r ON r.digest=s.workflow_package_digest
       WHERE r.workflow_api_json='{}' AND (s.state<>'invalid' OR
@@ -50,8 +51,7 @@ export const DATA_POSTCONDITION_REGISTRY: readonly DataPostconditionRegistration
   {
     folderMillis: 1784036400000,
     hash: "a89bf74586f7cc217f73a2440893e8532e04d3fd17c12dce1886b3a80b4c6019",
-    verify: (sqlite) => hasRows(sqlite, "SELECT 1 present FROM voice_profiles LIMIT 1")
-      ? "0058 dropped its copy source and is operator-only for nonempty voice profiles" : null,
+    verify: () => "0058 dropped its copy source; copy provenance is never independently provable",
   },
 ] as const;
 
@@ -101,8 +101,88 @@ export function topLevelStatementKind(sql: string): string {
 }
 
 function migrationsWithDml(migrations: MigrationMetadata[]): MigrationMetadata[] {
-  return migrations.filter((migration) => (migration.sql ?? []).some((statement) =>
+  return migrations.filter((migration) => (migration.sql ?? []).flatMap(splitSqlStatements).some((statement) =>
     ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(topLevelStatementKind(statement))));
+}
+
+/** Split SQL without treating semicolons in strings/comments/trigger bodies as boundaries. */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let start = 0;
+  let firstWords: string[] = [];
+  let lastWord = "";
+  let trigger = false;
+  let triggerBlockDepth = 0;
+  for (let index = 0; index < sql.length;) {
+    if (sql.startsWith("--", index)) {
+      const end = sql.indexOf("\n", index + 2);
+      index = end < 0 ? sql.length : end + 1;
+      continue;
+    }
+    if (sql.startsWith("/*", index)) {
+      const end = sql.indexOf("*/", index + 2);
+      index = end < 0 ? sql.length : end + 2;
+      continue;
+    }
+    const character = sql[index];
+    if (character === "'" || character === '"' || character === "`" || character === "[") {
+      const close = character === "[" ? "]" : character;
+      index += 1;
+      while (index < sql.length) {
+        if (sql[index] === close) {
+          if (close !== "]" && sql[index + 1] === close) index += 2;
+          else { index += 1; break; }
+        } else index += 1;
+      }
+      continue;
+    }
+    if (/[a-z_]/i.test(character)) {
+      const word = /^[a-z_][a-z0-9_]*/i.exec(sql.slice(index))?.[0] ?? "";
+      lastWord = word.toUpperCase();
+      if (firstWords.length < 3) firstWords.push(lastWord);
+      trigger = firstWords[0] === "CREATE" && firstWords.includes("TRIGGER");
+      if (trigger && (lastWord === "BEGIN" || lastWord === "CASE")) triggerBlockDepth += 1;
+      if (trigger && lastWord === "END") triggerBlockDepth -= 1;
+      index += word.length;
+      continue;
+    }
+    if (character === ";" && (!trigger || triggerBlockDepth === 0)) {
+      const statement = sql.slice(start, index).trim();
+      if (statement) statements.push(statement);
+      start = index + 1;
+      firstWords = [];
+      lastWord = "";
+      trigger = false;
+      triggerBlockDepth = 0;
+    }
+    index += 1;
+  }
+  const tail = sql.slice(start).trim();
+  if (tail) statements.push(tail);
+  return statements;
+}
+
+export function validateMigrationStatementEvidence(
+  migrations: MigrationMetadata[],
+  registrations: readonly DataPostconditionRegistration[],
+): void {
+  validateDataPostconditionRegistry(migrations, registrations);
+  for (const migration of migrations) {
+    for (const statement of (migration.sql ?? []).flatMap(splitSqlStatements)) {
+      const kind = topLevelStatementKind(statement);
+      if (["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(kind)) continue;
+      if (kind === "CREATE") {
+        const normalized = statement.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)+/, "").toUpperCase();
+        if (/^CREATE\s+(?:TEMP\s+)?VIRTUAL\s+TABLE\b/.test(normalized)
+          || /^CREATE\s+(?:TEMP\s+)?TABLE\b[\s\S]*\bAS\s+SELECT\b/.test(normalized)) {
+          throw new Error(`Migration ${migration.folderMillis} uses data-bearing CREATE without independent evidence`);
+        }
+        continue;
+      }
+      if (["ALTER", "DROP"].includes(kind)) continue;
+      throw new Error(`Migration ${migration.folderMillis} contains unsupported state-changing or ambiguous SQL: ${kind || "UNKNOWN"}`);
+    }
+  }
 }
 
 export function validateDataPostconditionRegistry(
@@ -140,7 +220,7 @@ export function verifyDataPostconditions(
 ): void {
   const relevant = DATA_POSTCONDITION_REGISTRY.filter((registration) =>
     migrations.some((migration) => migration.folderMillis === registration.folderMillis));
-  validateDataPostconditionRegistry(migrations, relevant);
+  validateMigrationStatementEvidence(migrations, relevant);
   for (const migration of migrationsWithDml(migrations.slice(0, boundaryCount))) {
     const registration = DATA_POSTCONDITION_REGISTRY.find((candidate) =>
       candidate.folderMillis === migration.folderMillis && candidate.hash === migration.hash);
