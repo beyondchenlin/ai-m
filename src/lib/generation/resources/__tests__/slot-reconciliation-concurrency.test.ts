@@ -267,7 +267,7 @@ describe("resource slot reconciliation concurrency", () => {
         updatedAtMs: NOW,
       },
     }, workerDb)).toEqual({ status: "applied" });
-    const lease = await acquireResourceSlot(poolId, attemptId, workerId);
+    const lease = await acquireResourceSlot(poolId, attemptId, workerId, workerDb, () => NOW);
     expect(lease).not.toBeNull();
     await db.update(resourcePoolSlots).set({
       expiresAtMs: NOW - 1,
@@ -335,7 +335,7 @@ describe("resource slot reconciliation concurrency", () => {
         updatedAtMs: NOW,
       },
     }, workerDb)).toEqual({ status: "applied" });
-    const lease = await acquireResourceSlot(input.poolId, attemptId, workerId);
+    const lease = await acquireResourceSlot(input.poolId, attemptId, workerId, workerDb, () => NOW);
     expect(lease).not.toBeNull();
     return { jobId, attemptId, workerId, jobFencingToken, lease: lease! };
   }

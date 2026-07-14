@@ -15,11 +15,13 @@ export type TransitionResult<T extends object = object> =
   | { status: "invalid-transition" }
   | { status: "ownership-lost" };
 
-export interface ExpiredJobSnapshot {
+export type RecoveryTransitionResult<T extends object = object> =
+  | TransitionResult<T>
+  | { status: "deferred-resource-slot" };
+
+interface ExpiredJobSnapshotBase {
   jobId: string;
   jobStatus: "RUNNING" | "CANCEL_REQUESTED";
-  claimOwner: string;
-  claimUntilMs: number;
   claimFencingToken: number;
   currentAttemptId: string | null;
   attempt: null | {
@@ -29,6 +31,12 @@ export interface ExpiredJobSnapshot {
     externalJobId: string | null;
   };
 }
+
+export type ExpiredJobSnapshot = ExpiredJobSnapshotBase & (
+  | { claimKind: "expired"; claimOwner: string; claimUntilMs: number }
+  | { claimKind: "malformed-ownerless"; claimOwner: null; claimUntilMs: number | null }
+  | { claimKind: "malformed-missing-expiry"; claimOwner: string; claimUntilMs: null }
+);
 
 export interface OwnedAttemptIdentity {
   jobId: string;
@@ -128,7 +136,7 @@ export function recoverExpiredJob(
   snapshot: ExpiredJobSnapshot,
   database: DB = db,
   clock: () => number = Date.now,
-): TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }> {
+): RecoveryTransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }> {
   try {
     return database.transaction((tx) => {
       const now = clock();
@@ -143,7 +151,8 @@ export function recoverExpiredJob(
         || currentJob.currentAttemptId !== snapshot.currentAttemptId) {
         return { status: "lost-race" } as const;
       }
-      if (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= now) {
+      if (snapshot.claimKind === "expired"
+        && (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= now)) {
         return { status: "invalid-transition" } as const;
       }
 
@@ -165,7 +174,31 @@ export function recoverExpiredJob(
       const safeBeforeSubmission = !currentAttempt
         || (PRE_SUBMISSION_PHASES.has(currentAttempt.phase) && !currentAttempt.externalJobId);
       if (safeBeforeSubmission) {
-        const plan = planPreSubmissionRecovery(currentJob.status, "expired_claim", now);
+        if (currentAttempt) {
+          const ownedSlots = tx.select().from(resourcePoolSlots)
+            .where(eq(resourcePoolSlots.ownerAttemptId, currentAttempt.id)).all();
+          const ownsRecoverableSlot = ownedSlots.some((slot) => {
+            // Expired is still occupied: only the slot scanner may recover all
+            // three records atomically after validating this physical identity.
+            const occupied = slot.leaseToken !== null && slot.expiresAtMs !== null;
+            const placeholderIdentity = currentAttempt.phase === "PREPARING"
+              && currentAttempt.resourcePoolId === slot.resourcePoolId
+              && currentAttempt.resourceSlotNo === 0
+              && currentAttempt.resourceLeaseToken === `pending-${currentAttempt.id}`
+              && currentAttempt.resourceFencingToken === 0;
+            const boundIdentity = currentAttempt.resourcePoolId === slot.resourcePoolId
+              && currentAttempt.resourceSlotNo === slot.slotNo
+              && currentAttempt.resourceLeaseToken === slot.leaseToken
+              && currentAttempt.resourceFencingToken === slot.fencingToken;
+            return occupied && (placeholderIdentity || boundIdentity);
+          });
+          if (ownsRecoverableSlot) return { status: "deferred-resource-slot" } as const;
+        }
+        const plan = planPreSubmissionRecovery(
+          currentJob.status,
+          snapshot.claimKind === "malformed-missing-expiry" ? "invalid_claim_lease" : "expired_claim",
+          now,
+        );
         if (currentAttempt) {
           const attemptChanged = tx.update(generationAttempts).set(plan.attemptPatch).where(and(
             eq(generationAttempts.id, currentAttempt.id),

@@ -220,7 +220,7 @@ export async function executeGenerationJob(
       resourceRenewalInFlight = true;
       try {
         const renewed = await renewResourceSlot(
-          backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken,
+          backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken, workerId,
         ).catch(() => false);
         if (!renewed) {
           retainResource = true;

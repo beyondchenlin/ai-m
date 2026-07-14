@@ -1,15 +1,15 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { db, type DB } from "@/lib/db";
 import { generationAttempts, generationJobs } from "@/lib/db/schema";
 import {
   recoverExpiredJob,
   type ExpiredJobSnapshot,
-  type TransitionResult,
+  type RecoveryTransitionResult,
 } from "./state-transitions";
 
 export interface RecoveryScanOutcome {
   jobId: string;
-  status: TransitionResult["status"];
+  status: RecoveryTransitionResult["status"];
   disposition?: "requeued" | "cancelled" | "needs-attention";
 }
 
@@ -30,17 +30,18 @@ export async function readExpiredJobCandidates(
     .leftJoin(generationAttempts, eq(generationAttempts.id, generationJobs.currentAttemptId))
     .where(and(
       inArray(generationJobs.status, ["RUNNING", "CANCEL_REQUESTED"]),
-      sql`${generationJobs.claimUntilMs} < ${observedAtMs}`,
+      or(
+        sql`${generationJobs.claimOwner} IS NULL`,
+        sql`${generationJobs.claimUntilMs} IS NULL`,
+        sql`${generationJobs.claimUntilMs} < ${observedAtMs}`,
+      ),
     ));
 
-  return expired.flatMap(({ job, attempt }) => {
-    if ((job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
-      || job.claimOwner === null || job.claimUntilMs === null) return [];
-    return [{
+  return expired.flatMap<ExpiredJobSnapshot>(({ job, attempt }) => {
+    if (job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED") return [];
+    const base = {
       jobId: job.id,
       jobStatus: job.status,
-      claimOwner: job.claimOwner,
-      claimUntilMs: job.claimUntilMs,
       claimFencingToken: job.claimFencingToken,
       currentAttemptId: job.currentAttemptId,
       attempt: attempt ? {
@@ -49,6 +50,25 @@ export async function readExpiredJobCandidates(
         jobClaimFencingToken: attempt.jobClaimFencingToken,
         externalJobId: attempt.externalJobId,
       } : null,
+    };
+    if (job.claimOwner === null) return [{
+      ...base,
+      claimKind: "malformed-ownerless",
+      claimOwner: null,
+      claimUntilMs: job.claimUntilMs,
+    } satisfies ExpiredJobSnapshot];
+    if (job.claimUntilMs === null) return [{
+      ...base,
+      claimKind: "malformed-missing-expiry",
+      claimOwner: job.claimOwner,
+      claimUntilMs: null,
+    } satisfies ExpiredJobSnapshot];
+    if (job.claimUntilMs >= observedAtMs) return [];
+    return [{
+      ...base,
+      claimKind: "expired",
+      claimOwner: job.claimOwner,
+      claimUntilMs: job.claimUntilMs,
     } satisfies ExpiredJobSnapshot];
   });
 }

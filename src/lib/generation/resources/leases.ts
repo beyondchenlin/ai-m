@@ -39,28 +39,44 @@ export async function acquireResourceSlot(
   resourcePoolId: string,
   attemptId: string,
   workerId: string,
+  database: DB = db,
+  clock: () => number = Date.now,
 ): Promise<{
   slotNo: number;
   leaseToken: string;
   fencingToken: number;
   expiresAtMs: number;
 } | null> {
-  const now = Date.now();
-  const leaseToken = `${workerId}_${attemptId}_${now}_${Math.random().toString(36).slice(2, 10)}`;
-  const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
-
   // 原子领取：通过 rowid 子查询只更新第一个空闲或过期槽位，避免同时更新多个槽位导致 lease_token UNIQUE 冲突。
-  const [slot] = await db
-    .update(resourcePoolSlots)
-    .set({
-      ownerAttemptId: attemptId,
-      leaseToken,
-      fencingToken: sql`${resourcePoolSlots.fencingToken} + 1`,
-      expiresAtMs,
-      updatedAtMs: now,
-    })
-    .where(
-      and(
+  const slot = database.transaction((tx) => {
+    const now = clock();
+    const leaseToken = `${workerId}_${attemptId}_${now}_${Math.random().toString(36).slice(2, 10)}`;
+    const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
+    const attempt = tx.select().from(generationAttempts)
+      .where(eq(generationAttempts.id, attemptId)).get();
+    if (!attempt
+      || attempt.phase !== "PREPARING"
+      || attempt.resourcePoolId !== resourcePoolId
+      || attempt.resourceSlotNo !== 0
+      || attempt.resourceLeaseToken !== `pending-${attempt.id}`
+      || attempt.resourceFencingToken !== 0) return undefined;
+    const job = tx.select().from(generationJobs).where(eq(generationJobs.id, attempt.jobId)).get();
+    if (!job
+      || job.currentAttemptId !== attempt.id
+      || (job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
+      || job.claimOwner !== workerId
+      || job.claimUntilMs === null
+      || job.claimUntilMs <= now
+      || job.claimFencingToken !== attempt.jobClaimFencingToken) return undefined;
+    return tx.update(resourcePoolSlots)
+      .set({
+        ownerAttemptId: attemptId,
+        leaseToken,
+        fencingToken: sql`${resourcePoolSlots.fencingToken} + 1`,
+        expiresAtMs,
+        updatedAtMs: now,
+      })
+      .where(and(
         eq(resourcePoolSlots.resourcePoolId, resourcePoolId),
         sql`${resourcePoolSlots}."rowid" = (
           SELECT "rowid" FROM ${resourcePoolSlots}
@@ -69,9 +85,9 @@ export async function acquireResourceSlot(
           ORDER BY ${resourcePoolSlots.slotNo}
           LIMIT 1
         )`,
-      ),
-    )
-    .returning();
+      ))
+      .returning().get();
+  }, { behavior: "immediate" });
 
   if (!slot) return null;
 
@@ -89,24 +105,47 @@ export async function renewResourceSlot(
   slotNo: number,
   leaseToken: string,
   fencingToken: number,
+  workerId: string,
+  database: DB = db,
+  clock: () => number = Date.now,
 ): Promise<boolean> {
-  const now = Date.now();
-  const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
-
-  const [updated] = await db
-    .update(resourcePoolSlots)
-    .set({ expiresAtMs, updatedAtMs: now })
-    .where(
-      and(
+  return database.transaction((tx) => {
+    const now = clock();
+    const expiresAtMs = now + LEASE_CONFIG.RESOURCE_LEASE_MS;
+    const slot = tx.select().from(resourcePoolSlots).where(and(
+      eq(resourcePoolSlots.resourcePoolId, resourcePoolId),
+      eq(resourcePoolSlots.slotNo, slotNo),
+      eq(resourcePoolSlots.leaseToken, leaseToken),
+      eq(resourcePoolSlots.fencingToken, fencingToken),
+    )).get();
+    if (!slot?.ownerAttemptId) return false;
+    const attempt = tx.select().from(generationAttempts)
+      .where(eq(generationAttempts.id, slot.ownerAttemptId)).get();
+    if (!attempt
+      || attempt.resourcePoolId !== resourcePoolId
+      || attempt.resourceSlotNo !== slotNo
+      || attempt.resourceLeaseToken !== leaseToken
+      || attempt.resourceFencingToken !== fencingToken) return false;
+    const job = tx.select().from(generationJobs).where(eq(generationJobs.id, attempt.jobId)).get();
+    if (!job
+      || job.currentAttemptId !== attempt.id
+      || (job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
+      || job.claimOwner !== workerId
+      || job.claimUntilMs === null
+      || job.claimUntilMs <= now
+      || job.claimFencingToken !== attempt.jobClaimFencingToken) return false;
+    const updated = tx.update(resourcePoolSlots)
+      .set({ expiresAtMs, updatedAtMs: now })
+      .where(and(
         eq(resourcePoolSlots.resourcePoolId, resourcePoolId),
         eq(resourcePoolSlots.slotNo, slotNo),
+        eq(resourcePoolSlots.ownerAttemptId, attempt.id),
         eq(resourcePoolSlots.leaseToken, leaseToken),
         eq(resourcePoolSlots.fencingToken, fencingToken),
-      ),
-    )
-    .returning();
-
-  return !!updated;
+      ))
+      .returning({ slotNo: resourcePoolSlots.slotNo }).all();
+    return updated.length === 1;
+  }, { behavior: "immediate" });
 }
 
 /** 释放资源槽位 */

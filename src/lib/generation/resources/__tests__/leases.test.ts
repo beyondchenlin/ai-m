@@ -23,6 +23,15 @@ import {
   scanExpiredClaims,
   LEASE_CONFIG,
 } from "../leases";
+import { recoverExpiredJob } from "@/lib/generation/jobs/state-transitions";
+
+const renewOwnedResourceSlot = renewResourceSlot as unknown as (
+  resourcePoolId: string,
+  slotNo: number,
+  leaseToken: string,
+  fencingToken: number,
+  workerId: string,
+) => Promise<boolean>;
 
 async function createPoolWithSlots(capacity: number) {
   const poolId = crypto.randomUUID();
@@ -92,14 +101,20 @@ async function createQueuedJob(capability: typeof generationJobs.$inferInsert.ca
   return jobId;
 }
 
-async function createAttempt(jobId: string, backendId: string, poolId: string, overrides: Partial<typeof generationAttempts.$inferInsert> = {}) {
+async function createAttempt(
+  jobId: string,
+  backendId: string,
+  poolId: string,
+  overrides: Partial<typeof generationAttempts.$inferInsert> = {},
+  workerId = "worker-1",
+) {
   const attemptId = crypto.randomUUID();
   const now = Date.now();
   await db.insert(generationAttempts).values({
     id: attemptId,
     jobId,
     attemptNo: 1,
-    phase: "SUBMITTING",
+    phase: "PREPARING",
     backendId,
     backendFeatureSnapshotJson: {},
     environmentFingerprint: "env:test",
@@ -108,13 +123,44 @@ async function createAttempt(jobId: string, backendId: string, poolId: string, o
     systemOutputPrefix: `prefix-${attemptId}`,
     resourcePoolId: poolId,
     resourceSlotNo: 0,
-    resourceLeaseToken: `token-${attemptId}`,
+    resourceLeaseToken: `pending-${attemptId}`,
     resourceFencingToken: 0,
     createdAtMs: now,
     updatedAtMs: now,
     ...overrides,
   });
+  await db.update(generationJobs).set({
+    status: "RUNNING",
+    currentAttemptId: attemptId,
+    claimOwner: workerId,
+    claimUntilMs: now + 60_000,
+    claimFencingToken: overrides.jobClaimFencingToken ?? 0,
+  }).where(eq(generationJobs.id, jobId));
   return attemptId;
+}
+
+async function createOwnedPreparingAttempt(input: { claimUntilMs: number; workerId?: string }) {
+  const workerId = input.workerId ?? "worker-1";
+  const { poolId, backendId } = await createBackendAndPool("image", 1);
+  const jobId = await createQueuedJob();
+  const attemptId = await createAttempt(jobId, backendId, poolId, {
+    phase: "PREPARING",
+    jobClaimFencingToken: 4,
+    resourceSlotNo: 0,
+    resourceLeaseToken: "pending-placeholder",
+    resourceFencingToken: 0,
+  });
+  await db.update(generationAttempts).set({
+    resourceLeaseToken: `pending-${attemptId}`,
+  }).where(eq(generationAttempts.id, attemptId));
+  await db.update(generationJobs).set({
+    status: "RUNNING",
+    currentAttemptId: attemptId,
+    claimOwner: workerId,
+    claimUntilMs: input.claimUntilMs,
+    claimFencingToken: 4,
+  }).where(eq(generationJobs.id, jobId));
+  return { poolId, backendId, jobId, attemptId, workerId };
 }
 
 describe("PR-11: 资源槽位租约", () => {
@@ -133,6 +179,59 @@ describe("PR-11: 资源槽位租约", () => {
     await db.delete(generationAttempts);
     await db.delete(executionBackends);
     await db.delete(resourcePools);
+  });
+
+  it("rejects an old resource acquisition after job recovery commits first", async () => {
+    const now = Date.now();
+    const seeded = await createOwnedPreparingAttempt({ claimUntilMs: now - 1 });
+    const result = recoverExpiredJob({
+      claimKind: "expired",
+      jobId: seeded.jobId,
+      jobStatus: "RUNNING",
+      claimOwner: seeded.workerId,
+      claimUntilMs: now - 1,
+      claimFencingToken: 4,
+      currentAttemptId: seeded.attemptId,
+      attempt: {
+        id: seeded.attemptId,
+        phase: "PREPARING",
+        jobClaimFencingToken: 4,
+        externalJobId: null,
+      },
+    }, undefined, () => now);
+    expect(result).toEqual({ status: "applied", disposition: "requeued" });
+
+    expect(await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId)).toBeNull();
+  });
+
+  it("rejects resource acquisition from a malformed preparing identity", async () => {
+    const seeded = await createOwnedPreparingAttempt({ claimUntilMs: Date.now() + 60_000 });
+    await db.update(generationAttempts).set({ resourceLeaseToken: "not-a-placeholder" })
+      .where(eq(generationAttempts.id, seeded.attemptId));
+
+    expect(await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId)).toBeNull();
+  });
+
+  it("rejects slot renewal after the owning job claim expires", async () => {
+    const now = Date.now();
+    const seeded = await createOwnedPreparingAttempt({ claimUntilMs: now + 60_000 });
+    const slot = await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId);
+    expect(slot).not.toBeNull();
+    await db.update(generationAttempts).set({
+      resourceSlotNo: slot!.slotNo,
+      resourceLeaseToken: slot!.leaseToken,
+      resourceFencingToken: slot!.fencingToken,
+    }).where(eq(generationAttempts.id, seeded.attemptId));
+    await db.update(generationJobs).set({ claimUntilMs: now - 1 })
+      .where(eq(generationJobs.id, seeded.jobId));
+
+    expect(await renewOwnedResourceSlot(
+      seeded.poolId,
+      slot!.slotNo,
+      slot!.leaseToken,
+      slot!.fencingToken,
+      seeded.workerId,
+    )).toBe(false);
   });
 
   it("空闲槽位应被原子领取", async () => {
@@ -163,7 +262,7 @@ describe("PR-11: 资源槽位租约", () => {
     await acquireResourceSlot(poolId, attemptId1, "worker-1");
 
     const jobId2 = await createQueuedJob();
-    const attemptId2 = await createAttempt(jobId2, backendId, poolId);
+    const attemptId2 = await createAttempt(jobId2, backendId, poolId, {}, "worker-2");
     const slot = await acquireResourceSlot(poolId, attemptId2, "worker-2");
     expect(slot).toBeNull();
   });
@@ -185,7 +284,7 @@ describe("PR-11: 资源槽位租约", () => {
       })
       .where(and(eq(resourcePoolSlots.resourcePoolId, poolId), eq(resourcePoolSlots.slotNo, 1)));
     const newJobId = await createQueuedJob();
-    const newAttempt = await createAttempt(newJobId, backendId, poolId);
+    const newAttempt = await createAttempt(newJobId, backendId, poolId, {}, "worker-2");
     const slot = await acquireResourceSlot(poolId, newAttempt, "worker-2");
     expect(slot).not.toBeNull();
     // Expiry alone cannot prove that external inference stopped. The retained
@@ -199,14 +298,19 @@ describe("PR-11: 资源槽位租约", () => {
     const jobId = await createQueuedJob();
     const attemptId = await createAttempt(jobId, backendId, poolId);
     const slot = (await acquireResourceSlot(poolId, attemptId, "worker-1"))!;
+    await db.update(generationAttempts).set({
+      resourceSlotNo: slot.slotNo,
+      resourceLeaseToken: slot.leaseToken,
+      resourceFencingToken: slot.fencingToken,
+    }).where(eq(generationAttempts.id, attemptId));
 
-    const ok = await renewResourceSlot(poolId, slot.slotNo, slot.leaseToken, slot.fencingToken);
+    const ok = await renewResourceSlot(poolId, slot.slotNo, slot.leaseToken, slot.fencingToken, "worker-1");
     expect(ok).toBe(true);
 
-    const wrongToken = await renewResourceSlot(poolId, slot.slotNo, "wrong-token", slot.fencingToken);
+    const wrongToken = await renewResourceSlot(poolId, slot.slotNo, "wrong-token", slot.fencingToken, "worker-1");
     expect(wrongToken).toBe(false);
 
-    const wrongFencing = await renewResourceSlot(poolId, slot.slotNo, slot.leaseToken, 999);
+    const wrongFencing = await renewResourceSlot(poolId, slot.slotNo, slot.leaseToken, 999, "worker-1");
     expect(wrongFencing).toBe(false);
   });
 
@@ -243,7 +347,7 @@ describe("PR-11: 资源槽位租约", () => {
     await releaseResourceSlot(poolId, slot1.slotNo, attemptId1, slot1.leaseToken, slot1.fencingToken);
 
     const jobId2 = await createQueuedJob();
-    const attemptId2 = await createAttempt(jobId2, backendId, poolId);
+    const attemptId2 = await createAttempt(jobId2, backendId, poolId, {}, "worker-2");
     const slot2 = await acquireResourceSlot(poolId, attemptId2, "worker-2");
     expect(slot2!.fencingToken).toBe(2);
   });
@@ -251,7 +355,7 @@ describe("PR-11: 资源槽位租约", () => {
   it("并发领取时只应有一个 worker 成功", async () => {
     const { poolId, backendId } = await createBackendAndPool("image", 1);
     const jobs = await Promise.all([createQueuedJob(), createQueuedJob(), createQueuedJob()]);
-    const attempts = await Promise.all(jobs.map((jobId) => createAttempt(jobId, backendId, poolId)));
+    const attempts = await Promise.all(jobs.map((jobId, i) => createAttempt(jobId, backendId, poolId, {}, `worker-${i}`)));
 
     const results = await Promise.all(
       attempts.map((attemptId, i) => acquireResourceSlot(poolId, attemptId, `worker-${i}`)),
