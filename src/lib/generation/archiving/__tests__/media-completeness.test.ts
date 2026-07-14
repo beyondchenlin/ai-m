@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { validateCompleteMediaFile } from "../media-completeness";
+import { completeMp3Bytes, completeWavBytes, corruptXingFrameCount } from "./audio-fixtures";
 
 const temporaryPaths: string[] = [];
 
@@ -26,6 +27,36 @@ describe("bounded media completeness classifier", () => {
   ])("accepts a complete ffmpeg-generated %s fixture", async (mimeType, base64) => {
     const bytes = Buffer.from(base64, "base64");
     await expect(classify(bytes, mimeType)).resolves.toBe(true);
+  });
+
+  it.each([
+    ["audio/wav", completeWavBytes],
+    ["audio/mpeg", completeMp3Bytes],
+  ])("accepts a complete ffmpeg-generated %s file", async (mimeType, bytes) => {
+    await expect(classify(bytes, mimeType)).resolves.toBe(true);
+  });
+
+  it.each([
+    ["audio/wav", completeWavBytes.subarray(0, Math.floor(completeWavBytes.length / 2))],
+    ["audio/mpeg", completeMp3Bytes.subarray(0, Math.floor(completeMp3Bytes.length / 2))],
+    ["audio/mpeg", completeMp3Bytes.subarray(0, completeMp3Bytes.length - 1)],
+    ["audio/mpeg", corruptXingFrameCount()],
+  ])("rejects truncated or declaration-mismatched %s data", async (mimeType, bytes) => {
+    await expect(classify(bytes, mimeType)).resolves.toBe(false);
+  });
+
+  it("rejects a WAV whose RIFF declaration no longer matches the file", async () => {
+    const corrupted = Buffer.from(completeWavBytes);
+    corrupted.writeUInt32LE(corrupted.readUInt32LE(4) - 2, 4);
+    await expect(classify(corrupted, "audio/wav")).resolves.toBe(false);
+  });
+
+  it("treats an undeclared MP3 ending exactly on a frame boundary as a complete shorter stream", async () => {
+    const shorter = Buffer.from(completeMp3Bytes.subarray(0, 620));
+    const xing = shorter.indexOf("Xing");
+    expect(xing).toBeGreaterThan(0);
+    shorter.fill(0, xing, xing + 4);
+    await expect(classify(shorter, "audio/mpeg")).resolves.toBe(true);
   });
 
   it.each([

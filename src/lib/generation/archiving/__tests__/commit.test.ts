@@ -26,6 +26,7 @@ import {
   streamCommitArtifact,
   validateMagicBytes,
 } from "../commit";
+import { completeMp3Bytes, completeWavBytes } from "./audio-fixtures";
 
 const pngBytes = new Uint8Array(Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -136,11 +137,12 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       kind: ArtifactKind.IMAGE,
       mimeType: "image/png",
       visibility: ArtifactVisibility.PROJECT,
+      expectedSizeBytes: pngBytes.length,
     });
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect((await fs.stat(resolveArtifactStoragePath(result.storageKey))).isFile()).toBe(true);
     const [row] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, result.id));
-    expect(row.status).toBe("COMMITTED");
+    expect(row).toMatchObject({ status: "COMMITTED", metadataJson: { expectedSizeBytes: pngBytes.length } });
   });
 
   it("rejects oversize content and quarantines the incomplete record", async () => {
@@ -239,6 +241,29 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       logicalName: "no-moov.mp4", kind: ArtifactKind.VIDEO, mimeType: "video/mp4",
       visibility: ArtifactVisibility.PROJECT,
     })).rejects.toThrow(/container is incomplete/i);
+  });
+
+  it.each([
+    ["audio/wav", completeWavBytes.subarray(0, Math.floor(completeWavBytes.length / 2))],
+    ["audio/mpeg", completeMp3Bytes.subarray(0, Math.floor(completeMp3Bytes.length / 2))],
+  ] as const)("rejects a truncated %s even when ffprobe accepts it", async (mimeType, bytes) => {
+    const execution = await createExecution();
+    await expect(commitArtifactFromBuffer(bytes, {
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1,
+      logicalName: "truncated-audio", kind: ArtifactKind.AUDIO, mimeType,
+      visibility: ArtifactVisibility.PROJECT,
+    })).rejects.toThrow(/container is incomplete/i);
+  });
+
+  it("rejects an expected-size mismatch even when the media structure is complete", async () => {
+    const execution = await createExecution();
+    await expect(commitArtifactFromBuffer(pngBytes, {
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1,
+      logicalName: "length-mismatch.png", kind: ArtifactKind.IMAGE, mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT, expectedSizeBytes: pngBytes.length + 1,
+    })).rejects.toThrow(/expected size/i);
+    const [row] = await db.select().from(generationArtifacts);
+    expect(row).toMatchObject({ status: "QUARANTINED", metadataJson: { expectedSizeBytes: pngBytes.length + 1 } });
   });
 
   it("does not recover a live delayed writer with a renewable STAGING lease", async () => {

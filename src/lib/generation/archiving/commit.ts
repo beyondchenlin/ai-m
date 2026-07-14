@@ -44,6 +44,8 @@ export interface ArtifactStreamInput {
   parentArtifactId?: string;
   read: () => ReadableStream<Uint8Array>;
   maxSizeBytes?: number;
+  /** Trusted decoded-body length evidence (for example, identity HTTP Content-Length). */
+  expectedSizeBytes?: number;
   /** Maximum wait for each upstream chunk; prevents a stalled backend holding a worker forever. */
   readTimeoutMs?: number;
   metadata?: Record<string, unknown>;
@@ -304,10 +306,22 @@ export async function streamCommitArtifact(
     : input.mimeType.startsWith("audio/") ? "audio" : null;
   if (!expectedKind || input.kind !== expectedKind) throw new Error("Artifact kind does not match MIME type");
   if (!input.logicalName || input.logicalName.length > 240 || input.logicalName.includes("\0")) throw new Error("Invalid artifact logical name");
-  if (JSON.stringify(input.metadata ?? {}).length > 64 * 1024) throw new Error("Artifact metadata exceeds 64 KiB");
   await assertAttemptFence(input.attemptId, input.expectedJobClaimFencingToken);
   const maxBytes = input.maxSizeBytes ?? 100 * 1024 * 1024;
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 10 * 1024 * 1024 * 1024) throw new Error("Invalid artifact size limit");
+  const expectedSizeBytes = input.expectedSizeBytes;
+  if (expectedSizeBytes !== undefined
+    && (!Number.isSafeInteger(expectedSizeBytes) || expectedSizeBytes <= 0 || expectedSizeBytes > maxBytes)) {
+    throw new Error("Invalid artifact expected size");
+  }
+  const callerMetadata = Object.fromEntries(
+    Object.entries(input.metadata ?? {}).filter(([key]) => key !== "expectedSizeBytes"),
+  );
+  const artifactMetadata = {
+    ...callerMetadata,
+    ...(expectedSizeBytes !== undefined ? { expectedSizeBytes } : {}),
+  };
+  if (JSON.stringify(artifactMetadata).length > 64 * 1024) throw new Error("Artifact metadata exceeds 64 KiB");
   const id = genId();
   const writerOwner = input.writerOwner?.trim() || `writer-${process.pid}`;
   const writerToken = genId();
@@ -326,7 +340,7 @@ export async function streamCommitArtifact(
     status: "STAGING", storageKey: relativeFinal, visibility: input.visibility,
     mimeType: input.mimeType, sizeBytes: 0, sha256: "pending", width: null, height: null,
     durationMs: null, metadataJson: {
-      ...(input.metadata ?? {}),
+      ...artifactMetadata,
       writingPath: writingKey,
       readyPath: readyKey,
       maxSizeBytes: maxBytes,
@@ -370,9 +384,15 @@ export async function streamCommitArtifact(
     ownedStagingIdentity = stagingIdentity(await stagingHandle.stat());
     await stagingHandle.close();
     stagingHandle = null;
+    if (expectedSizeBytes !== undefined && written.sizeBytes !== expectedSizeBytes) {
+      throw new Error(`Artifact expected size ${expectedSizeBytes} bytes but received ${written.sizeBytes}`);
+    }
     await renewal;
     if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
       throw new Error("Artifact writer lease was lost before container validation");
+    }
+    if (!ownedStagingIdentity || !await ownsStagingPath(writingPath, ownedStagingIdentity)) {
+      throw new Error("Artifact staging file ownership was lost before container validation");
     }
     if (!await validateCompleteMediaFile(writingPath, input.mimeType, written.sizeBytes)) {
       throw new Error(`Artifact container is incomplete for ${input.mimeType}`);
@@ -429,7 +449,7 @@ export async function streamCommitArtifact(
       }
       return tx.update(generationArtifacts).set({
         status: "COMMITTED", sizeBytes: written.sizeBytes, sha256: written.sha256,
-        durationMs, committedAtMs, updatedAtMs: committedAtMs, metadataJson: input.metadata ?? {},
+        durationMs, committedAtMs, updatedAtMs: committedAtMs, metadataJson: artifactMetadata,
         writerLeaseOwner: null, writerLeaseToken: null, writerLeaseExpiresAtMs: null,
       }).where(and(
         eq(generationArtifacts.id, id),
@@ -465,7 +485,7 @@ export async function streamCommitArtifact(
       // crash window without losing a valid immutable output.
       await db.update(generationArtifacts).set({
         metadataJson: {
-          ...(input.metadata ?? {}), writingPath: writingKey, readyPath: readyKey, maxSizeBytes: maxBytes, recoveryRequired: true,
+          ...artifactMetadata, writingPath: writingKey, readyPath: readyKey, maxSizeBytes: maxBytes, recoveryRequired: true,
         }, updatedAtMs: Date.now(),
       }).where(and(
         eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"),
@@ -475,7 +495,7 @@ export async function streamCommitArtifact(
       const failedAt = Date.now();
       await db.update(generationArtifacts).set({
         status: "QUARANTINED",
-        metadataJson: { ...(input.metadata ?? {}), failure: error instanceof Error ? error.message.slice(0, 300) : "artifact_commit_failed" },
+        metadataJson: { ...artifactMetadata, failure: error instanceof Error ? error.message.slice(0, 300) : "artifact_commit_failed" },
         writerLeaseOwner: null, writerLeaseToken: null, writerLeaseExpiresAtMs: null,
         updatedAtMs: failedAt,
       }).where(and(
@@ -755,6 +775,12 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
         candidate = recoveryTempPath;
       }
       const inspected = await inspectFile(candidate, recoveryMaxBytes);
+      const expectedSizeBytes = metadata.expectedSizeBytes;
+      if (expectedSizeBytes !== undefined
+        && (typeof expectedSizeBytes !== "number" || !Number.isSafeInteger(expectedSizeBytes) || expectedSizeBytes <= 0
+          || expectedSizeBytes > recoveryMaxBytes || inspected.sizeBytes !== expectedSizeBytes)) {
+        throw new Error("expected_size_mismatch");
+      }
       if (!validateMagicBytes(inspected.header, artifact.mimeType)) throw new Error("content_mismatch");
       if (!await validateCompleteMediaFile(candidate, artifact.mimeType, inspected.sizeBytes)) throw new Error("incomplete_container");
       const expectedKind = artifact.mimeType.startsWith("image/") ? "image"

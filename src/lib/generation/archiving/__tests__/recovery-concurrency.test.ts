@@ -18,6 +18,7 @@ import {
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { recoverStagingArtifacts, resolveArtifactStoragePath } from "../commit";
+import { completeMp3Bytes, completeWavBytes } from "./audio-fixtures";
 
 const pngBytes = new Uint8Array(Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -190,6 +191,9 @@ describe("artifact recovery lease concurrency", () => {
         ...Buffer.from("GIF89a"), 1, 0, 1, 0, 0, 0, 0,
       ]), ext: "gif" },
       { id: randomUUID(), kind: "video" as const, mimeType: "video/mp4", bytes: new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]), ext: "mp4" },
+      { id: randomUUID(), kind: "audio" as const, mimeType: "audio/wav", bytes: completeWavBytes.subarray(0, Math.floor(completeWavBytes.length / 2)), ext: "wav" },
+      { id: randomUUID(), kind: "audio" as const, mimeType: "audio/mpeg", bytes: completeMp3Bytes.subarray(0, Math.floor(completeMp3Bytes.length / 2)), ext: "mp3" },
+      { id: randomUUID(), kind: "image" as const, mimeType: "image/png", bytes: pngBytes, ext: "png", expectedSizeBytes: pngBytes.length + 1 },
     ];
     for (const item of cases) {
       const writerToken = `expired-${item.id}`;
@@ -198,17 +202,20 @@ describe("artifact recovery lease concurrency", () => {
       await fs.mkdir(path.dirname(readyPath), { recursive: true });
       await fs.writeFile(readyPath, item.bytes);
       await db.insert(generationArtifacts).values({
-        id: item.id, attemptId: execution.attemptId, logicalName: `truncated.${item.ext}`, kind: item.kind,
+        id: item.id, attemptId: execution.attemptId, logicalName: `truncated-${item.id}.${item.ext}`, kind: item.kind,
         status: "STAGING", storageKey: `${execution.attemptId}/${item.id}.${item.ext}`, visibility: "project",
-        mimeType: item.mimeType, sizeBytes: 0, sha256: "pending", metadataJson: { readyPath: readyKey },
+        mimeType: item.mimeType, sizeBytes: 0, sha256: "pending", metadataJson: {
+          readyPath: readyKey,
+          ...("expectedSizeBytes" in item ? { expectedSizeBytes: item.expectedSizeBytes } : {}),
+        },
         writerLeaseOwner: "expired-writer", writerLeaseToken: writerToken,
         writerLeaseExpiresAtMs: Date.now() - 1, createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
       });
     }
     await expect(recoverStagingArtifacts({ recoveryOwner: "container-validator" }))
-      .resolves.toEqual({ claimed: 5, committed: 0, quarantined: 5 });
+      .resolves.toEqual({ claimed: 8, committed: 0, quarantined: 8 });
     expect((await db.select().from(generationArtifacts)).map((row) => row.status))
-      .toEqual(Array(5).fill("QUARANTINED"));
+      .toEqual(Array(8).fill("QUARANTINED"));
   });
 
   it("removes token-bound writing and invalid ready files before terminal quarantine", async () => {

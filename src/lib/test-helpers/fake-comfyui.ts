@@ -35,6 +35,7 @@ export interface FakeTransportScenario {
   fileBytes?: ArrayBuffer;
   /** /view 返回的状态码 */
   fileStatus?: number;
+  fileHeaders?: HeadersInit;
   /** /system_stats 返回内容 */
   systemInfo?: ComfySystemInfo;
   /** /object_info 返回内容 */
@@ -211,7 +212,7 @@ export class FakeComfyUITransport implements ComfyUITransport {
 
   async getFile(): Promise<Response> {
     const bytes = this.scenario.fileBytes ?? new ArrayBuffer(0);
-    return new Response(bytes, { status: this.scenario.fileStatus ?? 200 });
+    return new Response(bytes, { status: this.scenario.fileStatus ?? 200, headers: this.scenario.fileHeaders });
   }
 
   connectWebSocket(): WebSocket {

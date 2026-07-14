@@ -360,8 +360,23 @@ export async function executeGenerationJob(
         ), "job_claim_lost_before_artifact_commit");
         const sequence = outputSequence++;
         const media = mimeForOutput(output.filename, output.mediaKind);
-        const contentLength = Number(output.response.headers.get("content-length") ?? 0);
-        if (contentLength > workflowPackage.manifest.limits.maxOutputBytes) throw new Error("Output exceeds workflow package limit");
+        const contentLengthHeader = output.response.headers.get("content-length");
+        let contentLength: number | undefined;
+        if (contentLengthHeader !== null) {
+          if (!/^\d+$/.test(contentLengthHeader)) throw new Error("Output returned an invalid Content-Length");
+          contentLength = Number(contentLengthHeader);
+          if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+            throw new Error("Output returned an invalid Content-Length");
+          }
+          if (contentLength > workflowPackage.manifest.limits.maxOutputBytes) {
+            throw new Error("Output exceeds workflow package limit");
+          }
+        }
+        const contentEncoding = output.response.headers.get("content-encoding")?.trim().toLowerCase();
+        const expectedSizeBytes = contentLength !== undefined
+          && (contentEncoding === undefined || contentEncoding === "identity")
+          ? contentLength
+          : undefined;
         if (!output.response.body) throw new Error("Output response has no body");
         const committed = await streamCommitArtifact({
           attemptId,
@@ -372,6 +387,7 @@ export async function executeGenerationJob(
           mimeType: media.mimeType,
           visibility: "project",
           maxSizeBytes: workflowPackage.manifest.limits.maxOutputBytes,
+          ...(expectedSizeBytes !== undefined ? { expectedSizeBytes } : {}),
           metadata: {
             nodeId: output.nodeId, outputKey: output.outputKey, outputField: output.field,
             mediaKind: output.mediaKind, originalFilename: output.filename,

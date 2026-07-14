@@ -109,6 +109,7 @@ describe("worker completion after cancellation intent", () => {
   async function arrangeExecution(
     scenario: "known-completed" | "completion-wins-after-queue-absence"
       | "timeout-discovers-running" | "timeout-stays-unknown",
+    fileHeaders?: HeadersInit,
   ) {
     const now = Date.now();
     const poolId = crypto.randomUUID();
@@ -257,6 +258,7 @@ describe("worker completion after cancellation intent", () => {
         },
       } : {},
       fileBytes: new Uint8Array([1, 2, 3]).buffer,
+      fileHeaders,
     });
     const compiled = {
       schemaVersion: 1 as const,
@@ -372,6 +374,30 @@ describe("worker completion after cancellation intent", () => {
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
       status: "SUCCEEDED",
     });
+  });
+
+  it.each([undefined, "identity"])("binds a %s Content-Length to the artifact writer", async (contentEncoding) => {
+    const arranged = await arrangeExecution("known-completed", {
+      "content-length": "3", ...(contentEncoding ? { "content-encoding": contentEncoding } : {}),
+    });
+    await arranged.execute();
+    expect(mocks.streamCommitArtifact).toHaveBeenCalledWith(expect.objectContaining({ expectedSizeBytes: 3 }));
+  });
+
+  it("does not bind encoded Content-Length to the decoded response body", async () => {
+    const arranged = await arrangeExecution("known-completed", {
+      "content-length": "3", "content-encoding": "gzip",
+    });
+    await arranged.execute();
+    expect(mocks.streamCommitArtifact).toHaveBeenCalledWith(
+      expect.not.objectContaining({ expectedSizeBytes: expect.anything() }),
+    );
+  });
+
+  it.each(["0", "-1", "NaN", "3, 4"])("rejects invalid Content-Length %s", async (contentLength) => {
+    const arranged = await arrangeExecution("known-completed", { "content-length": contentLength });
+    await expect(arranged.execute()).rejects.toThrow(/execution_callback_persistence_failed/);
+    expect(mocks.streamCommitArtifact).not.toHaveBeenCalled();
   });
 
   it("keeps a durable success terminal when duplicate-cardinality release fails", async () => {
