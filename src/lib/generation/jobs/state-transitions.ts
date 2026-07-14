@@ -1,6 +1,6 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { db, type DB } from "@/lib/db";
-import { generationAttempts, generationEvents, generationJobs } from "@/lib/db/schema";
+import { generationAttempts, generationEvents, generationJobs, resourcePoolSlots } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 
 type JobStatus = typeof generationJobs.$inferSelect.status;
@@ -41,6 +41,14 @@ export interface OwnedJobIdentity {
   jobId: string;
   workerId: string;
   jobFencingToken: number;
+}
+
+export interface SubmissionResourceIdentity {
+  resourcePoolId: string;
+  slotNo: number;
+  leaseToken: string;
+  fencingToken: number;
+  clock?: () => number;
 }
 
 const PRE_SUBMISSION_PHASES = new Set<AttemptPhase>(["CREATED", "LEASED", "PREPARING"]);
@@ -234,6 +242,76 @@ export function attachOwnedAttempt(
   }
 }
 
+/**
+ * Cross the external submission boundary only while both logical job ownership
+ * and the exact physical resource lease are live in the same writer transaction.
+ */
+export function beginOwnedAttemptSubmission(
+  identity: OwnedAttemptIdentity,
+  resource: SubmissionResourceIdentity,
+  database: DB = db,
+): TransitionResult {
+  return database.transaction((tx) => {
+    const now = resource.clock?.() ?? Date.now();
+    const current = tx.select({
+      attemptPhase: generationAttempts.phase,
+      attemptToken: generationAttempts.jobClaimFencingToken,
+      attemptJobId: generationAttempts.jobId,
+      attemptResourcePoolId: generationAttempts.resourcePoolId,
+      jobStatus: generationJobs.status,
+      currentAttemptId: generationJobs.currentAttemptId,
+      claimOwner: generationJobs.claimOwner,
+      claimUntilMs: generationJobs.claimUntilMs,
+      claimFencingToken: generationJobs.claimFencingToken,
+    }).from(generationAttempts)
+      .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+      .where(eq(generationAttempts.id, identity.attemptId)).get();
+
+    if (!current
+      || current.attemptJobId !== identity.jobId
+      || current.currentAttemptId !== identity.attemptId
+      || current.claimOwner !== identity.workerId
+      || current.claimFencingToken !== identity.jobFencingToken
+      || current.attemptToken !== identity.jobFencingToken
+      || current.claimUntilMs === null
+      || current.claimUntilMs < now
+      || current.jobStatus !== "RUNNING") {
+      return { status: "ownership-lost" } as const;
+    }
+    if (current.attemptPhase !== "PREPARING") return { status: "invalid-transition" } as const;
+    if (current.attemptResourcePoolId !== resource.resourcePoolId) {
+      return { status: "ownership-lost" } as const;
+    }
+
+    const slot = tx.select().from(resourcePoolSlots).where(and(
+      eq(resourcePoolSlots.resourcePoolId, resource.resourcePoolId),
+      eq(resourcePoolSlots.slotNo, resource.slotNo),
+    )).get();
+    if (!slot
+      || slot.ownerAttemptId !== identity.attemptId
+      || slot.leaseToken !== resource.leaseToken
+      || slot.fencingToken !== resource.fencingToken
+      || slot.expiresAtMs === null
+      || slot.expiresAtMs < now) {
+      return { status: "ownership-lost" } as const;
+    }
+
+    const changed = tx.update(generationAttempts).set({
+      phase: "SUBMITTING",
+      resourceSlotNo: resource.slotNo,
+      resourceLeaseToken: resource.leaseToken,
+      resourceFencingToken: resource.fencingToken,
+      updatedAtMs: now,
+    }).where(and(
+      eq(generationAttempts.id, identity.attemptId),
+      eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
+      eq(generationAttempts.phase, "PREPARING"),
+      eq(generationAttempts.resourcePoolId, resource.resourcePoolId),
+    )).returning({ id: generationAttempts.id }).all();
+    return changed.length === 1 ? { status: "applied" } as const : { status: "lost-race" } as const;
+  }, { behavior: "immediate" });
+}
+
 /** Update a worker-owned attempt only while it remains the live job attempt. */
 export function updateOwnedAttempt(
   identity: OwnedAttemptIdentity,
@@ -256,6 +334,9 @@ export function updateOwnedAttempt(
       attemptPhase: generationAttempts.phase,
       attemptToken: generationAttempts.jobClaimFencingToken,
       attemptJobId: generationAttempts.jobId,
+      attemptResourceSlotNo: generationAttempts.resourceSlotNo,
+      attemptResourceLeaseToken: generationAttempts.resourceLeaseToken,
+      attemptResourceFencingToken: generationAttempts.resourceFencingToken,
       jobStatus: generationJobs.status,
       currentAttemptId: generationJobs.currentAttemptId,
       claimOwner: generationJobs.claimOwner,
@@ -271,6 +352,10 @@ export function updateOwnedAttempt(
       || current.claimOwner !== identity.workerId
       || current.claimFencingToken !== identity.jobFencingToken
       || current.attemptToken !== identity.jobFencingToken
+      || current.attemptResourceSlotNo <= 0
+      || !current.attemptResourceLeaseToken
+      || current.attemptResourceLeaseToken.startsWith("pending-")
+      || current.attemptResourceFencingToken <= 0
       || current.claimUntilMs === null
       || current.claimUntilMs < now
       || !(["RUNNING", "CANCEL_REQUESTED"] as JobStatus[]).includes(current.jobStatus)) {

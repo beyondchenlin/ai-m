@@ -30,6 +30,7 @@ import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/
 import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
 import {
   attachOwnedAttempt,
+  beginOwnedAttemptSubmission,
   finalizeOwnedExecution,
   finalizeOwnedJob,
   type AttemptPhase,
@@ -202,11 +203,17 @@ export async function executeGenerationJob(
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
     if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
-    requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "begin-submission", {
-      resourceSlotNo: resourceSlot.slotNo,
-      resourceLeaseToken: resourceSlot.leaseToken,
-      resourceFencingToken: resourceSlot.fencingToken,
-    }), "job_claim_lost_before_submission_boundary");
+    requireApplied(beginOwnedAttemptSubmission({
+      jobId: job.id,
+      attemptId,
+      workerId,
+      jobFencingToken,
+    }, {
+      resourcePoolId: backend.resourcePoolId,
+      slotNo: resourceSlot.slotNo,
+      leaseToken: resourceSlot.leaseToken,
+      fencingToken: resourceSlot.fencingToken,
+    }), "job_or_resource_lease_lost_before_submission_boundary");
 
     resourceTimer = setInterval(async () => {
       if (!resourceSlot || resourceRenewalInFlight) return;
@@ -248,6 +255,8 @@ export async function executeGenerationJob(
       onPhaseChange: async (phase: OrchestratorPhase) => {
         const mapped = phase === "CREATED" ? "PREPARING" : phase;
         if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(mapped)) return;
+        // SUBMITTING was already persisted by the resource-bound atomic boundary.
+        if (mapped === "SUBMITTING") return;
         const transition = transitionForOrchestratorPhase(mapped as AttemptPhase);
         if (!transition) throw new Error(`unsupported_orchestrator_phase:${mapped}`);
         requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, transition),

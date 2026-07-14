@@ -12,7 +12,9 @@ import {
   resourcePoolSlots,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
+import * as stateTransitions from "@/lib/generation/jobs/state-transitions";
 import {
+  acquireResourceSlot,
   applyExpiredSlotCandidates,
   recordResourceTerminationProof,
   readExpiredSlotCandidates,
@@ -20,6 +22,24 @@ import {
 } from "../leases";
 
 const NOW = 1_780_000_000_000;
+
+type BeginSubmission = (
+  identity: { jobId: string; attemptId: string; workerId: string; jobFencingToken: number },
+  resource: {
+    resourcePoolId: string;
+    slotNo: number;
+    leaseToken: string;
+    fencingToken: number;
+    clock?: () => number;
+  },
+  database: typeof db,
+) => stateTransitions.TransitionResult;
+
+function beginSubmission(...args: Parameters<BeginSubmission>): stateTransitions.TransitionResult {
+  const transition = Reflect.get(stateTransitions, "beginOwnedAttemptSubmission") as BeginSubmission | undefined;
+  expect(transition, "dedicated atomic begin-submission transition").toBeTypeOf("function");
+  return transition!(...args);
+}
 
 describe("resource slot reconciliation concurrency", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -84,6 +104,9 @@ describe("resource slot reconciliation concurrency", () => {
     phase: typeof generationAttempts.$inferInsert.phase;
     jobStatus: typeof generationJobs.$inferInsert.status;
     externalJobId?: string | null;
+    claimOwner?: string | null;
+    claimUntilMs?: number | null;
+    claimFencingToken?: number;
   }) {
     const poolId = crypto.randomUUID();
     const backendId = crypto.randomUUID();
@@ -123,6 +146,9 @@ describe("resource slot reconciliation concurrency", () => {
       executionSnapshotJson: {},
       inputDigest: "slot-reconciliation",
       currentAttemptId: attemptId,
+      claimOwner: input.claimOwner ?? null,
+      claimUntilMs: input.claimUntilMs ?? null,
+      claimFencingToken: input.claimFencingToken ?? 0,
       createdAtMs: NOW,
       updatedAtMs: NOW,
     });
@@ -130,6 +156,7 @@ describe("resource slot reconciliation concurrency", () => {
       id: attemptId,
       jobId,
       attemptNo: 1,
+      jobClaimFencingToken: input.claimFencingToken ?? 0,
       phase: input.phase,
       backendId,
       backendFeatureSnapshotJson: {},
@@ -232,6 +259,201 @@ describe("resource slot reconciliation concurrency", () => {
     expect(occupied?.count).toBe(1);
     expect(scannerConnection.prepare("SELECT COUNT(*) AS count FROM resource_pool_slots WHERE fencing_token < 0")
       .get()).toEqual({ count: 0 });
+  });
+
+  it("retains an expired pre-submission slot while its current job claim is still live", async () => {
+    const seeded = await seedExpiredSlot({
+      phase: "PREPARING",
+      jobStatus: "RUNNING",
+      claimOwner: "worker-live",
+      claimUntilMs: NOW + 60_000,
+      claimFencingToken: 9,
+    });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: "worker-live",
+      jobFencingToken: 9,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: 1,
+      leaseToken: seeded.leaseToken,
+      fencingToken: seeded.fencingToken,
+      clock: () => NOW,
+    }, workerDb)).toEqual({ status: "ownership-lost" });
+  });
+
+  it("retains a current pre-submission attempt when a claim owner has no expiry evidence", async () => {
+    const seeded = await seedExpiredSlot({
+      phase: "PREPARING",
+      jobStatus: "RUNNING",
+      claimOwner: "worker-owner-without-expiry",
+      claimUntilMs: null,
+      claimFencingToken: 9,
+    });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+  });
+
+  it("prevents submission when the scanner releases the expired lease first", async () => {
+    const seeded = await seedExpiredSlot({
+      phase: "PREPARING",
+      jobStatus: "RUNNING",
+      claimOwner: "worker-old",
+      claimUntilMs: NOW - 1,
+      claimFencingToken: 9,
+    });
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+
+    const scanner = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+    const worker = beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: "worker-old",
+      jobFencingToken: 9,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: 1,
+      leaseToken: seeded.leaseToken,
+      fencingToken: seeded.fencingToken,
+      clock: () => NOW,
+    }, workerDb);
+
+    expect(scanner).toMatchObject([{ disposition: "reconciled" }]);
+    expect(worker).toEqual({ status: "ownership-lost" });
+    const attempt = workerConnection.prepare<[string], { phase: string }>(
+      "SELECT phase FROM generation_attempts WHERE id = ?",
+    ).get(seeded.attemptId);
+    expect(attempt?.phase).toBe("PREPARING");
+  });
+
+  it("prevents the scanner from releasing after the worker renews and crosses submission atomically", async () => {
+    const seeded = await seedExpiredSlot({
+      phase: "PREPARING",
+      jobStatus: "RUNNING",
+      claimOwner: "worker-live",
+      claimUntilMs: NOW + 60_000,
+      claimFencingToken: 9,
+    });
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    workerConnection.prepare(`
+      UPDATE resource_pool_slots SET expires_at_ms = ?, updated_at_ms = ?
+      WHERE resource_pool_id = ? AND slot_no = 1 AND owner_attempt_id = ?
+        AND lease_token = ? AND fencing_token = ?
+    `).run(
+      NOW + 120_000, NOW, seeded.poolId, seeded.attemptId,
+      seeded.leaseToken, seeded.fencingToken,
+    );
+
+    const worker = beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: "worker-live",
+      jobFencingToken: 9,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: 1,
+      leaseToken: seeded.leaseToken,
+      fencingToken: seeded.fencingToken,
+      clock: () => NOW,
+    }, workerDb);
+    const scanner = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(worker).toEqual({ status: "applied" });
+    expect(scanner).toMatchObject([{ disposition: "retained" }]);
+    const state = scannerConnection.prepare<[string], { phase: string; ownerAttemptId: string | null }>(`
+      SELECT a.phase, s.owner_attempt_id AS ownerAttemptId
+      FROM generation_attempts a
+      JOIN resource_pool_slots s ON s.owner_attempt_id = a.id
+      WHERE a.id = ?
+    `).get(seeded.attemptId);
+    expect(state).toEqual({ phase: "SUBMITTING", ownerAttemptId: seeded.attemptId });
+  });
+
+  it("prevents an old worker from submitting after a new attempt acquires the released slot", async () => {
+    const seeded = await seedExpiredSlot({
+      phase: "PREPARING",
+      jobStatus: "RUNNING",
+      claimOwner: "worker-old",
+      claimUntilMs: NOW - 1,
+      claimFencingToken: 9,
+    });
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    expect(await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW))
+      .toMatchObject([{ disposition: "reconciled" }]);
+
+    const newJobId = crypto.randomUUID();
+    const newAttemptId = crypto.randomUUID();
+    const currentNow = Date.now();
+    await db.insert(generationJobs).values({
+      id: newJobId,
+      capability: "image",
+      status: "RUNNING",
+      executionSnapshotJson: {},
+      inputDigest: "new-owner",
+      currentAttemptId: newAttemptId,
+      claimOwner: "worker-new",
+      claimUntilMs: currentNow + 60_000,
+      claimFencingToken: 10,
+      createdAtMs: currentNow,
+      updatedAtMs: currentNow,
+    });
+    await db.insert(generationAttempts).values({
+      id: newAttemptId,
+      jobId: newJobId,
+      attemptNo: 1,
+      jobClaimFencingToken: 10,
+      phase: "PREPARING",
+      backendId: seeded.backendId,
+      backendFeatureSnapshotJson: {},
+      environmentFingerprint: "env:new-owner",
+      submissionCorrelationId: `corr-${newAttemptId}`,
+      externalIdStrategy: "server-assigned",
+      systemOutputPrefix: `prefix-${newAttemptId}`,
+      resourcePoolId: seeded.poolId,
+      resourceSlotNo: 0,
+      resourceLeaseToken: `pending-${newAttemptId}`,
+      resourceFencingToken: 0,
+      createdAtMs: currentNow,
+      updatedAtMs: currentNow,
+    });
+    const newLease = await acquireResourceSlot(seeded.poolId, newAttemptId, "worker-new");
+    expect(newLease).not.toBeNull();
+
+    const oldWorker = beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: "worker-old",
+      jobFencingToken: 9,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: 1,
+      leaseToken: seeded.leaseToken,
+      fencingToken: seeded.fencingToken,
+      clock: () => currentNow,
+    }, workerDb);
+
+    expect(oldWorker).toEqual({ status: "ownership-lost" });
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(newAttemptId);
   });
 
   it("releases an uncertain slot exactly once only with matching durable termination proof", async () => {

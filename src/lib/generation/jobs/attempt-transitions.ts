@@ -9,7 +9,6 @@ import {
 } from "./state-transitions";
 
 export type OwnedAttemptTransition =
-  | "begin-submission"
   | "mark-submission-unknown"
   | "record-external-queued"
   | "record-external-running"
@@ -26,7 +25,6 @@ interface AttemptTransitionPolicy {
 }
 
 export const OWNED_ATTEMPT_TRANSITION_POLICY: Record<OwnedAttemptTransition, AttemptTransitionPolicy> = {
-  "begin-submission": { expectedPhases: ["PREPARING", "SUBMITTING"], nextPhase: "SUBMITTING" },
   "mark-submission-unknown": {
     expectedPhases: ["SUBMITTING", "SUBMISSION_UNKNOWN"],
     nextPhase: "SUBMISSION_UNKNOWN",
@@ -71,7 +69,7 @@ export function transitionForOrchestratorPhase(
   phase: AttemptPhase,
 ): OwnedAttemptTransition | null {
   switch (phase) {
-    case "SUBMITTING": return "begin-submission";
+    case "SUBMITTING": return null;
     case "SUBMISSION_UNKNOWN": return "mark-submission-unknown";
     case "EXTERNAL_QUEUED": return "record-external-queued";
     case "EXTERNAL_RUNNING": return "record-external-running";

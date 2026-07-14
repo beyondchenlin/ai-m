@@ -18,9 +18,35 @@ import { finalizeGenerationFailure, finalizeGenerationSuccess } from "../worker-
 import {
   applyOwnedAttemptTransition,
   CONFIRMED_CANCELLATION_PREDECESSORS,
+  OWNED_ATTEMPT_TRANSITION_POLICY,
+  transitionForOrchestratorPhase,
 } from "../attempt-transitions";
 
 describe("worker terminal transitions", () => {
+  it("reserves SUBMITTING for the dedicated resource-boundary transition", () => {
+    expect(Reflect.has(OWNED_ATTEMPT_TRANSITION_POLICY, "begin-submission")).toBe(false);
+    expect(transitionForOrchestratorPhase("SUBMITTING")).toBeNull();
+  });
+
+  it("rejects post-submission phase writes without a persisted slot identity", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    await db.update(generationJobs).set({ status: "RUNNING" }).where(eq(generationJobs.id, jobId));
+    await db.update(generationAttempts).set({
+      phase: "SUBMITTING",
+      resourceSlotNo: 0,
+      resourceLeaseToken: `pending-${attemptId}`,
+      resourceFencingToken: 0,
+    }).where(eq(generationAttempts.id, attemptId));
+
+    const result = applyOwnedAttemptTransition({
+      jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+    }, "mark-submission-unknown", { clock: () => now });
+
+    expect(result).toEqual({ status: "ownership-lost" });
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(attempt.phase).toBe("SUBMITTING");
+  });
+
   let ctx: ReturnType<typeof setupTestDb>;
   let secondConnection: Database.Database;
 

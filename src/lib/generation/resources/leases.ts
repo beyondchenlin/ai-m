@@ -335,7 +335,7 @@ export interface SlotReconciliationOutcome {
   slotNo: number;
   ownerAttemptId: string;
   disposition: "retained" | "reconciled";
-  reason: "pre-submission-safe" | "termination-proven" | "termination-proof-missing" | "slot-changed";
+  reason: "pre-submission-safe" | "termination-proven" | "termination-proof-missing" | "slot-changed" | "live-job-claim";
 }
 
 class SlotReconciliationRollback extends Error {}
@@ -398,6 +398,16 @@ export async function applyExpiredSlotCandidates(
 
         const safeBeforeSubmission = preSubmissionPhases.has(currentAttempt.phase)
           && currentAttempt.externalJobId === null;
+        const currentJob = safeBeforeSubmission ? tx.select({
+          currentAttemptId: generationJobs.currentAttemptId,
+          claimOwner: generationJobs.claimOwner,
+          claimUntilMs: generationJobs.claimUntilMs,
+        }).from(generationJobs).where(eq(generationJobs.id, currentAttempt.jobId)).get() : undefined;
+        if (currentJob?.currentAttemptId === currentAttempt.id
+          && currentJob.claimOwner !== null
+          && (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= scanNow)) {
+          return { disposition: "retained", reason: "live-job-claim" } as const;
+        }
         const proof = safeBeforeSubmission ? undefined : tx.select().from(resourceReconciliationProofs)
           .where(and(
             eq(resourceReconciliationProofs.attemptId, currentAttempt.id),

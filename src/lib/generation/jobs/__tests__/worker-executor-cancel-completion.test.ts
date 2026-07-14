@@ -8,6 +8,7 @@ import {
   generationEvents,
   generationJobs,
   resourcePools,
+  resourcePoolSlots,
   workflowBackendValidations,
   workflowPackageRevisions,
 } from "@/lib/db/schema";
@@ -81,6 +82,7 @@ describe("worker completion after cancellation intent", () => {
     restoreWebSocket = installFakeWebSocket();
     await db.delete(generationEvents);
     await db.delete(generationArtifacts);
+    await db.delete(resourcePoolSlots);
     await db.delete(generationAttempts);
     await db.delete(generationJobs);
     await db.delete(workflowBackendValidations);
@@ -269,7 +271,18 @@ describe("worker completion after cancellation intent", () => {
     };
     mocks.createComfyUITransport.mockResolvedValue(transport);
     mocks.probeBackendFeatures.mockResolvedValue(defaultBackendFeatures());
-    mocks.acquireResourceSlot.mockResolvedValue({ slotNo: 1, leaseToken: "slot-lease", fencingToken: 4 });
+    mocks.acquireResourceSlot.mockImplementation(async (resourcePoolId: string, attemptId: string) => {
+      await db.insert(resourcePoolSlots).values({
+        resourcePoolId,
+        slotNo: 1,
+        ownerAttemptId: attemptId,
+        leaseToken: "slot-lease",
+        fencingToken: 4,
+        expiresAtMs: Date.now() + 120_000,
+        updatedAtMs: Date.now(),
+      });
+      return { slotNo: 1, leaseToken: "slot-lease", fencingToken: 4 };
+    });
     mocks.renewResourceSlot.mockResolvedValue(true);
     mocks.releaseResourceSlot.mockResolvedValue(true);
     mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: async () => undefined });
