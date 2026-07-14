@@ -8,6 +8,7 @@
 import { db } from "@/lib/db";
 import { resourcePoolSlots, generationJobs, generationAttempts } from "@/lib/db/schema";
 import { eq, and, inArray, sql } from "drizzle-orm";
+import { recoverExpiredJob, type ExpiredJobSnapshot } from "@/lib/generation/jobs/state-transitions";
 
 /** 租约配置 */
 export const LEASE_CONFIG = {
@@ -225,85 +226,41 @@ export async function scanExpiredClaims(): Promise<{
   releasedSlots: { poolId: string; slotNo: number }[];
 }> {
   const now = Date.now();
-  const expired = await db.select().from(generationJobs).where(and(
+  const expired = await db.select({ job: generationJobs, attempt: generationAttempts })
+    .from(generationJobs)
+    .leftJoin(generationAttempts, eq(generationAttempts.id, generationJobs.currentAttemptId))
+    .where(and(
     inArray(generationJobs.status, ["RUNNING", "CANCEL_REQUESTED"]),
     sql`${generationJobs.claimUntilMs} < ${now}`,
   ));
   const requeuedJobs: string[] = [];
   const attentionJobs: string[] = [];
   const cancelledJobs: string[] = [];
-  const safePreSubmission = new Set(["CREATED", "LEASED", "PREPARING"]);
   const terminalAttemptPhases = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "ORPHANED"]);
 
-  for (const job of expired) {
-    const attempt = job.currentAttemptId
-      ? (await db.select().from(generationAttempts).where(eq(generationAttempts.id, job.currentAttemptId)))[0]
-      : undefined;
-    if (job.status === "CANCEL_REQUESTED" && (!attempt || (safePreSubmission.has(attempt.phase) && !attempt.externalJobId))) {
-      const cancelled = await db.update(generationJobs).set({
-        status: "CANCELLED",
-        claimOwner: null,
-        claimUntilMs: null,
-        claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
-        completedAtMs: now,
-        updatedAtMs: now,
-      }).where(and(
-        eq(generationJobs.id, job.id),
-        eq(generationJobs.status, "CANCEL_REQUESTED"),
-        eq(generationJobs.claimOwner, job.claimOwner!),
-        eq(generationJobs.claimFencingToken, job.claimFencingToken),
-        sql`${generationJobs.claimUntilMs} < ${now}`,
-      )).returning({ id: generationJobs.id });
-      if (cancelled[0]) {
-        if (attempt) await db.update(generationAttempts).set({
-          phase: "CANCELLED", finishedAtMs: now, updatedAtMs: now,
-        }).where(and(eq(generationAttempts.id, attempt.id), eq(generationAttempts.jobClaimFencingToken, job.claimFencingToken)));
-        cancelledJobs.push(job.id);
-      }
-      continue;
-    }
-
-    if (!attempt || (safePreSubmission.has(attempt.phase) && !attempt.externalJobId)) {
-      const updated = await db.update(generationJobs).set({
-        status: "QUEUED",
-        claimOwner: null,
-        claimUntilMs: null,
-        claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
-        updatedAtMs: now,
-      }).where(and(
-        eq(generationJobs.id, job.id),
-        eq(generationJobs.status, "RUNNING"),
-        eq(generationJobs.claimOwner, job.claimOwner!),
-        eq(generationJobs.claimFencingToken, job.claimFencingToken),
-        sql`${generationJobs.claimUntilMs} < ${now}`,
-      )).returning({ id: generationJobs.id });
-      if (updated[0]) {
-        if (attempt) await db.update(generationAttempts).set({
-          phase: "ORPHANED", errorClass: "expired_pre_submission_claim",
-          errorCode: "expired_pre_submission_claim",
-          errorMessageSafe: "The previous worker lost ownership before external submission",
-          finishedAtMs: now, updatedAtMs: now,
-        }).where(and(eq(generationAttempts.id, attempt.id), eq(generationAttempts.jobClaimFencingToken, job.claimFencingToken)));
-        requeuedJobs.push(job.id);
-      }
-      continue;
-    }
-
-    const updated = await db.update(generationJobs).set({
-      status: "NEEDS_ATTENTION",
-      claimOwner: null,
-      claimUntilMs: null,
-      claimFencingToken: sql`${generationJobs.claimFencingToken} + 1`,
-      needsAttentionReason: `expired_claim:${attempt.phase}:external=${attempt.externalJobId ?? "unknown"}`,
-      updatedAtMs: now,
-    }).where(and(
-      eq(generationJobs.id, job.id),
-      eq(generationJobs.status, job.status),
-      eq(generationJobs.claimOwner, job.claimOwner!),
-      eq(generationJobs.claimFencingToken, job.claimFencingToken),
-      sql`${generationJobs.claimUntilMs} < ${now}`,
-    )).returning({ id: generationJobs.id });
-    if (updated[0]) attentionJobs.push(job.id);
+  for (const row of expired) {
+    const { job, attempt } = row;
+    if ((job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
+      || job.claimOwner === null || job.claimUntilMs === null) continue;
+    const snapshot: ExpiredJobSnapshot = {
+      jobId: job.id,
+      jobStatus: job.status,
+      claimOwner: job.claimOwner,
+      claimUntilMs: job.claimUntilMs,
+      claimFencingToken: job.claimFencingToken,
+      currentAttemptId: job.currentAttemptId,
+      attempt: attempt ? {
+        id: attempt.id,
+        phase: attempt.phase,
+        jobClaimFencingToken: attempt.jobClaimFencingToken,
+        externalJobId: attempt.externalJobId,
+      } : null,
+    };
+    const result = recoverExpiredJob(snapshot, now);
+    if (result.status !== "applied") continue;
+    if (result.disposition === "requeued") requeuedJobs.push(job.id);
+    else if (result.disposition === "cancelled") cancelledJobs.push(job.id);
+    else attentionJobs.push(job.id);
   }
 
   const expiredSlots = await db.select().from(resourcePoolSlots).where(
