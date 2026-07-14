@@ -7,7 +7,7 @@
  */
 
 import type { ComfyUITransport, ComfyExecutionResult } from "./comfyui";
-import { probeHistory, probeQueueStatus } from "./comfyui";
+import { classifyComfyHistory, probeHistory, probeQueueStatus } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 
 /** 对账证据强度 */
@@ -194,11 +194,9 @@ export async function reconcileSubmission(
   } else if (foundInQueuePending) {
     externalStatus = "queued";
   } else if (executionResult) {
-    if (executionResult.status.completed) {
-      externalStatus = executionResult.status.statusStr === "error" ? "failed" : "completed";
-    } else {
-      externalStatus = "queued";
-    }
+    const historyOutcome = classifyComfyHistory(executionResult);
+    if (historyOutcome === "completed") externalStatus = "completed";
+    if (historyOutcome === "failed" || historyOutcome === "cancelled") externalStatus = "failed";
   }
 
   const evidenceStrength = computeOverallStrength(evidence, exists);

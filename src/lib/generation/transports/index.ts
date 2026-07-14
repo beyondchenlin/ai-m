@@ -6,6 +6,7 @@ export {
   probeModelFolder,
   probeQueueStatus,
   probeHistory,
+  classifyComfyHistory,
   createComfyUITransport,
 } from "./comfyui";
 export type {
@@ -14,6 +15,7 @@ export type {
   ComfyPromptResponse,
   ComfyProgress,
   ComfyExecutionResult,
+  ComfyHistoryOutcome,
   ComfySystemInfo,
   ComfyObjectInfo,
   ComfyWSMessage,

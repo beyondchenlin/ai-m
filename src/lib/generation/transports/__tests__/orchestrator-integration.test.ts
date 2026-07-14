@@ -66,15 +66,20 @@ function makeCompletedHistory(promptId: string) {
   };
 }
 
-function makeTerminalErrorHistory(promptId: string, messageType: string) {
+function makeTerminalHistory(
+  promptId: string,
+  statusStr: string,
+  completed: boolean,
+  messageType?: string,
+) {
   return {
     [promptId]: {
       promptId,
       outputs: {},
       status: {
-        statusStr: "error",
-        completed: true,
-        messages: [[messageType, {}] as [string, Record<string, unknown>]],
+        statusStr,
+        completed,
+        messages: messageType ? [[messageType, {}] as [string, Record<string, unknown>]] : [],
       },
     },
   };
@@ -259,7 +264,7 @@ describe("PR-11: 编排器假后端集成", () => {
     const transport = new FakeComfyUITransport({
       promptId,
       queueRunning: [{ prompt_id: promptId }],
-      history: makeTerminalErrorHistory(promptId, "execution_interrupted"),
+      history: makeTerminalHistory(promptId, "error", false, "execution_interrupted"),
     });
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
@@ -271,7 +276,7 @@ describe("PR-11: 编排器假后端集成", () => {
         },
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
       },
-      fastConfig(),
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
     );
 
     const result = await orchestrator.execute(workflow);
@@ -283,10 +288,43 @@ describe("PR-11: 编排器假后端集成", () => {
   it("classifies an ordinary failed history terminal as failure, not cancellation", async () => {
     const promptId = "cancel-race-failed";
     const confirmations: string[] = [];
+    let historyProbes = 0;
+    class CountingTransport extends FakeComfyUITransport {
+      override async get(path: string): Promise<Response> {
+        if (path === `/history/${promptId}`) historyProbes++;
+        return super.get(path);
+      }
+    }
+    const transport = new CountingTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalHistory(promptId, "error", false, "execution_error"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+      },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(false);
+    expect(confirmations).toEqual([]);
+    expect(historyProbes).toBe(1);
+  });
+
+  it("does not confirm contradictory success plus interruption history", async () => {
+    const promptId = "cancel-race-contradictory";
+    const confirmations: string[] = [];
     const transport = new FakeComfyUITransport({
       promptId,
       queueRunning: [{ prompt_id: promptId }],
-      history: makeTerminalErrorHistory(promptId, "execution_error"),
+      history: makeTerminalHistory(promptId, "success", true, "execution_interrupted"),
     });
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
@@ -298,7 +336,7 @@ describe("PR-11: 编排器假后端集成", () => {
         },
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
       },
-      fastConfig(),
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
     );
 
     const result = await orchestrator.execute(workflow);

@@ -12,7 +12,7 @@
  */
 
 import type { ComfyUITransport, ComfyExecutionResult, ComfyWSMessage } from "./comfyui";
-import { submitPrompt, probeHistory, probeQueueStatus } from "./comfyui";
+import { classifyComfyHistory, submitPrompt, probeHistory, probeQueueStatus } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 import {
   ComfyUIConnectionManager,
@@ -453,8 +453,11 @@ export class ComfyUIExecutionOrchestrator {
           }
 
           const history = await probeHistory(this.transport, this.externalJobId);
-          if (history[this.externalJobId!]) {
-            return true;
+          const historyOutcome = classifyComfyHistory(history[this.externalJobId!]);
+          if (historyOutcome === "completed") return true;
+          if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+            this.phase = "FAILED";
+            return false;
           }
         }
       } catch {
@@ -499,15 +502,11 @@ export class ComfyUIExecutionOrchestrator {
 
       try {
         const history = await probeHistory(this.transport, this.externalJobId);
-        if (history[this.externalJobId]) {
-          const result = history[this.externalJobId];
-          if (result.status.completed) {
-            if (result.status.statusStr === "error") {
-              this.phase = "FAILED";
-              return false;
-            }
-            return true;
-          }
+        const historyOutcome = classifyComfyHistory(history[this.externalJobId]);
+        if (historyOutcome === "completed") return true;
+        if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+          this.phase = "FAILED";
+          return false;
         }
       } catch {
         // 轮询失败继续
@@ -689,18 +688,8 @@ export class ComfyUIExecutionOrchestrator {
   }
 
   private classifyCancellationHistory(result: ComfyExecutionResult | undefined): CancellationOutcome | null {
-    if (!result?.status.completed) return null;
-
-    const status = result.status.statusStr.trim().toLowerCase();
-    const messageTypes = (result.status.messages ?? []).map(([type]) => type.trim().toLowerCase());
-    const explicitlyCancelled = ["cancelled", "canceled", "interrupted"].includes(status)
-      || messageTypes.some((type) => [
-        "execution_cancelled",
-        "execution_canceled",
-        "execution_interrupted",
-      ].includes(type));
-
-    if (explicitlyCancelled) {
+    const historyOutcome = classifyComfyHistory(result);
+    if (historyOutcome === "cancelled") {
       return {
         outcome: "confirmed-cancelled",
         evidence: {
@@ -713,8 +702,9 @@ export class ComfyUIExecutionOrchestrator {
       };
     }
 
-    if (["error", "failed", "failure"].includes(status)) return { outcome: "failed" };
-    return { outcome: "completed" };
+    if (historyOutcome === "failed") return { outcome: "failed" };
+    if (historyOutcome === "completed") return { outcome: "completed" };
+    return null;
   }
 
   private async refreshCancellationState(): Promise<boolean> {

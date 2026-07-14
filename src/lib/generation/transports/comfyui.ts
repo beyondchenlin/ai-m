@@ -62,6 +62,33 @@ export interface ComfyExecutionResult {
   };
 }
 
+export type ComfyHistoryOutcome = "completed" | "cancelled" | "failed" | "unknown";
+
+/** Classifies ComfyUI history using the queue's actual status/message contract. */
+export function classifyComfyHistory(result: ComfyExecutionResult | undefined): ComfyHistoryOutcome {
+  if (!result) return "unknown";
+
+  const status = result.status.statusStr.trim().toLowerCase();
+  const messages = new Set((result.status.messages ?? []).map(([type]) => type.trim().toLowerCase()));
+  const interrupted = messages.has("execution_interrupted");
+  const executionFailed = messages.has("execution_error") || messages.has("execution_failed");
+
+  if (status === "success" && result.status.completed === true && !interrupted && !executionFailed) {
+    return "completed";
+  }
+  if (status === "error" && result.status.completed === false && interrupted && !executionFailed) {
+    return "cancelled";
+  }
+  if (status === "error" && result.status.completed === false && executionFailed && !interrupted) {
+    return "failed";
+  }
+  if (["failed", "failure"].includes(status) && result.status.completed === false
+    && !interrupted) {
+    return "failed";
+  }
+  return "unknown";
+}
+
 /** ComfyUI 系统信息 */
 export interface ComfySystemInfo {
   system?: Record<string, unknown>;
