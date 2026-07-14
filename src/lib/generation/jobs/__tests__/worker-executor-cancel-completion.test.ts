@@ -83,7 +83,6 @@ describe("worker completion after cancellation intent", () => {
     await db.delete(generationAttempts);
     await db.delete(generationJobs);
     await db.delete(workflowBackendValidations);
-    await db.delete(workflowPackageRevisions);
     await db.delete(executionBackends);
     await db.delete(resourcePools);
     getSqlite().exec(`
@@ -103,11 +102,14 @@ describe("worker completion after cancellation intent", () => {
     getSqlite().exec("DROP TRIGGER IF EXISTS audit_attempt_phase; DROP TABLE IF EXISTS attempt_phase_audit;");
   });
 
-  it("collects and commits completed output after durable cancellation intent", async () => {
+  async function arrangeExecution(
+    scenario: "known-completed" | "timeout-discovers-running" | "timeout-stays-unknown",
+  ) {
     const now = Date.now();
     const poolId = crypto.randomUUID();
     const backendId = crypto.randomUUID();
-    const workflowDigest = `sha256:${"a".repeat(64)}`;
+    const workflowIdentity = crypto.randomUUID();
+    const workflowDigest = `sha256:${workflowIdentity}`;
     const jobId = crypto.randomUUID();
     const promptId = "cancel-completed-prompt";
     const workerId = "worker-cancel-race";
@@ -135,7 +137,7 @@ describe("worker completion after cancellation intent", () => {
     });
     await db.insert(workflowPackageRevisions).values({
       digest: workflowDigest,
-      workflowId: "cancel-race-workflow",
+      workflowId: `cancel-race-${workflowIdentity}`,
       version: "1.0.0",
       capability: "image",
       workflowApiJson: {},
@@ -167,38 +169,73 @@ describe("worker completion after cancellation intent", () => {
       executionSnapshotJson: { executionBackendId: backendId, workflowPackageDigest: workflowDigest },
       inputDigest: "cancel-completion",
       claimOwner: workerId,
-      claimUntilMs: now + 60_000,
+      claimUntilMs: now + 10_000_000,
       claimFencingToken: fencingToken,
       createdAtMs: now,
       updatedAtMs: now,
     });
     const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
 
-    class CancelAfterRunningEvidenceTransport extends FakeComfyUITransport {
+    let nonterminalAtCancellationDispatch = false;
+    let cancellationDispatchAtMs: number | null = null;
+    class CancellationRaceTransport extends FakeComfyUITransport {
       private cancellationPersisted = false;
+      private cancellationDispatched = false;
+      private correlationId: string | undefined;
+      private correlationProbeCount = 0;
 
       override async get(path: string): Promise<Response> {
-        if (path === "/queue" && !this.cancellationPersisted) {
+        if (scenario === "known-completed" && path === "/queue" && !this.cancellationPersisted) {
           this.cancellationPersisted = true;
           await db.update(generationJobs).set({
             status: "CANCEL_REQUESTED",
             cancelRequestedAtMs: Date.now(),
           }).where(eq(generationJobs.id, jobId));
         }
+        if (path === "/queue" && scenario === "timeout-discovers-running"
+          && this.correlationId && !this.cancellationDispatched) {
+          this.correlationProbeCount++;
+          if (this.correlationProbeCount >= 2) {
+            this.scenario.queueRunning = [{ prompt_id: promptId, correlation_id: this.correlationId }];
+          }
+        }
         return super.get(path);
+      }
+
+      override async post(path: string, body: unknown): Promise<Response> {
+        if (path === "/prompt" && scenario !== "known-completed") {
+          const record = body as { extra_data?: { correlation_id?: string } };
+          const correlationId = record.extra_data?.correlation_id;
+          this.correlationId = correlationId;
+          await db.update(generationJobs).set({
+            status: "CANCEL_REQUESTED",
+            cancelRequestedAtMs: Date.now(),
+          }).where(eq(generationJobs.id, jobId));
+        }
+        if (path === "/queue" && Array.isArray((body as { delete?: unknown }).delete)) {
+          this.cancellationDispatched = true;
+          cancellationDispatchAtMs = Date.now();
+          const [currentJob] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+          const [currentAttempt] = await db.select().from(generationAttempts)
+            .where(eq(generationAttempts.jobId, jobId));
+          nonterminalAtCancellationDispatch = currentJob.status === "CANCEL_REQUESTED"
+            && currentAttempt.phase !== "CANCELLED";
+        }
+        return super.post(path, body);
       }
     }
 
-    const transport = new CancelAfterRunningEvidenceTransport({
+    const transport = new CancellationRaceTransport({
       promptId,
-      queueRunning: [{ prompt_id: promptId }],
-      history: {
+      submitError: scenario === "known-completed" ? undefined : new Error("submission timeout"),
+      queueRunning: scenario === "known-completed" ? [{ prompt_id: promptId }] : [],
+      history: scenario === "known-completed" ? {
         [promptId]: {
           promptId,
           outputs: { "node-1": { images: [{ filename: "completed.png", subfolder: "", type: "output" }] } },
           status: { statusStr: "success", completed: true },
         },
-      },
+      } : {},
       fileBytes: new Uint8Array([1, 2, 3]).buffer,
     });
     const compiled = {
@@ -251,7 +288,36 @@ describe("worker completion after cancellation intent", () => {
       return { id: artifactId };
     });
 
-    const result = await executeGenerationJob(job, workerId, fencingToken);
+    const execute = async () => {
+      if (scenario === "known-completed") return executeGenerationJob(job, workerId, fencingToken);
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      try {
+        const execution = executeGenerationJob(job, workerId, fencingToken);
+        let settled = false;
+        void execution.then(() => { settled = true; }, () => { settled = true; });
+        for (let step = 0; step < 800 && !settled; step++) {
+          await vi.advanceTimersByTimeAsync(10_000);
+        }
+        if (!settled) throw new Error("execution did not settle under fake timer budget");
+        return await execution;
+      } finally {
+        vi.useRealTimers();
+      }
+    };
+
+    return {
+      execute,
+      jobId,
+      get nonterminalAtCancellationDispatch() { return nonterminalAtCancellationDispatch; },
+      get cancellationDispatchDelayMs() {
+        return cancellationDispatchAtMs === null ? null : cancellationDispatchAtMs - now;
+      },
+    };
+  }
+
+  it("collects and commits completed output after durable cancellation intent", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    const result = await arranged.execute();
 
     expect(result).toMatchObject({
       success: true,
@@ -269,11 +335,49 @@ describe("worker completion after cancellation intent", () => {
       "COMMITTING",
       "SUCCEEDED",
     ]);
-    const events = await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId));
+    const events = await db.select().from(generationEvents).where(eq(generationEvents.jobId, arranged.jobId));
     expect(events.filter((event) => event.eventType === "external_cancellation_requested")).toHaveLength(1);
     expect(events.filter((event) => event.eventType === "job_succeeded")).toHaveLength(1);
-    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, jobId)))[0]).toMatchObject({
+    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
       status: "SUCCEEDED",
     });
+  });
+
+  it("reconciles a timed-out submission before safely cancelling the discovered prompt", async () => {
+    const arranged = await arrangeExecution("timeout-discovers-running");
+    const result = await arranged.execute();
+
+    expect(arranged.nonterminalAtCancellationDispatch).toBe(true);
+    expect(arranged.cancellationDispatchDelayMs).toBeGreaterThan(60_000);
+    expect(result).toMatchObject({
+      success: false,
+      finalPhase: "CANCELLED",
+      claimDisposition: "release-terminal",
+    });
+    const events = await db.select().from(generationEvents)
+      .where(eq(generationEvents.jobId, arranged.jobId));
+    expect(events.filter((event) => event.eventType === "external_cancellation_confirmed")).toHaveLength(1);
+    expect(events.filter((event) => event.eventType === "job_cancelled")).toHaveLength(1);
+    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
+      .toBe("CANCELLED");
+  });
+
+  it("escalates an uncorrelated timed-out submission without releasing its resource", async () => {
+    const arranged = await arrangeExecution("timeout-stays-unknown");
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({
+      success: false,
+      finalPhase: "NEEDS_ATTENTION",
+      needsAttention: true,
+      claimDisposition: "release-terminal",
+    });
+    expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    const events = await db.select().from(generationEvents)
+      .where(eq(generationEvents.jobId, arranged.jobId));
+    expect(events.some((event) => event.eventType === "external_cancellation_confirmed")).toBe(false);
+    expect(events.some((event) => event.eventType === "job_cancelled")).toBe(false);
+    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
+      .toBe("NEEDS_ATTENTION");
   });
 });

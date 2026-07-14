@@ -341,10 +341,41 @@ describe("worker terminal transitions", () => {
 
   it("limits confirmed cancellation finalization to phases where cancellation is polled", () => {
     expect(CONFIRMED_CANCELLATION_PREDECESSORS).toEqual([
-      "SUBMISSION_UNKNOWN",
       "EXTERNAL_QUEUED",
       "EXTERNAL_RUNNING",
     ]);
+  });
+
+  it("requires persisted cancellation confirmation before terminal cancellation", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    await db.update(generationAttempts).set({ phase: "EXTERNAL_RUNNING" })
+      .where(eq(generationAttempts.id, attemptId));
+    const finalize = () => finalizeOwnedExecution({
+      jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+    }, {
+      clock: () => now,
+      expectedJobStatuses: ["CANCEL_REQUESTED"],
+      expectedAttemptPhases: CONFIRMED_CANCELLATION_PREDECESSORS,
+      requiredPriorEventType: "external_cancellation_confirmed",
+      attemptValues: { phase: "CANCELLED", finishedAtMs: now },
+      jobValues: { status: "CANCELLED", completedAtMs: now },
+      event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },
+    });
+
+    expect(finalize()).toEqual({ status: "invalid-transition" });
+    await db.insert(generationEvents).values({
+      id: crypto.randomUUID(),
+      jobId,
+      attemptId,
+      eventType: "external_cancellation_confirmed",
+      severity: "info",
+      safePayloadJson: {
+        source: "dispatch-ack-and-queue-absence",
+        externalJobId: "external-terminal",
+      },
+      createdAtMs: now,
+    });
+    expect(finalize()).toEqual({ status: "applied" });
   });
 
   it.each([

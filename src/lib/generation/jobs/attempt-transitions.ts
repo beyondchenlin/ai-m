@@ -17,6 +17,7 @@ export type OwnedAttemptTransition =
   | "commit-collected-output"
   | "record-progress"
   | "record-cancellation-intent"
+  | "record-cancellation-confirmation"
   | "wait-before-retry";
 
 interface AttemptTransitionPolicy {
@@ -52,6 +53,9 @@ export const OWNED_ATTEMPT_TRANSITION_POLICY: Record<OwnedAttemptTransition, Att
   "record-cancellation-intent": {
     expectedPhases: ["SUBMISSION_UNKNOWN", "EXTERNAL_QUEUED", "EXTERNAL_RUNNING"],
   },
+  "record-cancellation-confirmation": {
+    expectedPhases: ["EXTERNAL_QUEUED", "EXTERNAL_RUNNING"],
+  },
   "wait-before-retry": {
     expectedPhases: ["SUBMITTING", "SUBMISSION_UNKNOWN", "RETRY_WAIT"],
     nextPhase: "RETRY_WAIT",
@@ -59,7 +63,6 @@ export const OWNED_ATTEMPT_TRANSITION_POLICY: Record<OwnedAttemptTransition, Att
 };
 
 export const CONFIRMED_CANCELLATION_PREDECESSORS = [
-  "SUBMISSION_UNKNOWN",
   "EXTERNAL_QUEUED",
   "EXTERNAL_RUNNING",
 ] as const satisfies readonly AttemptPhase[];

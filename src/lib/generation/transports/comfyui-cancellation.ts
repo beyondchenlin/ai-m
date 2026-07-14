@@ -20,6 +20,8 @@ export interface CancellationResult {
   safeMessage: string;
   /** 是否需要对账确认 */
   needsReconciliation: boolean;
+  /** What this call actually proved; dispatch is not terminal confirmation. */
+  evidenceKind: "unknown" | "dispatch-acknowledged" | "dispatch-failed" | "unsupported";
 }
 
 /** 取消策略配置 */
@@ -70,6 +72,7 @@ export async function safeCancelJob(
         ? "Shared backend cannot be cancelled safely (no per-task cancel support)"
         : "Cancellation not supported by this backend",
     needsReconciliation: true,
+    evidenceKind: "unsupported",
   };
 }
 
@@ -92,6 +95,7 @@ async function cancelByTaskId(
       method: "per-task",
       safeMessage: "Cancellation requested via per-task queue API",
       needsReconciliation: true,
+      evidenceKind: "dispatch-acknowledged",
     };
   } catch (err) {
     return {
@@ -99,6 +103,7 @@ async function cancelByTaskId(
       method: "per-task",
       safeMessage: `Failed to request cancellation: ${(err as Error).message.slice(0, 100)}`,
       needsReconciliation: true,
+      evidenceKind: "dispatch-failed",
     };
   }
 }
@@ -132,6 +137,7 @@ async function cancelWithGlobalInterruptVerified(
             method: "global-interrupt",
             safeMessage: "Cannot cancel: currently running task is not the target",
             needsReconciliation: false,
+            evidenceKind: "unsupported",
           };
         }
       }
@@ -147,6 +153,7 @@ async function cancelWithGlobalInterruptVerified(
     method: "global-interrupt",
     safeMessage: "Cannot verify target task for global interrupt",
     needsReconciliation: true,
+    evidenceKind: "unknown",
   };
 }
 
@@ -161,6 +168,7 @@ async function doGlobalInterrupt(transport: ComfyUITransport): Promise<Cancellat
       method: "global-interrupt",
       safeMessage: "Global interrupt sent (dedicated backend)",
       needsReconciliation: true,
+      evidenceKind: "dispatch-acknowledged",
     };
   } catch (err) {
     return {
@@ -168,6 +176,7 @@ async function doGlobalInterrupt(transport: ComfyUITransport): Promise<Cancellat
       method: "global-interrupt",
       safeMessage: `Interrupt failed: ${(err as Error).message.slice(0, 100)}`,
       needsReconciliation: true,
+      evidenceKind: "dispatch-failed",
     };
   }
 }

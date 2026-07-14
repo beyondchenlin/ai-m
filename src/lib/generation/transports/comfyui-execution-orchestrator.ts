@@ -66,7 +66,21 @@ export interface ExecutionCallbacks {
   isCancellationRequested?: () => boolean | Promise<boolean>;
   /** Records the exact cancellation method/evidence selected by policy. */
   onCancellationResult?: (result: CancellationResult) => void | Promise<void>;
+  /** Persists strong terminal evidence before the attempt may become CANCELLED. */
+  onCancellationConfirmed?: (evidence: CancellationConfirmationEvidence) => void | Promise<void>;
 }
+
+export interface CancellationConfirmationEvidence {
+  outcome: "confirmed-cancelled";
+  source: "dispatch-ack-and-queue-absence";
+  externalJobId: string;
+  method: CancellationResult["method"];
+  observedAtMs: number;
+}
+
+type CancellationOutcome =
+  | { outcome: "pending" | "unknown" | "completed" | "failed" }
+  | { outcome: "confirmed-cancelled"; evidence: CancellationConfirmationEvidence };
 
 /** A durable callback failed; callers must retain ownership for recovery. */
 export class ExecutionCallbackPersistenceError extends Error {
@@ -165,6 +179,8 @@ export class ComfyUIExecutionOrchestrator {
   private externalJobId: string | null = null;
   private cancelRequested = false;
   private cancellationDispatched = false;
+  private cancellationWithoutIdReported = false;
+  private cancellationResult: CancellationResult | null = null;
   private stopped = false;
   private startTimeMs = 0;
   private submitTimeMs = 0;
@@ -262,19 +278,25 @@ export class ComfyUIExecutionOrchestrator {
       const result: CancellationResult = {
         requested: false,
         method: "none",
-        safeMessage: "Cancellation recorded before an external job ID was assigned",
-        needsReconciliation: false,
+        safeMessage: "Cancellation is awaiting correlation reconciliation for an external job ID",
+        needsReconciliation: true,
+        evidenceKind: "unknown",
       };
-      await this.callbacks.onCancellationResult?.(result);
+      this.cancellationResult = result;
+      if (!this.cancellationWithoutIdReported) {
+        this.cancellationWithoutIdReported = true;
+        await this.callbacks.onCancellationResult?.(result);
+      }
       return result;
     }
 
     if (this.cancellationDispatched) {
-      return {
+      return this.cancellationResult ?? {
         requested: true,
         method: "none",
         safeMessage: "Cancellation was already dispatched; awaiting reconciliation",
         needsReconciliation: true,
+        evidenceKind: "unknown",
       };
     }
 
@@ -282,6 +304,7 @@ export class ComfyUIExecutionOrchestrator {
     const result = await safeCancelJob(this.transport, this.features, this.externalJobId, {
       isShared: this.config.isSharedBackend,
     });
+    this.cancellationResult = result;
     await this.callbacks.onCancellationResult?.(result);
     return result;
   }
@@ -343,7 +366,7 @@ export class ComfyUIExecutionOrchestrator {
     await new Promise((r) => setTimeout(r, this.config.reconciliationGraceMs));
 
     while (!this.stopped && this.reconciliationCount < this.config.maxReconciliationAttempts) {
-      if (await this.refreshCancellationState()) { this.phase = "CANCELLED"; return false; }
+      await this.refreshCancellationState();
 
       this.reconciliationCount++;
 
@@ -362,6 +385,7 @@ export class ComfyUIExecutionOrchestrator {
       if (result.discoveredExternalJobId && !this.externalJobId) {
         this.externalJobId = result.discoveredExternalJobId;
         await this.callbacks.onExternalJobId?.(result.discoveredExternalJobId);
+        if (this.cancelRequested) await this.requestCancel();
       }
 
       await this.callbacks.onReconciliation?.(result);
@@ -387,7 +411,7 @@ export class ComfyUIExecutionOrchestrator {
       const delay = nextReconciliationDelay(this.reconciliationCount, {
         intervalMs: this.config.reconciliationIntervalMs,
       });
-      await this.sleepCancellable(delay);
+      await this.sleepCancellable(delay, false);
     }
 
     this.phase = "FAILED";
@@ -403,8 +427,13 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation === "completed") return true;
-        if (cancellation === "cancelled") {
+        if (cancellation.outcome === "completed") return true;
+        if (cancellation.outcome === "failed") {
+          this.phase = "FAILED";
+          return false;
+        }
+        if (cancellation.outcome === "confirmed-cancelled") {
+          await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
           this.phase = "CANCELLED";
           return false;
         }
@@ -451,8 +480,13 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation === "completed") return true;
-        if (cancellation === "cancelled") {
+        if (cancellation.outcome === "completed") return true;
+        if (cancellation.outcome === "failed") {
+          this.phase = "FAILED";
+          return false;
+        }
+        if (cancellation.outcome === "confirmed-cancelled") {
+          await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
           this.phase = "CANCELLED";
           return false;
         }
@@ -628,15 +662,15 @@ export class ComfyUIExecutionOrchestrator {
     );
   }
 
-  private async resolveCancellationOutcome(): Promise<"pending" | "cancelled" | "completed"> {
-    if (!this.cancelRequested) return "pending";
-    if (!this.externalJobId) return "cancelled";
+  private async resolveCancellationOutcome(): Promise<CancellationOutcome> {
+    if (!this.cancelRequested) return { outcome: "pending" };
+    if (!this.externalJobId) return { outcome: "unknown" };
 
     try {
       const history = await probeHistory(this.transport, this.externalJobId);
       const result = history[this.externalJobId];
       if (result?.status.completed) {
-        return result.status.statusStr === "error" ? "cancelled" : "completed";
+        return { outcome: result.status.statusStr === "error" ? "failed" : "completed" };
       }
     } catch {
       // Fall through to queue evidence.
@@ -645,25 +679,45 @@ export class ComfyUIExecutionOrchestrator {
     try {
       const queue = await probeQueueStatus(this.transport);
       const ids = [...queue.queueRunning, ...queue.queuePending].map((entry) => entry.promptId);
-      if (!ids.includes(this.externalJobId)) return "cancelled";
+      if (ids.includes(this.externalJobId)) return { outcome: "pending" };
+      if (this.cancellationResult?.requested
+        && this.cancellationResult.evidenceKind === "dispatch-acknowledged") {
+        return {
+          outcome: "confirmed-cancelled",
+          evidence: {
+            outcome: "confirmed-cancelled",
+            source: "dispatch-ack-and-queue-absence",
+            externalJobId: this.externalJobId,
+            method: this.cancellationResult.method,
+            observedAtMs: Date.now(),
+          },
+        };
+      }
     } catch {
       // Absence of evidence is not evidence of cancellation.
     }
-    return "pending";
+    return { outcome: "unknown" };
   }
 
   private async refreshCancellationState(): Promise<boolean> {
     if (!this.cancelRequested && (await this.callbacks.isCancellationRequested?.())) {
-      await this.requestCancel();
+      this.cancelRequested = true;
     }
+    if (this.cancelRequested && !this.cancellationDispatched) await this.requestCancel();
     return this.cancelRequested;
   }
 
-  private async sleepCancellable(ms: number): Promise<void> {
+  private async sleepCancellable(ms: number, interruptOnCancellation = true): Promise<void> {
+    if (!interruptOnCancellation) {
+      await this.refreshCancellationState();
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return;
+    }
     const interval = 100;
     const steps = Math.ceil(ms / interval);
     for (let i = 0; i < steps && !this.stopped; i++) {
-      if (await this.refreshCancellationState()) break;
+      const cancellationRequested = await this.refreshCancellationState();
+      if (cancellationRequested && interruptOnCancellation) break;
       await new Promise((r) => setTimeout(r, interval));
     }
   }

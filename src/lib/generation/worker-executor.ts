@@ -295,9 +295,19 @@ export async function executeGenerationJob(
             requested: result.requested,
             method: result.method,
             needsReconciliation: result.needsReconciliation,
+            evidenceKind: result.evidenceKind,
             safeMessage: result.safeMessage.slice(0, 200),
           },
         }), "job_claim_lost_recording_cancellation_request");
+      },
+      onCancellationConfirmed: async (evidence) => {
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken, "record-cancellation-confirmation", {}, {
+            eventType: "external_cancellation_confirmed",
+            severity: "info",
+            safePayloadJson: { ...evidence },
+          },
+        ), "job_claim_lost_recording_cancellation_confirmation");
       },
       onOutputStream: async (output) => {
         requireApplied(applyAttemptTransition(
@@ -464,6 +474,7 @@ async function cancelJob(jobId: string, attemptId: string, workerId: string, fen
   const result = finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
     expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
     expectedAttemptPhases: CONFIRMED_CANCELLATION_PREDECESSORS,
+    requiredPriorEventType: "external_cancellation_confirmed",
     attemptValues: { phase: "CANCELLED", finishedAtMs: now },
     jobValues: { status: "CANCELLED", completedAtMs: now },
     event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },

@@ -311,6 +311,7 @@ export function finalizeOwnedExecution(
     clock?: () => number;
     expectedJobStatuses: readonly ("RUNNING" | "CANCEL_REQUESTED")[];
     expectedAttemptPhases: readonly AttemptPhase[];
+    requiredPriorEventType?: string;
     attemptValues: OwnedAttemptValues;
     jobValues: Partial<Omit<typeof generationJobs.$inferInsert,
       "id" | "currentAttemptId" | "claimOwner" | "claimUntilMs" | "claimFencingToken" | "createdAtMs">>;
@@ -352,6 +353,14 @@ export function finalizeOwnedExecution(
       if (!input.expectedJobStatuses.includes(current.jobStatus)
         || !input.expectedAttemptPhases.includes(current.attemptPhase)) {
         return { status: "invalid-transition" } as const;
+      }
+      if (input.requiredPriorEventType) {
+        const evidence = tx.select({ id: generationEvents.id }).from(generationEvents).where(and(
+          eq(generationEvents.jobId, identity.jobId),
+          eq(generationEvents.attemptId, identity.attemptId),
+          eq(generationEvents.eventType, input.requiredPriorEventType),
+        )).get();
+        if (!evidence) return { status: "invalid-transition" } as const;
       }
 
       const attemptChanged = tx.update(generationAttempts).set({
