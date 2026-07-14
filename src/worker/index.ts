@@ -10,16 +10,19 @@
 
 import { claimJob, renewJobClaim, releaseJobClaim, scanExpiredClaims, LEASE_CONFIG } from "@/lib/generation/resources/leases";
 import { executeGenerationJob } from "@/lib/generation/worker-executor";
-import { recoverStagingArtifacts } from "@/lib/generation/archiving";
+import { parseLegacyArtifactRecoveryBeforeMs, recoverStagingArtifacts } from "@/lib/generation/archiving";
 import { cleanupTerminalSharedInputs } from "@/lib/generation/input-materializer";
 import { cleanupSourceAssetStorage, recoverSourceMediaAssets } from "@/lib/generation/source-assets";
-import { getSqlite } from "@/lib/db";
+import { waitForCurrentMigrationBundle } from "@/lib/db";
 import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-adapter";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { settleClaimedJob } from "./claim-settlement";
 
 // Worker 标识
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
+const LEGACY_ARTIFACT_RECOVERY_BEFORE_MS = parseLegacyArtifactRecoveryBeforeMs(
+  process.env.AI_M_LEGACY_ARTIFACT_RECOVERY_BEFORE_MS,
+);
 const SUPPORTED_CAPABILITIES = ["image", "text", "video", "speech"] as const;
 
 // 运行状态
@@ -66,7 +69,9 @@ function startRecoveryScanner() {
     if (recoveryScanRunning) return;
     recoveryScanRunning = true;
     try {
-      const artifactRecovery = await recoverStagingArtifacts({ recoveryOwner: WORKER_ID });
+      const artifactRecovery = await recoverStagingArtifacts({
+        recoveryOwner: WORKER_ID, legacyRecoveryBeforeMs: LEGACY_ARTIFACT_RECOVERY_BEFORE_MS,
+      });
       const result = await scanExpiredClaims();
       const projections = await reconcileBusinessArtifactProjections();
       const cleanedSharedInputs = await cleanupTerminalSharedInputs();
@@ -139,35 +144,6 @@ async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>
 }
 
 
-async function waitForPlatformSchema(timeoutMs = 60_000): Promise<void> {
-  const startedAt = Date.now();
-  while (true) {
-    try {
-      const sqlite = getSqlite();
-      const tables = sqlite.prepare<[], { name: string }>(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('generation_jobs','generation_attempts','generation_artifacts','workflow_package_revisions','workflow_backend_validations','voice_profiles','source_media_assets','generation_job_source_assets')",
-      ).all();
-      const names = new Set(tables.map((row) => row.name));
-      if ([
-        "generation_jobs",
-        "generation_attempts",
-        "generation_artifacts",
-        "workflow_package_revisions",
-        "workflow_backend_validations",
-        "voice_profiles",
-        "source_media_assets",
-        "generation_job_source_assets",
-      ].every((name) => names.has(name))) return;
-    } catch {
-      // The web process may still be applying migrations. Retry until timeout.
-    }
-    if (Date.now() - startedAt >= timeoutMs) {
-      throw new Error("Platform schema is not ready. Run application migrations before starting the worker.");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-  }
-}
-
 /** 主循环 */
 async function mainLoop() {
   if (!isEnabled(FF.V2_DURABLE_EXECUTION)) {
@@ -176,10 +152,12 @@ async function mainLoop() {
   }
 
   console.log(`[${WORKER_ID}] Worker started, waiting for platform schema...`);
-  await waitForPlatformSchema();
+  await waitForCurrentMigrationBundle();
   console.log(`[${WORKER_ID}] Platform schema ready, polling for jobs...`);
 
-  const artifactRecovery = await recoverStagingArtifacts({ recoveryOwner: WORKER_ID });
+  const artifactRecovery = await recoverStagingArtifacts({
+    recoveryOwner: WORKER_ID, legacyRecoveryBeforeMs: LEGACY_ARTIFACT_RECOVERY_BEFORE_MS,
+  });
   const cleanedSharedInputs = await cleanupTerminalSharedInputs();
   const sourceRecovery = await recoverSourceMediaAssets();
   const sourceCleanup = await cleanupSourceAssetStorage();

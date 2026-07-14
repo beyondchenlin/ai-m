@@ -19,10 +19,10 @@ import {
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { recoverStagingArtifacts, resolveArtifactStoragePath } from "../commit";
 
-const pngBytes = new Uint8Array([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-  0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-]);
+const pngBytes = new Uint8Array(Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+));
 
 async function createExecution() {
   const now = Date.now();
@@ -61,14 +61,16 @@ async function createExecution() {
 async function createStaleArtifact(attemptId: string, logicalName: string) {
   const artifactId = randomUUID();
   const storageKey = `${attemptId}/${artifactId}.png`;
-  const stagingKey = `.staging/${attemptId}/${artifactId}.part`;
+  const stagingKey = `.staging/${attemptId}/${artifactId}.ready`;
   const stagingPath = resolveArtifactStoragePath(stagingKey);
   await fs.mkdir(path.dirname(stagingPath), { recursive: true });
   await fs.writeFile(stagingPath, pngBytes);
   await db.insert(generationArtifacts).values({
     id: artifactId, attemptId, logicalName, kind: "image", status: "STAGING", storageKey,
     visibility: "project", mimeType: "image/png", sizeBytes: 0, sha256: "pending",
-    metadataJson: { stagingPath: stagingKey, maxSizeBytes: 1024 },
+    metadataJson: { readyPath: stagingKey, maxSizeBytes: 1024 },
+    writerLeaseOwner: "expired-writer", writerLeaseToken: `expired-${artifactId}`,
+    writerLeaseExpiresAtMs: Date.now() - 1,
     createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
   });
   return { artifactId, storageKey, stagingPath };
@@ -121,6 +123,52 @@ describe("artifact recovery lease concurrency", () => {
     const [row] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, artifact.artifactId));
     expect(row).toMatchObject({ status: "COMMITTED", recoveryLeaseOwner: null, recoveryLeaseToken: null });
     await expect(fs.readFile(resolveArtifactStoragePath(artifact.storageKey))).resolves.toEqual(Buffer.from(pngBytes));
+  });
+
+  it("requires an explicit drain cutoff before claiming a lease-less legacy part", async () => {
+    const execution = await createExecution();
+    const artifactId = randomUUID();
+    const partKey = `.staging/${execution.attemptId}/${artifactId}.part`;
+    const partPath = resolveArtifactStoragePath(partKey);
+    await fs.mkdir(path.dirname(partPath), { recursive: true });
+    await fs.writeFile(partPath, pngBytes);
+    const createdAtMs = Date.now() - 60_000;
+    await db.insert(generationArtifacts).values({
+      id: artifactId, attemptId: execution.attemptId, logicalName: "legacy.png", kind: "image",
+      status: "STAGING", storageKey: `${execution.attemptId}/${artifactId}.png`, visibility: "project",
+      mimeType: "image/png", sizeBytes: 0, sha256: "pending",
+      metadataJson: { stagingPath: partKey, maxSizeBytes: 1024 }, createdAtMs, updatedAtMs: createdAtMs,
+    });
+    await expect(recoverStagingArtifacts({ recoveryOwner: "mixed-version-scanner" }))
+      .resolves.toEqual({ claimed: 0, committed: 0, quarantined: 0 });
+    await expect(recoverStagingArtifacts({
+      recoveryOwner: "drained-legacy-scanner", legacyRecoveryBeforeMs: createdAtMs,
+    })).resolves.toEqual({ claimed: 1, committed: 0, quarantined: 1 });
+  });
+
+  it("quarantines truncated PNG and MP4 ready files instead of publishing magic-byte prefixes", async () => {
+    const execution = await createExecution();
+    const cases = [
+      { id: randomUUID(), kind: "image" as const, mimeType: "image/png", bytes: pngBytes.subarray(0, 16), ext: "png" },
+      { id: randomUUID(), kind: "video" as const, mimeType: "video/mp4", bytes: new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]), ext: "mp4" },
+    ];
+    for (const item of cases) {
+      const readyKey = `.staging/${execution.attemptId}/${item.id}.ready`;
+      const readyPath = resolveArtifactStoragePath(readyKey);
+      await fs.mkdir(path.dirname(readyPath), { recursive: true });
+      await fs.writeFile(readyPath, item.bytes);
+      await db.insert(generationArtifacts).values({
+        id: item.id, attemptId: execution.attemptId, logicalName: `truncated.${item.ext}`, kind: item.kind,
+        status: "STAGING", storageKey: `${execution.attemptId}/${item.id}.${item.ext}`, visibility: "project",
+        mimeType: item.mimeType, sizeBytes: 0, sha256: "pending", metadataJson: { readyPath: readyKey },
+        writerLeaseOwner: "expired-writer", writerLeaseToken: `expired-${item.id}`,
+        writerLeaseExpiresAtMs: Date.now() - 1, createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
+      });
+    }
+    await expect(recoverStagingArtifacts({ recoveryOwner: "container-validator" }))
+      .resolves.toEqual({ claimed: 2, committed: 0, quarantined: 2 });
+    expect((await db.select().from(generationArtifacts)).map((row) => row.status))
+      .toEqual(["QUARANTINED", "QUARANTINED"]);
   });
 
   it("fences a paused loser after token loss and reclaims the successor after lease expiry", async () => {

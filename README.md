@@ -94,6 +94,8 @@ corepack pnpm worker:build
 corepack pnpm worker
 ```
 
+During a mixed-version rollout, leave `AI_M_LEGACY_ARTIFACT_RECOVERY_BEFORE_MS` unset so new workers never claim lease-less artifacts from old writers. After every pre-0062 writer is confirmed drained, an operator may set it to an epoch-millisecond cutoff; only legacy rows created at or before that cutoff become eligible for fenced recovery. Invalid or future values fail closed.
+
 ### 构建版本信息
 
 设置页会显示可用于支持与问题诊断的版本、提交和构建时间。`package.json` 中的 `version` 是应用版本的唯一来源，不能通过环境变量覆盖。部署系统只可在执行 Next.js 构建时提供以下两个可选输入：

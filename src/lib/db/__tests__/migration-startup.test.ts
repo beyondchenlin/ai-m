@@ -18,6 +18,7 @@ import {
   loadValidatedMigrationBundle,
   prepareMigrationJournal,
   resolveMigrationsFolder,
+  waitForCurrentMigrationBundle,
 } from "../index";
 import {
   MIGRATION_PRECONDITION_REGISTRY,
@@ -601,6 +602,38 @@ describe("migration journal startup ordering", () => {
         "SELECT name FROM sqlite_master WHERE type='trigger' AND name='generation_artifacts_lease_validate_update'",
       ).get()).toBeDefined();
     } finally { sqlite.close(); }
+  });
+
+  it("keeps concurrent worker connections waiting at 0061 and releases both after 0062", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-worker-journal-"));
+    const databasePath = path.join(directory, "worker.sqlite");
+    const writer = new Database(databasePath);
+    const observerA = new Database(databasePath);
+    const observerB = new Database(databasePath);
+    try {
+      writer.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+      const insert = writer.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+      for (const migration of repositoryBundle.migrations.slice(0, 62)) {
+        for (const statement of migration.sql ?? []) writer.exec(statement);
+        insert.run(migration.hash, migration.folderMillis);
+      }
+      let released = 0;
+      const waits = [observerA, observerB].map((sqlite) => waitForCurrentMigrationBundle({
+        sqlite, bundle: repositoryBundle, timeoutMs: 2_000, pollIntervalMs: 10,
+      }).then(() => { released++; }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(released).toBe(0);
+      const migration0062 = repositoryBundle.migrations[62];
+      writer.transaction(() => {
+        for (const statement of migration0062.sql ?? []) writer.exec(statement);
+        insert.run(migration0062.hash, migration0062.folderMillis);
+      })();
+      await Promise.all(waits);
+      expect(released).toBe(2);
+    } finally {
+      observerA.close(); observerB.close(); writer.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("installs a partial unique owner index used by resource-slot owner lookups", () => {

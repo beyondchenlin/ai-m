@@ -27,10 +27,10 @@ import {
   validateMagicBytes,
 } from "../commit";
 
-const pngBytes = new Uint8Array([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-  0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-]);
+const pngBytes = new Uint8Array(Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+));
 const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
 
 async function createExecution(ownerId = "owner") {
@@ -172,7 +172,7 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       sizeBytes: 0, sha256: "pending", metadataJson: { maxSizeBytes: 1024 },
       createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
     });
-    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test" })).toEqual({ claimed: 1, committed: 1, quarantined: 0 });
+    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test", legacyRecoveryBeforeMs: Date.now() })).toEqual({ claimed: 1, committed: 1, quarantined: 0 });
 
     const staleId = randomUUID();
     const staleKey = `${execution.attemptId}/${staleId}.png`;
@@ -184,7 +184,7 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
     });
     await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));
-    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test" })).toEqual({ claimed: 1, committed: 0, quarantined: 1 });
+    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test", legacyRecoveryBeforeMs: Date.now() })).toEqual({ claimed: 1, committed: 0, quarantined: 1 });
   });
 
   it("does not recover a live delayed writer with a renewable STAGING lease", async () => {
@@ -216,7 +216,7 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     let staging: typeof generationArtifacts.$inferSelect | undefined;
     for (let retry = 0; retry < 100; retry++) {
       [staging] = await db.select().from(generationArtifacts);
-      const stagingKey = (staging?.metadataJson as { stagingPath?: string } | undefined)?.stagingPath;
+      const stagingKey = (staging?.metadataJson as { writingPath?: string } | undefined)?.writingPath;
       const size = stagingKey
         ? (await fs.stat(resolveArtifactStoragePath(stagingKey)).catch(() => null))?.size
         : 0;
@@ -254,10 +254,10 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       visibility: ArtifactVisibility.PROJECT, readTimeoutMs: 5_000,
       read: () => new ReadableStream<Uint8Array>({
         async start(controller) {
-          controller.enqueue(pngBytes);
+          controller.enqueue(pngBytes.subarray(0, 16));
           started();
           await streamRelease;
-          controller.enqueue(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+          controller.enqueue(pngBytes.subarray(16));
           controller.close();
         },
       }),
@@ -267,27 +267,27 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     let stagedSize = -1;
     for (let retry = 0; retry < 100; retry++) {
       [artifact] = await db.select().from(generationArtifacts);
-      const stagingKey = (artifact?.metadataJson as { stagingPath?: string } | undefined)?.stagingPath;
+      const stagingKey = (artifact?.metadataJson as { writingPath?: string } | undefined)?.writingPath;
       stagedSize = stagingKey
         ? (await fs.stat(resolveArtifactStoragePath(stagingKey)).catch(() => null))?.size ?? -1
         : -1;
-      if (artifact?.status === "STAGING" && stagedSize === pngBytes.byteLength) break;
+      if (artifact?.status === "STAGING" && stagedSize === 16) break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(artifact).toBeDefined();
-    expect(stagedSize).toBe(pngBytes.byteLength);
+    expect(stagedSize).toBe(16);
     await db.update(generationArtifacts).set({
       writerLeaseOwner: "new-owner", writerLeaseToken: "new-token",
       writerLeaseExpiresAtMs: Date.now() - 1,
     }).where(eq(generationArtifacts.id, artifact!.id));
     await expect(recoverStagingArtifacts({ recoveryOwner: "writer-loss-recovery" }))
-      .resolves.toEqual({ claimed: 1, committed: 1, quarantined: 0 });
+      .resolves.toEqual({ claimed: 1, committed: 0, quarantined: 1 });
     releaseStream();
     await expect(writing).rejects.toThrow(/writer lease was lost/i);
 
     const [fenced] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, artifact!.id));
-    expect(fenced.status).toBe("COMMITTED");
-    await expect(fs.readFile(resolveArtifactStoragePath(fenced.storageKey))).resolves.toEqual(Buffer.from(pngBytes));
+    expect(fenced.status).toBe("QUARANTINED");
+    await expect(fs.stat(resolveArtifactStoragePath(fenced.storageKey))).rejects.toThrow();
   });
 
   it("removes its exclusively-owned late staging file when recovery already quarantined missing output", async () => {

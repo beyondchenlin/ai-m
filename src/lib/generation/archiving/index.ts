@@ -13,6 +13,7 @@ export {
   checkArtifactAccess,
   cleanupStagingDir,
   recoverStagingArtifacts,
+  parseLegacyArtifactRecoveryBeforeMs,
   getArtifactRoot,
   resolveArtifactStoragePath,
   isArtifactStorageKeySafe,

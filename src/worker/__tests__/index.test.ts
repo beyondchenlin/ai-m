@@ -12,6 +12,7 @@ vi.mock("@/lib/feature-flags", () => ({
 }));
 
 vi.mock("@/lib/db", () => ({
+  waitForCurrentMigrationBundle: vi.fn(() => Promise.resolve()),
   db: {
     delete: vi.fn(() => ({ where: vi.fn() })),
     select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => []) })) })),
@@ -42,6 +43,19 @@ vi.mock("@/lib/generation/worker-executor", () => ({
     needsAttention: false,
     claimDisposition: "release-terminal",
   })),
+}));
+
+vi.mock("@/lib/generation/archiving", () => ({
+  parseLegacyArtifactRecoveryBeforeMs: vi.fn(() => undefined),
+  recoverStagingArtifacts: vi.fn(() => Promise.resolve({ claimed: 0, committed: 0, quarantined: 0 })),
+}));
+vi.mock("@/lib/generation/input-materializer", () => ({ cleanupTerminalSharedInputs: vi.fn(() => Promise.resolve(0)) }));
+vi.mock("@/lib/generation/source-assets", () => ({
+  recoverSourceMediaAssets: vi.fn(() => Promise.resolve({ committed: 0, quarantined: 0 })),
+  cleanupSourceAssetStorage: vi.fn(() => Promise.resolve({ deletedFiles: 0, orphanStagingFiles: 0, abandonedAssets: 0 })),
+}));
+vi.mock("@/lib/generation/business-adapter", () => ({
+  reconcileBusinessArtifactProjections: vi.fn(() => Promise.resolve({ projected: 0, failed: 0 })),
 }));
 
 describe("PR-11: Worker 信号处理", () => {

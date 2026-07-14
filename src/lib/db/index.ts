@@ -368,6 +368,40 @@ export function runMigrations() {
   applyPendingMigrations(sqlite, bundle);
 }
 
+export function isCurrentMigrationBundleApplied(
+  sqlite: SqliteConnection,
+  bundle: ValidatedMigrationBundle = loadValidatedMigrationBundle(),
+): boolean {
+  try {
+    const rows = readMigrationJournal(sqlite);
+    if (rows.length !== bundle.migrations.length) return false;
+    return rows.every((row, index) => row.createdAt === bundle.migrations[index].folderMillis
+      && row.hash === bundle.migrations[index].hash);
+  } catch {
+    return false;
+  }
+}
+
+export async function waitForCurrentMigrationBundle(options: {
+  sqlite?: SqliteConnection;
+  bundle?: ValidatedMigrationBundle;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+} = {}): Promise<void> {
+  const sqlite = options.sqlite ?? getSqlite();
+  const bundle = options.bundle ?? loadValidatedMigrationBundle();
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const startedAt = Date.now();
+  for (;;) {
+    if (isCurrentMigrationBundleApplied(sqlite, bundle)) return;
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Platform migration journal is not current. Wait for application migrations before starting the worker.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
 // Proxy preserves the `db` export API — lazy-inits on first property access
 export const db: DrizzleDB = new Proxy({} as DrizzleDB, {
   get(_, prop) {
