@@ -268,7 +268,7 @@ For every task, follow the same review loop after its task-specific checks:
 
 **Files:**
 
-- Create: `drizzle/0063_job_input_artifacts.sql`
+- Create: `drizzle/0064_job_input_artifacts.sql`
 - Modify: `drizzle/meta/_journal.json`
 - Modify: `src/lib/db/schema.ts`
 - Modify: `src/lib/generation/jobs/service.ts`
@@ -302,7 +302,7 @@ For every task, follow the same review loop after its task-specific checks:
 
 **Files:**
 
-- Create: `drizzle/0064_source_asset_quota_reservations.sql`
+- Create: `drizzle/0065_source_asset_quota_reservations.sql`
 - Modify: `drizzle/meta/_journal.json`
 - Modify: `src/lib/db/schema.ts`
 - Modify: `src/lib/generation/source-assets.ts`
@@ -331,7 +331,7 @@ For every task, follow the same review loop after its task-specific checks:
 
 **Files:**
 
-- Create: `drizzle/0065_voice_profile_idempotency.sql`
+- Create: `drizzle/0066_voice_profile_idempotency.sql`
 - Modify: `drizzle/meta/_journal.json`
 - Modify: `src/lib/db/schema.ts`
 - Modify: `src/lib/generation/voice-profiles.ts`
