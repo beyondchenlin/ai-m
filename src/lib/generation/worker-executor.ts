@@ -31,11 +31,15 @@ import {
   attachOwnedAttempt,
   finalizeOwnedExecution,
   finalizeOwnedJob,
-  updateOwnedAttempt,
-  type OwnedAttemptValues,
   type AttemptPhase,
-  type TransitionResult,
+  type OwnedAttemptPatch,
 } from "@/lib/generation/jobs/state-transitions";
+import {
+  applyOwnedAttemptTransition,
+  CONFIRMED_CANCELLATION_PREDECESSORS,
+  transitionForOrchestratorPhase,
+  type OwnedAttemptTransition,
+} from "@/lib/generation/jobs/attempt-transitions";
 import {
   finalizeGenerationFailure,
   finalizeGenerationSuccess,
@@ -45,24 +49,6 @@ import {
   type JobExecutionResult,
 } from "@/lib/generation/jobs/worker-finalization";
 export type { JobExecutionResult } from "@/lib/generation/jobs/worker-finalization";
-
-const OWNED_ACTIVE_ATTEMPT_PHASES = [
-  "CREATED", "LEASED", "PREPARING", "SUBMITTING", "SUBMISSION_UNKNOWN",
-  "EXTERNAL_QUEUED", "EXTERNAL_RUNNING", "COLLECTING", "COMMITTING",
-  "RETRY_WAIT", "CANCEL_REQUESTED",
-] as const;
-
-const ATTEMPT_PHASE_PREDECESSORS: Partial<Record<AttemptPhase, readonly AttemptPhase[]>> = {
-  PREPARING: ["CREATED", "LEASED", "PREPARING"],
-  SUBMITTING: ["PREPARING", "SUBMITTING"],
-  SUBMISSION_UNKNOWN: ["SUBMITTING", "SUBMISSION_UNKNOWN"],
-  EXTERNAL_QUEUED: ["SUBMITTING", "SUBMISSION_UNKNOWN", "EXTERNAL_QUEUED"],
-  EXTERNAL_RUNNING: ["EXTERNAL_QUEUED", "EXTERNAL_RUNNING"],
-  COLLECTING: ["EXTERNAL_RUNNING", "COLLECTING"],
-  COMMITTING: ["COLLECTING", "COMMITTING"],
-  RETRY_WAIT: ["SUBMITTING", "SUBMISSION_UNKNOWN", "RETRY_WAIT"],
-  CANCEL_REQUESTED: OWNED_ACTIVE_ATTEMPT_PHASES,
-};
 
 function mimeForOutput(
   filename: string,
@@ -84,29 +70,24 @@ function mimeForOutput(
   return detected;
 }
 
-function updateAttemptFenced(
+function applyAttemptTransition(
   jobId: string,
   attemptId: string,
   workerId: string,
   jobFencingToken: number,
-  values: OwnedAttemptValues,
+  transition: OwnedAttemptTransition,
+  values: OwnedAttemptPatch = {},
   event?: {
     eventType: string;
     severity: typeof generationEvents.$inferInsert.severity;
     safePayloadJson: Record<string, unknown>;
   },
-): TransitionResult {
-  const { phase: nextPhase, ...patch } = values;
-  const expectedPhases = nextPhase
-    ? ATTEMPT_PHASE_PREDECESSORS[nextPhase]
-    : OWNED_ACTIVE_ATTEMPT_PHASES;
-  if (!expectedPhases) return { status: "invalid-transition" };
-  return updateOwnedAttempt({ jobId, attemptId, workerId, jobFencingToken }, {
-    expectedPhases,
-    nextPhase,
-    values: patch,
-    event,
-  });
+): ReturnType<typeof applyOwnedAttemptTransition> {
+  return applyOwnedAttemptTransition(
+    { jobId, attemptId, workerId, jobFencingToken },
+    transition,
+    { values, event },
+  );
 }
 
 export async function executeGenerationJob(
@@ -220,8 +201,7 @@ export async function executeGenerationJob(
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
     if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
-    requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, {
-      phase: "SUBMITTING",
+    requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "begin-submission", {
       resourceSlotNo: resourceSlot.slotNo,
       resourceLeaseToken: resourceSlot.leaseToken,
       resourceFencingToken: resourceSlot.fencingToken,
@@ -267,26 +247,28 @@ export async function executeGenerationJob(
       onPhaseChange: async (phase: OrchestratorPhase) => {
         const mapped = phase === "CREATED" ? "PREPARING" : phase;
         if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(mapped)) return;
-        requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, { phase: mapped }),
+        const transition = transitionForOrchestratorPhase(mapped as AttemptPhase);
+        if (!transition) throw new Error(`unsupported_orchestrator_phase:${mapped}`);
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, transition),
           "job_claim_lost_during_phase_change");
       },
       onExternalJobId: async (externalJobId) => {
         retainResource = true;
-        requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, {
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-external-queued", {
           externalJobId,
           submittedAtMs: Date.now(),
-          phase: "EXTERNAL_QUEUED",
         }), "job_claim_lost_recording_external_id");
       },
       onProgress: async (progress) => {
-        requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, {
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-progress", {
           progressSnapshotJson: progress as unknown as Record<string, unknown>,
         }), "job_claim_lost_recording_progress");
       },
       onReconciliation: async (result) => {
         if (result.discoveredExternalJobId) retainResource = true;
-        requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, {
-          phase: result.exists ? "EXTERNAL_QUEUED" : "SUBMISSION_UNKNOWN",
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken,
+          result.exists ? "record-external-queued" : "mark-submission-unknown", {
           externalJobId: result.discoveredExternalJobId ?? undefined,
         }), "job_claim_lost_during_reconciliation");
       },
@@ -306,9 +288,7 @@ export async function executeGenerationJob(
         return Boolean(current.cancelRequestedAtMs);
       },
       onCancellationResult: async (result) => {
-        requireApplied(updateAttemptFenced(job.id, attemptId, workerId, jobFencingToken, {
-          phase: "CANCEL_REQUESTED",
-        }, {
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-cancellation-intent", {}, {
           eventType: "external_cancellation_requested",
           severity: result.needsReconciliation ? "warning" : "info",
           safePayloadJson: {
@@ -320,6 +300,9 @@ export async function executeGenerationJob(
         }), "job_claim_lost_recording_cancellation_request");
       },
       onOutputStream: async (output) => {
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken, "commit-collected-output",
+        ), "job_claim_lost_before_artifact_commit");
         const sequence = outputSequence++;
         const media = mimeForOutput(output.filename, output.mediaKind);
         const contentLength = Number(output.response.headers.get("content-length") ?? 0);
@@ -480,7 +463,7 @@ async function cancelJob(jobId: string, attemptId: string, workerId: string, fen
   const now = Date.now();
   const result = finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
     expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
-    expectedAttemptPhases: ["CANCEL_REQUESTED"],
+    expectedAttemptPhases: CONFIRMED_CANCELLATION_PREDECESSORS,
     attemptValues: { phase: "CANCELLED", finishedAtMs: now },
     jobValues: { status: "CANCELLED", completedAtMs: now },
     event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },

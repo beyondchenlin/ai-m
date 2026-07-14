@@ -7,12 +7,12 @@
 
 import { db } from "@/lib/db";
 import { resourcePoolSlots, generationJobs, generationAttempts } from "@/lib/db/schema";
-import { eq, and, inArray, sql } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import {
-  recoverExpiredJob,
-  type ExpiredJobSnapshot,
-  type TransitionResult,
-} from "@/lib/generation/jobs/state-transitions";
+  applyExpiredJobCandidates,
+  readExpiredJobCandidates,
+  type RecoveryScanOutcome,
+} from "@/lib/generation/jobs/recovery-candidates";
 
 /** 租约配置 */
 export const LEASE_CONFIG = {
@@ -223,11 +223,7 @@ export async function releaseJobClaim(
  * slot remains reserved. This deliberately prefers a blocked slot over duplicate
  * inference.
  */
-export interface RecoveryScanOutcome {
-  jobId: string;
-  status: TransitionResult["status"];
-  disposition?: "requeued" | "cancelled" | "needs-attention";
-}
+export type { RecoveryScanOutcome } from "@/lib/generation/jobs/recovery-candidates";
 
 export interface RecoveryScanResult {
   requeuedJobs: string[];
@@ -237,53 +233,11 @@ export interface RecoveryScanResult {
   outcomes: RecoveryScanOutcome[];
 }
 
-type RecoverCandidate = (
-  snapshot: ExpiredJobSnapshot,
-) => TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }>
-  | Promise<TransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }>>;
-
-async function scanExpiredClaimsUsing(recoverCandidate: RecoverCandidate): Promise<RecoveryScanResult> {
+export async function scanExpiredClaims(): Promise<RecoveryScanResult> {
   const now = Date.now();
-  const expired = await db.select({ job: generationJobs, attempt: generationAttempts })
-    .from(generationJobs)
-    .leftJoin(generationAttempts, eq(generationAttempts.id, generationJobs.currentAttemptId))
-    .where(and(
-      inArray(generationJobs.status, ["RUNNING", "CANCEL_REQUESTED"]),
-      sql`${generationJobs.claimUntilMs} < ${now}`,
-    ));
-  const requeuedJobs: string[] = [];
-  const attentionJobs: string[] = [];
-  const cancelledJobs: string[] = [];
-  const outcomes: RecoveryScanOutcome[] = [];
+  const candidates = await readExpiredJobCandidates(now);
+  const jobRecovery = await applyExpiredJobCandidates(candidates);
   const terminalAttemptPhases = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "ORPHANED"]);
-
-  for (const row of expired) {
-    const { job, attempt } = row;
-    if ((job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
-      || job.claimOwner === null || job.claimUntilMs === null) continue;
-    const snapshot: ExpiredJobSnapshot = {
-      jobId: job.id,
-      jobStatus: job.status,
-      claimOwner: job.claimOwner,
-      claimUntilMs: job.claimUntilMs,
-      claimFencingToken: job.claimFencingToken,
-      currentAttemptId: job.currentAttemptId,
-      attempt: attempt ? {
-        id: attempt.id,
-        phase: attempt.phase,
-        jobClaimFencingToken: attempt.jobClaimFencingToken,
-        externalJobId: attempt.externalJobId,
-      } : null,
-    };
-    const result = await recoverCandidate(snapshot);
-    outcomes.push(result.status === "applied"
-      ? { jobId: job.id, status: result.status, disposition: result.disposition }
-      : { jobId: job.id, status: result.status });
-    if (result.status !== "applied") continue;
-    if (result.disposition === "requeued") requeuedJobs.push(job.id);
-    else if (result.disposition === "cancelled") cancelledJobs.push(job.id);
-    else attentionJobs.push(job.id);
-  }
 
   const expiredSlots = await db.select().from(resourcePoolSlots).where(
     sql`${resourcePoolSlots.expiresAtMs} < ${now} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`,
@@ -308,10 +262,5 @@ async function scanExpiredClaimsUsing(recoverCandidate: RecoverCandidate): Promi
       if (released[0]) releasedSlots.push({ poolId: slot.resourcePoolId, slotNo: slot.slotNo });
     }
   }
-  return { requeuedJobs, attentionJobs, cancelledJobs, releasedSlots, outcomes };
-}
-
-/** Scan with the production recovery transition; callers cannot replace it. */
-export function scanExpiredClaims(): Promise<RecoveryScanResult> {
-  return scanExpiredClaimsUsing(recoverExpiredJob);
+  return { ...jobRecovery, releasedSlots };
 }

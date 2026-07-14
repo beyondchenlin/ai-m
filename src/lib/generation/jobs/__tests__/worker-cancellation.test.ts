@@ -15,6 +15,10 @@ import {
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { finalizeOwnedExecution, finalizeOwnedJob } from "../state-transitions";
 import { finalizeGenerationFailure, finalizeGenerationSuccess } from "../worker-finalization";
+import {
+  applyOwnedAttemptTransition,
+  CONFIRMED_CANCELLATION_PREDECESSORS,
+} from "../attempt-transitions";
 
 describe("worker terminal transitions", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -288,6 +292,59 @@ describe("worker terminal transitions", () => {
     const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
     expect(job).toMatchObject({ status: "SUCCEEDED", currentArtifactId: artifactId });
     expect(attempt.phase).toBe("SUCCEEDED");
+  });
+
+  it("records cancellation intent without overwriting external execution phase", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    await db.update(generationAttempts).set({ phase: "EXTERNAL_RUNNING" })
+      .where(eq(generationAttempts.id, attemptId));
+
+    const result = applyOwnedAttemptTransition({
+      jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+    }, "record-cancellation-intent", {
+      clock: () => now,
+      event: {
+        eventType: "external_cancellation_requested",
+        severity: "info",
+        safePayloadJson: { requested: true },
+      },
+    });
+
+    expect(result).toEqual({ status: "applied" });
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(attempt.phase).toBe("EXTERNAL_RUNNING");
+    expect((await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId)))
+      .map((event) => event.eventType)).toEqual(["external_cancellation_requested"]);
+  });
+
+  it.each(["SUBMITTING", "COLLECTING", "COMMITTING"] as const)(
+    "does not record cancellation intent from illegal physical phase %s",
+    async (phase) => {
+      const { now, jobId, attemptId } = await seedOwnedExecution();
+      await db.update(generationAttempts).set({ phase }).where(eq(generationAttempts.id, attemptId));
+
+      const result = applyOwnedAttemptTransition({
+        jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+      }, "record-cancellation-intent", {
+        clock: () => now,
+        event: {
+          eventType: "external_cancellation_requested",
+          severity: "info",
+          safePayloadJson: {},
+        },
+      });
+
+      expect(result).toEqual({ status: "invalid-transition" });
+      expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+    },
+  );
+
+  it("limits confirmed cancellation finalization to phases where cancellation is polled", () => {
+    expect(CONFIRMED_CANCELLATION_PREDECESSORS).toEqual([
+      "SUBMISSION_UNKNOWN",
+      "EXTERNAL_QUEUED",
+      "EXTERNAL_RUNNING",
+    ]);
   });
 
   it.each([

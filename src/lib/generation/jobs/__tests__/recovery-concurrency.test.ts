@@ -15,8 +15,15 @@ import {
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { recoverExpiredJob, updateOwnedAttempt, type ExpiredJobSnapshot } from "../state-transitions";
+import { applyExpiredJobCandidates, readExpiredJobCandidates } from "../recovery-candidates";
 
 type RecoverableJobStatus = "RUNNING" | "CANCEL_REQUESTED";
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 describe("expired claim recovery concurrency", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -116,22 +123,15 @@ describe("expired claim recovery concurrency", () => {
     "does not recover a %s snapshot after the worker crosses the external submission boundary",
     async (status) => {
       const { jobId, attemptId } = await seedExpiredPreparingJob(status);
-      const [jobBefore] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
-      const [attemptBefore] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
-      const snapshot: ExpiredJobSnapshot = {
-        jobId,
-        jobStatus: status,
-        claimOwner: jobBefore.claimOwner!,
-        claimUntilMs: jobBefore.claimUntilMs!,
-        claimFencingToken: jobBefore.claimFencingToken,
-        currentAttemptId: attemptId,
-        attempt: {
-          id: attemptId,
-          phase: attemptBefore.phase,
-          jobClaimFencingToken: attemptBefore.jobClaimFencingToken,
-          externalJobId: attemptBefore.externalJobId,
-        },
-      };
+      const candidateRead = deferred<ExpiredJobSnapshot>();
+      const resumeApply = deferred();
+      const recovery = (async () => {
+        const candidates = await readExpiredJobCandidates(1_750_000_000_100);
+        candidateRead.resolve(candidates[0]);
+        await resumeApply.promise;
+        return applyExpiredJobCandidates(candidates, undefined, () => 1_750_000_000_100);
+      })();
+      const snapshot = await candidateRead.promise;
       expect(snapshot.attempt).toMatchObject({
         id: attemptId,
         phase: "PREPARING",
@@ -146,14 +146,18 @@ describe("expired claim recovery concurrency", () => {
         `).run(1_750_000_000_001, attemptId);
         expect(attempt.changes).toBe(1);
       }).immediate();
-      const result = recoverExpiredJob(snapshot, undefined, () => 1_750_000_000_100);
+      resumeApply.resolve();
+      const result = await recovery;
       const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
       const [attempt] = await db.select().from(generationAttempts).where(and(
         eq(generationAttempts.id, attemptId),
         eq(generationAttempts.jobId, jobId),
       ));
 
-      expect(result).toEqual({ status: "lost-race" });
+      expect(result.outcomes).toEqual([{ jobId, status: "lost-race" }]);
+      expect(result.requeuedJobs).not.toContain(jobId);
+      expect(result.cancelledJobs).not.toContain(jobId);
+      expect(result.attentionJobs).not.toContain(jobId);
       expect(job.status).toBe(status);
       expect(job.currentAttemptId).toBe(attemptId);
       expect(attempt.phase).toBe("SUBMITTING");
