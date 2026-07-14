@@ -28,6 +28,7 @@ import { resolveBackendAuthHeaders } from "@/lib/security";
 import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
 import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
 import {
+  attachOwnedAttempt,
   finalizeOwnedExecution,
   finalizeOwnedJob,
   updateOwnedAttempt,
@@ -91,23 +92,6 @@ function updateAttemptFenced(
     values,
     event,
   });
-}
-
-async function attachAttemptToOwnedJob(
-  jobId: string,
-  attemptId: string,
-  workerId: string,
-  jobFencingToken: number,
-): Promise<boolean> {
-  const now = Date.now();
-  const rows = await db.update(generationJobs).set({ currentAttemptId: attemptId, updatedAtMs: now }).where(and(
-    eq(generationJobs.id, jobId),
-    eq(generationJobs.claimOwner, workerId),
-    eq(generationJobs.claimFencingToken, jobFencingToken),
-    eq(generationJobs.status, "RUNNING"),
-    sql`${generationJobs.claimUntilMs} >= ${now}`,
-  )).returning({ id: generationJobs.id });
-  return Boolean(rows[0]);
 }
 
 export async function executeGenerationJob(
@@ -192,29 +176,35 @@ export async function executeGenerationJob(
     const attemptNo = await getNextAttemptNo(job.id);
     const correlationId = `corr-${attemptId}`;
     const outputPrefix = `ai-m/${job.id}/${attemptNo}`;
-    await db.insert(generationAttempts).values({
-      id: attemptId,
+    const attemptCreatedAtMs = Date.now();
+    const attached = attachOwnedAttempt({
       jobId: job.id,
-      attemptNo,
-      jobClaimFencingToken: jobFencingToken,
-      phase: "PREPARING",
-      backendId: backend.id,
-      backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
-      environmentFingerprint: features.environmentFingerprint,
-      submissionCorrelationId: correlationId,
-      externalIdStrategy: features.externalIdStrategy,
-      systemOutputPrefix: outputPrefix,
-      resourcePoolId: backend.resourcePoolId,
-      resourceSlotNo: 0,
-      resourceLeaseToken: `pending-${attemptId}`,
-      resourceFencingToken: 0,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
+      workerId,
+      jobFencingToken,
+    }, {
+      now: attemptCreatedAtMs,
+      attempt: {
+        id: attemptId,
+        jobId: job.id,
+        attemptNo,
+        jobClaimFencingToken: jobFencingToken,
+        phase: "PREPARING",
+        backendId: backend.id,
+        backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
+        environmentFingerprint: features.environmentFingerprint,
+        submissionCorrelationId: correlationId,
+        externalIdStrategy: features.externalIdStrategy,
+        systemOutputPrefix: outputPrefix,
+        resourcePoolId: backend.resourcePoolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${attemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: attemptCreatedAtMs,
+        updatedAtMs: attemptCreatedAtMs,
+      },
     });
+    requireApplied(attached, "job_claim_lost_before_attempt_attachment");
     attemptPersisted = true;
-
-    const claimed = await attachAttemptToOwnedJob(job.id, attemptId, workerId, jobFencingToken);
-    if (!claimed) throw new Error("job_claim_lost_before_resource_acquisition");
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
     if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");

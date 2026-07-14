@@ -25,7 +25,7 @@ vi.mock("@/lib/generation/resources/leases", () => ({
   renewJobClaim: vi.fn(() => Promise.resolve(true)),
   releaseJobClaim: vi.fn(() => Promise.resolve(true)),
   scanExpiredClaims: vi.fn(() => Promise.resolve({
-    requeuedJobs: [], attentionJobs: [], cancelledJobs: [], releasedSlots: [],
+    requeuedJobs: [], attentionJobs: [], cancelledJobs: [], releasedSlots: [], outcomes: [],
   })),
   LEASE_CONFIG: {
     CLAIM_LEASE_MS: 30_000,

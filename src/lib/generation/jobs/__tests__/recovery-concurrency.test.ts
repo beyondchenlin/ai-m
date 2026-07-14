@@ -12,10 +12,16 @@ import {
   resourcePools,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
-import { scanExpiredClaims } from "../../resources/leases";
+import { scanExpiredClaimsWithTransitionForTest } from "../../resources/leases";
 import { recoverExpiredJob, updateOwnedAttempt, type ExpiredJobSnapshot } from "../state-transitions";
 
 type RecoverableJobStatus = "RUNNING" | "CANCEL_REQUESTED";
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 describe("expired claim recovery concurrency", () => {
   let ctx: ReturnType<typeof setupTestDb>;
@@ -35,6 +41,8 @@ describe("expired claim recovery concurrency", () => {
   });
 
   beforeEach(async () => {
+    workerConnection.exec("DROP TRIGGER IF EXISTS ignore_recovery_attempt_update");
+    workerConnection.exec("DROP TRIGGER IF EXISTS ignore_recovery_job_update");
     await db.delete(generationEvents);
     await db.delete(generationAttempts);
     await db.delete(generationJobs);
@@ -114,11 +122,19 @@ describe("expired claim recovery concurrency", () => {
     async (status) => {
       const { jobId, attemptId } = await seedExpiredPreparingJob(status);
 
-      // scanExpiredClaims performs the expired-job read and then the attempt
-      // read in separate awaited queries. One microtask gives the scanner the
-      // exact PREPARING snapshot before this independent WAL writer commits.
-      const recovery = scanExpiredClaims();
-      await Promise.resolve();
+      const candidateRead = deferred<ExpiredJobSnapshot>();
+      const releaseRecovery = deferred();
+      const recovery = scanExpiredClaimsWithTransitionForTest(async (snapshot, now) => {
+        candidateRead.resolve(snapshot);
+        await releaseRecovery.promise;
+        return recoverExpiredJob(snapshot, now);
+      });
+      const snapshot = await candidateRead.promise;
+      expect(snapshot.attempt).toMatchObject({
+        id: attemptId,
+        phase: "PREPARING",
+        externalJobId: null,
+      });
 
       workerConnection.transaction(() => {
         const attempt = workerConnection.prepare(`
@@ -128,6 +144,7 @@ describe("expired claim recovery concurrency", () => {
         `).run(1_750_000_000_001, attemptId);
         expect(attempt.changes).toBe(1);
       }).immediate();
+      releaseRecovery.resolve();
 
       const result = await recovery;
       const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
@@ -139,6 +156,7 @@ describe("expired claim recovery concurrency", () => {
       expect(result.requeuedJobs).not.toContain(jobId);
       expect(result.cancelledJobs).not.toContain(jobId);
       expect(result.attentionJobs).not.toContain(jobId);
+      expect(result.outcomes).toEqual([{ jobId, status: "lost-race" }]);
       expect(job.status).toBe(status);
       expect(job.currentAttemptId).toBe(attemptId);
       expect(attempt.phase).toBe("SUBMITTING");
@@ -211,5 +229,100 @@ describe("expired claim recovery concurrency", () => {
     expect(result).toEqual({ status: "ownership-lost" });
     const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
     expect(attempt).toMatchObject({ phase: "PREPARING", externalJobId: null });
+  });
+
+  it("rolls back recovery when the attempt update affects zero rows", async () => {
+    const { jobId, attemptId } = await seedExpiredPreparingJob("RUNNING");
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    const snapshot: ExpiredJobSnapshot = {
+      jobId,
+      jobStatus: "RUNNING",
+      claimOwner: job.claimOwner!,
+      claimUntilMs: job.claimUntilMs!,
+      claimFencingToken: job.claimFencingToken,
+      currentAttemptId: attemptId,
+      attempt: {
+        id: attemptId,
+        phase: "PREPARING",
+        jobClaimFencingToken: attempt.jobClaimFencingToken,
+        externalJobId: null,
+      },
+    };
+    workerConnection.exec(`
+      CREATE TRIGGER ignore_recovery_attempt_update BEFORE UPDATE ON generation_attempts
+      WHEN OLD.id = '${attemptId}'
+      BEGIN SELECT RAISE(IGNORE); END
+    `);
+
+    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+
+    expect(result).toEqual({ status: "lost-race" });
+    const [currentJob] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [currentAttempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(currentJob.status).toBe("RUNNING");
+    expect(currentAttempt.phase).toBe("PREPARING");
+    expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+  });
+
+  it("rolls back the attempt update when the recovery job update affects zero rows", async () => {
+    const { jobId, attemptId } = await seedExpiredPreparingJob("CANCEL_REQUESTED");
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    const snapshot: ExpiredJobSnapshot = {
+      jobId,
+      jobStatus: "CANCEL_REQUESTED",
+      claimOwner: job.claimOwner!,
+      claimUntilMs: job.claimUntilMs!,
+      claimFencingToken: job.claimFencingToken,
+      currentAttemptId: attemptId,
+      attempt: {
+        id: attemptId,
+        phase: "PREPARING",
+        jobClaimFencingToken: attempt.jobClaimFencingToken,
+        externalJobId: null,
+      },
+    };
+    workerConnection.exec(`
+      CREATE TRIGGER ignore_recovery_job_update BEFORE UPDATE ON generation_jobs
+      WHEN OLD.id = '${jobId}'
+      BEGIN SELECT RAISE(IGNORE); END
+    `);
+
+    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+
+    expect(result).toEqual({ status: "lost-race" });
+    const [currentJob] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [currentAttempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(currentJob.status).toBe("CANCEL_REQUESTED");
+    expect(currentAttempt.phase).toBe("PREPARING");
+    expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+  });
+
+  it("uses the attempt snapshot fence for the recovery attempt write", async () => {
+    const { jobId, attemptId } = await seedExpiredPreparingJob("RUNNING");
+    await db.update(generationAttempts).set({ jobClaimFencingToken: 6 })
+      .where(eq(generationAttempts.id, attemptId));
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const snapshot: ExpiredJobSnapshot = {
+      jobId,
+      jobStatus: "RUNNING",
+      claimOwner: job.claimOwner!,
+      claimUntilMs: job.claimUntilMs!,
+      claimFencingToken: 7,
+      currentAttemptId: attemptId,
+      attempt: {
+        id: attemptId,
+        phase: "PREPARING",
+        jobClaimFencingToken: 6,
+        externalJobId: null,
+      },
+    };
+
+    const result = recoverExpiredJob(snapshot, 1_750_000_000_100);
+
+    expect(result).toEqual({ status: "applied", disposition: "requeued" });
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(attempt.phase).toBe("ORPHANED");
   });
 });

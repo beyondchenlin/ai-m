@@ -77,6 +77,8 @@ function startRecoveryScanner() {
       if (result.attentionJobs.length > 0) console.warn(`[${WORKER_ID}] Recovery: escalated ${result.attentionJobs.length} externally-uncertain jobs`);
       if (result.cancelledJobs.length > 0) console.log(`[${WORKER_ID}] Recovery: finalized ${result.cancelledJobs.length} pre-submission cancellations`);
       if (result.releasedSlots.length > 0) console.log(`[${WORKER_ID}] Recovery: released ${result.releasedSlots.length} terminal slots`);
+      const nonAppliedRecoveries = result.outcomes.filter((outcome) => outcome.status !== "applied").length;
+      if (nonAppliedRecoveries > 0) console.warn(`[${WORKER_ID}] Recovery: ${nonAppliedRecoveries} candidates changed before transition`);
       if (cleanedSharedInputs > 0) console.log(`[${WORKER_ID}] Recovery: removed ${cleanedSharedInputs} terminal shared-input namespaces`);
       if (sourceRecovery.committed || sourceRecovery.quarantined) {
         console.log(`[${WORKER_ID}] Source recovery: committed=${sourceRecovery.committed}, quarantined=${sourceRecovery.quarantined}`);
