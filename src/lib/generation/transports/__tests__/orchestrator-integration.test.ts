@@ -17,6 +17,7 @@ import {
   installFakeWebSocket,
 } from "@/lib/test-helpers/fake-comfyui";
 import type { ExecutionConfig } from "../comfyui-execution-orchestrator";
+import { ComfyUIOperationError, type ComfyUIOperationOptions } from "../comfyui";
 
 const pngBytes = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -146,7 +147,109 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
     expect(result.externalJobId).toBe(promptId);
+    expect(result.operationOutcome).toBe("definitely-complete");
     expect(outputs).toHaveLength(1);
+  });
+
+  it("passes the configured absolute submission deadline into the transport", async () => {
+    class CapturingTransport extends FakeComfyUITransport {
+      observedTimeoutMs: number | undefined;
+      override async post(path: string, body: unknown, options?: ComfyUIOperationOptions): Promise<Response> {
+        if (path === "/prompt") this.observedTimeoutMs = options?.timeoutMs;
+        return super.post(path, body);
+      }
+    }
+    const promptId = "submission-deadline-config";
+    const transport = new CapturingTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeCompletedHistory(promptId),
+      fileBytes: pngArrayBuffer,
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      { onOutputStream: async (output) => { await output.response.arrayBuffer(); } },
+      { ...fastConfig(), submitTimeoutMs: 137 },
+    );
+
+    await orchestrator.execute(workflow);
+
+    expect(transport.observedTimeoutMs).toBe(137);
+  });
+
+  it("does not reconcile a submission proven to have timed out before write", async () => {
+    const reconciliations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      submitError: new ComfyUIOperationError(
+        "ComfyUI submission operation failed",
+        "definitely-not-submitted",
+      ),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      { onReconciliation: (result) => { reconciliations.push(result.evidenceStrength); } },
+      fastConfig(),
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result).toMatchObject({
+      success: false,
+      phase: "FAILED",
+      operationOutcome: "definitely-not-submitted",
+      needsAttention: false,
+    });
+    expect(reconciliations).toEqual([]);
+  });
+
+  it("uses one absolute collection deadline across every output download", async () => {
+    class CollectionDeadlineTransport extends FakeComfyUITransport {
+      readonly downloadTimeouts: number[] = [];
+      override async getFile(
+        params: { filename: string; subfolder: string; type: string },
+        options?: ComfyUIOperationOptions,
+      ): Promise<Response> {
+        this.downloadTimeouts.push(options?.timeoutMs ?? -1);
+        return super.getFile(params, options);
+      }
+    }
+    const promptId = "collection-absolute-deadline";
+    const history = makeCompletedHistory(promptId);
+    history[promptId].outputs["node-1"].images = [
+      { filename: "first.png", subfolder: "", type: "output" },
+      { filename: "second.png", subfolder: "", type: "output" },
+    ];
+    const transport = new CollectionDeadlineTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history,
+      fileBytes: pngArrayBuffer,
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onOutputStream: async (output) => {
+          await output.response.arrayBuffer();
+          await new Promise((resolve) => setTimeout(resolve, 15));
+        },
+      },
+      {
+        ...fastConfig(),
+        collectionTimeoutMs: 200,
+        approvedOutputs: [{ key: "primary", nodeId: "node-1", field: "images", mediaKind: "image", maxItems: 2 }],
+        maxOutputs: 2,
+      },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(true);
+    expect(transport.downloadTimeouts).toHaveLength(2);
+    expect(transport.downloadTimeouts[0]).toBeLessThanOrEqual(200);
+    expect(transport.downloadTimeouts[1]).toBeLessThan(transport.downloadTimeouts[0]);
   });
 
   it("propagates durable callback failures instead of classifying them as execution errors", async () => {
@@ -191,6 +294,7 @@ describe("PR-11: 编排器假后端集成", () => {
 
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
+    expect(result.operationOutcome).toBe("definitely-complete");
     expect(result.externalJobId).toBe(promptId);
     expect(reconciliations.length).toBeGreaterThan(0);
     expect(reconciliations[0]).toBe("conclusive");
@@ -222,6 +326,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(false);
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(true);
+    expect(result.operationOutcome).toBe("submission-uncertain");
     expect(terminalEvidence).toEqual([]);
   });
 

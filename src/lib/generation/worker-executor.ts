@@ -466,7 +466,10 @@ export async function executeGenerationJob(
         await cancelJob(job.id, attemptId, workerId, jobFencingToken);
         return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
       }
-      retainResource = retainResource || result.needsAttention || result.phase === "SUBMISSION_UNKNOWN";
+      retainResource = retainResource
+        || result.operationOutcome === "submission-uncertain"
+        || result.needsAttention
+        || result.phase === "SUBMISSION_UNKNOWN";
       return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
     } finally {
       abortSignal?.removeEventListener("abort", abortListener);

@@ -212,7 +212,12 @@ export class FakeComfyUITransport implements ComfyUITransport {
     return { name: input.filename, subfolder: input.subfolder ?? "", type: "input" };
   }
 
-  async getFile(): Promise<Response> {
+  async getFile(
+    params?: { filename: string; subfolder: string; type: string },
+    options?: import("@/lib/generation/transports/comfyui").ComfyUIOperationOptions,
+  ): Promise<Response> {
+    void params;
+    void options;
     const bytes = this.scenario.fileBytes ?? new ArrayBuffer(0);
     return new Response(bytes, { status: this.scenario.fileStatus ?? 200, headers: this.scenario.fileHeaders });
   }

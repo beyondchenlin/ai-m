@@ -18,6 +18,7 @@ import {
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { ArtifactKind, ArtifactVisibility } from "@/lib/generation/naming";
+import { ComfyUIOperationDeadlineError } from "@/lib/generation/transports/comfyui";
 import {
   checkArtifactAccess,
   commitArtifactFromBuffer,
@@ -158,6 +159,38 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     })).rejects.toThrow(/Artifact exceeds 8 bytes/);
     const [row] = await db.select().from(generationArtifacts);
     expect(row.status).toBe("QUARANTINED");
+  });
+
+  it("removes a partial staging file when a download body deadline expires", async () => {
+    const execution = await createExecution();
+    let stagingPath = "";
+    const deadline = new ComfyUIOperationDeadlineError("definitely-complete");
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
+      writerOwner: "deadline-writer",
+      logicalName: "partial.png",
+      kind: ArtifactKind.IMAGE,
+      mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+      read: () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(pngBytes.subarray(0, 16));
+          controller.error(deadline);
+        },
+      }),
+    }, {
+      openStagingFile: async (filePath) => {
+        stagingPath = filePath;
+        return fs.open(filePath, "wx", 0o600);
+      },
+    });
+
+    await expect(writing).rejects.toBe(deadline);
+    const [artifact] = await db.select().from(generationArtifacts);
+    expect(artifact.status).toBe("QUARANTINED");
+    expect(stagingPath).not.toBe("");
+    await expect(fs.stat(stagingPath)).rejects.toThrow();
   });
 
   it("rejects stale workers before publishing output", async () => {

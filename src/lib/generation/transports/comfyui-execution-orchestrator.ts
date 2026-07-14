@@ -12,7 +12,14 @@
  */
 
 import type { ComfyUITransport, ComfyExecutionResult, ComfyWSMessage } from "./comfyui";
-import { classifyComfyHistory, submitPrompt, probeHistory, probeQueueStatus } from "./comfyui";
+import {
+  classifyComfyHistory,
+  ComfyUIOperationError,
+  submitPrompt,
+  probeHistory,
+  probeQueueStatus,
+  type ComfyUIOperationOutcome,
+} from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 import {
   ComfyUIConnectionManager,
@@ -160,6 +167,7 @@ export interface OrchestratorResult {
   errorClass?: string;
   cancellationRequested?: boolean;
   needsAttention?: boolean;
+  operationOutcome: ComfyUIOperationOutcome;
 }
 
 /**
@@ -195,6 +203,7 @@ export class ComfyUIExecutionOrchestrator {
   private submitTimeMs = 0;
   private reconciliationCount = 0;
   private outputCollected = false;
+  private operationOutcome: ComfyUIOperationOutcome = "definitely-not-submitted";
 
   private wsUnregister: (() => void) | null = null;
   private progressListener: (() => void) | null = null;
@@ -331,17 +340,15 @@ export class ComfyUIExecutionOrchestrator {
   private async submitWithTimeout(
     workflow: Record<string, unknown>,
   ): Promise<{ success: boolean; needsReconciliation: boolean }> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Do not abort the underlying request on timeout: the server may already
-      // have accepted the prompt.  A local timeout is therefore classified as
-      // submission-unknown and reconciled by correlation ID.
-      const result = await Promise.race([
-        submitPrompt(this.transport, workflow, this.clientId, this.correlationId),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error("submission_timeout")), this.config.submitTimeoutMs);
-        }),
-      ]);
+      const result = await submitPrompt(
+        this.transport,
+        workflow,
+        this.clientId,
+        this.correlationId,
+        { timeoutMs: this.config.submitTimeoutMs },
+      );
+      this.operationOutcome = "definitely-complete";
       this.externalJobId = result.promptId;
       await this.callbacks.onExternalJobId?.(result.promptId);
       this.submitTimeMs = Date.now();
@@ -350,23 +357,34 @@ export class ComfyUIExecutionOrchestrator {
       const error = err instanceof Error ? err : new Error(String(err));
       const classification = classifySubmissionError(error);
 
+      if (error instanceof ComfyUIOperationError) {
+        this.operationOutcome = error.outcome;
+        if (error.outcome === "definitely-not-submitted") {
+          this.phase = "FAILED";
+          await this.callbacks.onError?.(error, "submission_not_sent");
+          return { success: false, needsReconciliation: false };
+        }
+        this.submitTimeMs = Date.now();
+        return { success: false, needsReconciliation: true };
+      }
+
       if (
         error.message.includes("timeout") ||
         error.message.includes("aborted") ||
         error.message.includes("Failed to fetch") ||
         classification.errorClass === "network_error"
       ) {
+        this.operationOutcome = "submission-uncertain";
         this.submitTimeMs = Date.now();
         return { success: false, needsReconciliation: true };
       }
 
       if (classification.retryable) {
+        this.operationOutcome = "submission-uncertain";
         return { success: false, needsReconciliation: true };
       }
 
       throw error;
-    } finally {
-      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -399,6 +417,7 @@ export class ComfyUIExecutionOrchestrator {
       await this.callbacks.onReconciliation?.(result);
 
       if (result.exists && result.externalStatus) {
+        this.operationOutcome = "definitely-complete";
         if (result.externalStatus === "queued" || result.externalStatus === "running") {
           return true;
         }
@@ -569,10 +588,20 @@ export class ComfyUIExecutionOrchestrator {
   private async collectOutputs(): Promise<boolean> {
     if (!this.externalJobId) return false;
 
-    const startTime = Date.now();
+    const collectionDeadlineMs = Date.now() + this.config.collectionTimeoutMs;
+    const remainingCollectionMs = () => {
+      const remaining = collectionDeadlineMs - Date.now();
+      if (remaining <= 0) throw new Error("ComfyUI collection operation deadline exceeded");
+      return remaining;
+    };
 
     try {
-      const history = await probeHistory(this.transport, this.externalJobId);
+      const history = await probeHistory(
+        this.transport,
+        this.externalJobId,
+        undefined,
+        { timeoutMs: remainingCollectionMs() },
+      );
       const result = history[this.externalJobId];
 
       if (!result) {
@@ -590,7 +619,7 @@ export class ComfyUIExecutionOrchestrator {
         if (!output) continue;
         // Once ComfyUI reports completion, committed output wins the cancel race.
         // Continue collecting immutable outputs instead of discarding completed work.
-        if (Date.now() - startTime > this.config.collectionTimeoutMs) {
+        if (Date.now() >= collectionDeadlineMs) {
           this.phase = "FAILED";
           return false;
         }
@@ -638,7 +667,7 @@ export class ComfyUIExecutionOrchestrator {
             if (!this.callbacks.onOutputStream) {
               throw new Error("A streaming output consumer is required");
             }
-            const response = await this.transport.getFile(file);
+            const response = await this.transport.getFile(file, { timeoutMs: remainingCollectionMs() });
             if (!response.ok || !response.body) {
               throw new Error(`Output download failed (${response.status})`);
             }
@@ -814,6 +843,7 @@ export class ComfyUIExecutionOrchestrator {
         (this.phase === "FAILED" && (this.reconciliationCount > 0 || this.cancelRequested))
         || (this.stopped && Boolean(this.externalJobId) && this.phase !== "SUCCEEDED" && this.phase !== "CANCELLED"),
       outputs: this.outputCollected ? [] : undefined,
+      operationOutcome: this.operationOutcome,
     };
   }
 }

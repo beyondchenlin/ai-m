@@ -21,6 +21,7 @@ import {
   installFakeWebSocket,
   jsonResponse,
 } from "@/lib/test-helpers/fake-comfyui";
+import { ComfyUIOperationDeadlineError } from "@/lib/generation/transports/comfyui";
 
 const mocks = vi.hoisted(() => ({
   acquireResourceSlot: vi.fn(),
@@ -109,7 +110,7 @@ describe("worker completion after cancellation intent", () => {
 
   async function arrangeExecution(
     scenario: "known-completed" | "completion-wins-after-queue-absence"
-      | "timeout-discovers-running" | "timeout-stays-unknown",
+      | "timeout-discovers-running" | "timeout-stays-unknown" | "prewrite-timeout",
     fileHeaders?: HeadersInit,
   ) {
     const now = Date.now();
@@ -223,7 +224,7 @@ describe("worker completion after cancellation intent", () => {
           }).where(eq(generationJobs.id, jobId));
           return response;
         }
-        if (path === "/prompt" && scenario !== "known-completed") {
+        if (path === "/prompt" && scenario !== "known-completed" && scenario !== "prewrite-timeout") {
           const record = body as { extra_data?: { correlation_id?: string } };
           const correlationId = record.extra_data?.correlation_id;
           this.correlationId = correlationId;
@@ -249,6 +250,8 @@ describe("worker completion after cancellation intent", () => {
       promptId,
       submitError: scenario === "timeout-discovers-running" || scenario === "timeout-stays-unknown"
         ? new Error("submission timeout")
+        : scenario === "prewrite-timeout"
+          ? new ComfyUIOperationDeadlineError("definitely-not-submitted")
         : undefined,
       queueRunning: scenario === "known-completed" ? [{ prompt_id: promptId }] : [],
       history: scenario === "known-completed" || scenario === "completion-wins-after-queue-absence" ? {
@@ -289,7 +292,8 @@ describe("worker completion after cancellation intent", () => {
     });
     mocks.renewResourceSlot.mockResolvedValue(true);
     mocks.releaseResourceSlot.mockResolvedValue(true);
-    mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: async () => undefined });
+    const inputCleanup = vi.fn(async () => undefined);
+    mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: inputCleanup });
     mocks.bindWorkflow.mockReturnValue({ "1": { class_type: "KSampler", inputs: {} } });
     mocks.loadActiveWorkflowPackage.mockResolvedValue({
       revision: { environmentLockDigest: "lock:test" },
@@ -346,6 +350,7 @@ describe("worker completion after cancellation intent", () => {
       get cancellationDispatchDelayMs() {
         return cancellationDispatchAtMs === null ? null : cancellationDispatchAtMs - now;
       },
+      inputCleanup,
     };
   }
 
@@ -396,6 +401,21 @@ describe("worker completion after cancellation intent", () => {
     );
   });
 
+  it("retains the external prompt identity and leases when output streaming hits a deadline", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    mocks.streamCommitArtifact.mockRejectedValueOnce(
+      new ComfyUIOperationDeadlineError("definitely-complete"),
+    );
+
+    await expect(arranged.execute()).rejects.toThrow(/execution_callback_persistence_failed/);
+
+    const [attempt] = await db.select().from(generationAttempts)
+      .where(eq(generationAttempts.jobId, arranged.jobId));
+    expect(attempt.externalJobId).toBe("cancel-completed-prompt");
+    expect(arranged.inputCleanup).not.toHaveBeenCalled();
+    expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+  });
+
   it.each(["0", "-1", "NaN", "3, 4"])("rejects invalid Content-Length %s", async (contentLength) => {
     const arranged = await arrangeExecution("known-completed", { "content-length": contentLength });
     await expect(arranged.execute()).rejects.toThrow(/execution_callback_persistence_failed/);
@@ -437,6 +457,7 @@ describe("worker completion after cancellation intent", () => {
       claimDisposition: "release-terminal",
     });
     expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    expect(arranged.inputCleanup).not.toHaveBeenCalled();
     const events = await db.select().from(generationEvents)
       .where(eq(generationEvents.jobId, arranged.jobId));
     expect(events.filter((event) => event.eventType === "external_cancellation_confirmed")).toHaveLength(0);
@@ -474,11 +495,27 @@ describe("worker completion after cancellation intent", () => {
       claimDisposition: "release-terminal",
     });
     expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    expect(arranged.inputCleanup).not.toHaveBeenCalled();
     const events = await db.select().from(generationEvents)
       .where(eq(generationEvents.jobId, arranged.jobId));
     expect(events.some((event) => event.eventType === "external_cancellation_confirmed")).toBe(false);
     expect(events.some((event) => event.eventType === "job_cancelled")).toBe(false);
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
       .toBe("NEEDS_ATTENTION");
+  });
+
+  it("releases inputs and the resource after a proven pre-write submission timeout", async () => {
+    const arranged = await arrangeExecution("prewrite-timeout");
+
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({
+      success: false,
+      finalPhase: "FAILED",
+      needsAttention: false,
+      claimDisposition: "release-terminal",
+    });
+    expect(arranged.inputCleanup).toHaveBeenCalledOnce();
+    expect(mocks.releaseResourceSlot).toHaveBeenCalledOnce();
   });
 });
