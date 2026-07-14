@@ -33,6 +33,8 @@ describe("worker terminal transitions", () => {
 
   beforeEach(async () => {
     secondConnection.exec("DROP TRIGGER IF EXISTS reject_terminal_event");
+    secondConnection.exec("DROP TRIGGER IF EXISTS ignore_terminal_job_update");
+    secondConnection.exec("DROP TRIGGER IF EXISTS ignore_terminal_attempt_update");
     await db.delete(generationEvents);
     await db.delete(generationAttempts);
     await db.delete(generationJobs);
@@ -191,6 +193,67 @@ describe("worker terminal transitions", () => {
       event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },
     })).toThrow(/event rejected/);
 
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job.status).toBe("CANCEL_REQUESTED");
+    expect(attempt.phase).toBe("CANCEL_REQUESTED");
+    expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+  });
+
+  it.each([
+    { jobStatus: "SUCCEEDED", attemptPhase: "SUCCEEDED", eventType: "job_succeeded" },
+    { jobStatus: "FAILED", attemptPhase: "FAILED", eventType: "job_failed" },
+    { jobStatus: "CANCELLED", attemptPhase: "CANCELLED", eventType: "job_cancelled" },
+  ] as const)(
+    "rolls back the $attemptPhase attempt when the terminal job update affects zero rows",
+    async ({ jobStatus, attemptPhase, eventType }) => {
+      const { now, jobId, attemptId } = await seedOwnedExecution();
+      secondConnection.exec(`
+        CREATE TRIGGER ignore_terminal_job_update BEFORE UPDATE ON generation_jobs
+        WHEN OLD.id = '${jobId}'
+        BEGIN SELECT RAISE(IGNORE); END
+      `);
+
+      const result = finalizeOwnedExecution({
+        jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+      }, {
+        now,
+        expectedJobStatuses: ["CANCEL_REQUESTED"],
+        expectedAttemptPhases: ["CANCEL_REQUESTED"],
+        attemptValues: { phase: attemptPhase, finishedAtMs: now },
+        jobValues: { status: jobStatus, completedAtMs: now },
+        event: { eventType, severity: "info", safePayloadJson: {} },
+      });
+
+      expect(result).toEqual({ status: "lost-race" });
+      const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+      const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+      expect(job.status).toBe("CANCEL_REQUESTED");
+      expect(attempt.phase).toBe("CANCEL_REQUESTED");
+      expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+    },
+  );
+
+  it("leaves the job and event unchanged when the terminal attempt update affects zero rows", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    secondConnection.exec(`
+      CREATE TRIGGER ignore_terminal_attempt_update BEFORE UPDATE ON generation_attempts
+      WHEN OLD.id = '${attemptId}'
+      BEGIN SELECT RAISE(IGNORE); END
+    `);
+
+    const result = finalizeOwnedExecution({
+      jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+    }, {
+      now,
+      expectedJobStatuses: ["CANCEL_REQUESTED"],
+      expectedAttemptPhases: ["CANCEL_REQUESTED"],
+      attemptValues: { phase: "CANCELLED", finishedAtMs: now },
+      jobValues: { status: "CANCELLED", completedAtMs: now },
+      event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },
+    });
+
+    expect(result).toEqual({ status: "lost-race" });
     const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
     const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
     expect(job.status).toBe("CANCEL_REQUESTED");

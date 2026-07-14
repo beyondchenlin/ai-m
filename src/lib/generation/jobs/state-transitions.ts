@@ -316,67 +316,72 @@ export function finalizeOwnedExecution(
   },
   database: DB = db,
 ): TransitionResult {
-  return database.transaction((tx) => {
-    const current = tx.select({
-      attemptPhase: generationAttempts.phase,
-      attemptToken: generationAttempts.jobClaimFencingToken,
-      attemptJobId: generationAttempts.jobId,
-      jobStatus: generationJobs.status,
-      currentAttemptId: generationJobs.currentAttemptId,
-      claimOwner: generationJobs.claimOwner,
-      claimUntilMs: generationJobs.claimUntilMs,
-      claimFencingToken: generationJobs.claimFencingToken,
-    }).from(generationAttempts)
-      .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
-      .where(eq(generationAttempts.id, identity.attemptId)).get();
+  try {
+    return database.transaction((tx) => {
+      const current = tx.select({
+        attemptPhase: generationAttempts.phase,
+        attemptToken: generationAttempts.jobClaimFencingToken,
+        attemptJobId: generationAttempts.jobId,
+        jobStatus: generationJobs.status,
+        currentAttemptId: generationJobs.currentAttemptId,
+        claimOwner: generationJobs.claimOwner,
+        claimUntilMs: generationJobs.claimUntilMs,
+        claimFencingToken: generationJobs.claimFencingToken,
+      }).from(generationAttempts)
+        .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+        .where(eq(generationAttempts.id, identity.attemptId)).get();
 
-    if (!current
-      || current.attemptJobId !== identity.jobId
-      || current.currentAttemptId !== identity.attemptId
-      || current.claimOwner !== identity.workerId
-      || current.claimFencingToken !== identity.jobFencingToken
-      || current.attemptToken !== identity.jobFencingToken
-      || current.claimUntilMs === null
-      || current.claimUntilMs < input.now
-      || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
-      return { status: "ownership-lost" } as const;
-    }
-    if (!input.expectedJobStatuses.includes(current.jobStatus)
-      || !input.expectedAttemptPhases.includes(current.attemptPhase)) {
-      return { status: "invalid-transition" } as const;
-    }
+      if (!current
+        || current.attemptJobId !== identity.jobId
+        || current.currentAttemptId !== identity.attemptId
+        || current.claimOwner !== identity.workerId
+        || current.claimFencingToken !== identity.jobFencingToken
+        || current.attemptToken !== identity.jobFencingToken
+        || current.claimUntilMs === null
+        || current.claimUntilMs < input.now
+        || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
+        return { status: "ownership-lost" } as const;
+      }
+      if (!input.expectedJobStatuses.includes(current.jobStatus)
+        || !input.expectedAttemptPhases.includes(current.attemptPhase)) {
+        return { status: "invalid-transition" } as const;
+      }
 
-    const attemptChanged = tx.update(generationAttempts).set({
-      ...input.attemptValues,
-      updatedAtMs: input.now,
-    }).where(and(
-      eq(generationAttempts.id, identity.attemptId),
-      eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
-      eq(generationAttempts.phase, current.attemptPhase),
-    )).returning({ id: generationAttempts.id }).all();
-    if (!attemptChanged[0]) return { status: "lost-race" } as const;
+      const attemptChanged = tx.update(generationAttempts).set({
+        ...input.attemptValues,
+        updatedAtMs: input.now,
+      }).where(and(
+        eq(generationAttempts.id, identity.attemptId),
+        eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
+        eq(generationAttempts.phase, current.attemptPhase),
+      )).returning({ id: generationAttempts.id }).all();
+      if (!attemptChanged[0]) rollbackLostRace();
 
-    const jobChanged = tx.update(generationJobs).set({
-      ...input.jobValues,
-      updatedAtMs: input.now,
-    }).where(and(
-      eq(generationJobs.id, identity.jobId),
-      eq(generationJobs.status, current.jobStatus),
-      eq(generationJobs.currentAttemptId, identity.attemptId),
-      eq(generationJobs.claimOwner, identity.workerId),
-      eq(generationJobs.claimFencingToken, identity.jobFencingToken),
-    )).returning({ id: generationJobs.id }).all();
-    if (!jobChanged[0]) return { status: "lost-race" } as const;
+      const jobChanged = tx.update(generationJobs).set({
+        ...input.jobValues,
+        updatedAtMs: input.now,
+      }).where(and(
+        eq(generationJobs.id, identity.jobId),
+        eq(generationJobs.status, current.jobStatus),
+        eq(generationJobs.currentAttemptId, identity.attemptId),
+        eq(generationJobs.claimOwner, identity.workerId),
+        eq(generationJobs.claimFencingToken, identity.jobFencingToken),
+      )).returning({ id: generationJobs.id }).all();
+      if (!jobChanged[0]) rollbackLostRace();
 
-    tx.insert(generationEvents).values({
-      id: genId(),
-      jobId: identity.jobId,
-      attemptId: identity.attemptId,
-      ...input.event,
-      createdAtMs: input.now,
-    }).run();
-    return { status: "applied" } as const;
-  }, { behavior: "immediate" });
+      tx.insert(generationEvents).values({
+        id: genId(),
+        jobId: identity.jobId,
+        attemptId: identity.attemptId,
+        ...input.event,
+        createdAtMs: input.now,
+      }).run();
+      return { status: "applied" } as const;
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (error instanceof TransitionRollback) return { status: error.transitionStatus };
+    throw error;
+  }
 }
 
 /** Finalize an owned job that has no current attempt, with its event. */
