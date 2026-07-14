@@ -164,7 +164,7 @@ describe("PR-12 fenced two-phase artifact commit", () => {
   it("removes a partial staging file when a download body deadline expires", async () => {
     const execution = await createExecution();
     let stagingPath = "";
-    const deadline = new ComfyUIOperationDeadlineError("definitely-complete");
+    const deadline = new ComfyUIOperationDeadlineError("definitely-submitted");
     const writing = streamCommitArtifact({
       attemptId: execution.attemptId,
       expectedJobClaimFencingToken: 1,

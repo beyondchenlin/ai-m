@@ -1,5 +1,8 @@
 export {
   ComfyUIHttpTransport,
+  ComfyUIOperationError,
+  ComfyUIOperationDeadlineError,
+  parseComfyUIOperationTimeouts,
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
@@ -19,6 +22,8 @@ export type {
   ComfySystemInfo,
   ComfyObjectInfo,
   ComfyWSMessage,
+  ComfyUIOperationOptions,
+  ComfyUISubmissionDisposition,
 } from "./comfyui";
 
 export {

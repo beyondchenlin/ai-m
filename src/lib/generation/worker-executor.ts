@@ -12,6 +12,7 @@ import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import {
   ComfyUIExecutionOrchestrator,
+  ComfyUIOperationError,
   ExecutionCallbackPersistenceError,
   acquireResourceSlot,
   createComfyUITransport,
@@ -22,6 +23,7 @@ import {
   renewResourceSlot,
   streamCommitArtifact,
   materializeWorkflowInputs,
+  parseComfyUIOperationTimeouts,
 } from "@/lib/generation";
 import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
 import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
@@ -154,7 +156,11 @@ export async function executeGenerationJob(
       Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
         ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
         : [],
-      { policyRevision: sha256(backend.networkPolicyJson) },
+      {
+        policyRevision: sha256(backend.networkPolicyJson),
+        ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
+        ...(abortSignal ? { lifecycleSignal: abortSignal } : {}),
+      },
     );
     const activeTransport = transport;
     const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
@@ -265,6 +271,7 @@ export async function executeGenerationJob(
       request: { ...defaults, ...request },
       metadata: job.metadataJson as Record<string, unknown>,
       maxReferenceInputs: workflowPackage.manifest.limits.maxBatch,
+      signal: abortSignal,
     });
     inputCleanup = materialized.cleanup;
     const workflow = bindWorkflow(
@@ -423,7 +430,7 @@ export async function executeGenerationJob(
         key: output.key, nodeId: output.nodeId, field: output.field,
         mediaKind: output.mediaKind, maxItems: output.maxItems,
       })),
-    }, correlationId);
+    }, correlationId, abortSignal);
     const abortListener = () => orchestrator?.stop();
     abortSignal?.addEventListener("abort", abortListener, { once: true });
     try {
@@ -467,7 +474,7 @@ export async function executeGenerationJob(
         return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
       }
       retainResource = retainResource
-        || result.operationOutcome === "submission-uncertain"
+        || result.submissionDisposition === "submission-uncertain"
         || result.needsAttention
         || result.phase === "SUBMISSION_UNKNOWN";
       return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
@@ -479,6 +486,25 @@ export async function executeGenerationJob(
       && (error.transitionStatus === "lost-race" || error.transitionStatus === "ownership-lost")) {
       retainResource = true;
       return ownershipLostResult();
+    }
+    const cleanupOnFailure = error && typeof error === "object"
+      ? (error as { cleanupOnFailure?: unknown }).cleanupOnFailure
+      : undefined;
+    if (typeof cleanupOnFailure === "function") {
+      await Promise.resolve(cleanupOnFailure()).catch(() => undefined);
+    }
+    const materializationCause = typeof cleanupOnFailure === "function"
+      && error instanceof Error
+      && error.cause instanceof ComfyUIOperationError
+      ? error.cause
+      : null;
+    if (materializationCause?.submissionDisposition === "definitely-not-submitted") {
+      retainResource = false;
+      return failJob(
+        job.id, attemptId, workerId, jobFencingToken,
+        "Input upload was not submitted before its operation deadline",
+        "input_upload_not_sent",
+      );
     }
     retainResource = true;
     throw error;

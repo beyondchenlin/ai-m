@@ -13,6 +13,7 @@ import {
   type BackendAddressResolver,
 } from "@/lib/security/network-policy";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { channel } from "node:diagnostics_channel";
 import net from "node:net";
 import tls from "node:tls";
@@ -29,6 +30,39 @@ const CREDENTIAL_IDENTITY_KEY = randomBytes(32);
 const UNDICI_REQUEST_CREATE = channel("undici:request:create");
 const UNDICI_REQUEST_BODY_SENT = channel("undici:request:bodySent");
 const UNDICI_REQUEST_BODY_CHUNK_SENT = channel("undici:request:bodyChunkSent");
+
+interface ComfyUIRequestContext {
+  controller: AbortController;
+  expectedMethod: string;
+  expectedOrigin: string;
+  expectedPath: string;
+  trackedRequest?: object;
+  requestBytesWritten: boolean;
+}
+
+const COMFYUI_REQUEST_CONTEXT = new AsyncLocalStorage<ComfyUIRequestContext>();
+const COMFYUI_REQUESTS = new WeakMap<object, ComfyUIRequestContext>();
+
+UNDICI_REQUEST_CREATE.subscribe((message: unknown) => {
+  const context = COMFYUI_REQUEST_CONTEXT.getStore();
+  const request = (message as { request?: unknown }).request;
+  if (!context || context.trackedRequest || !request || typeof request !== "object") return;
+  const candidate = request as { method?: unknown; origin?: unknown; path?: unknown };
+  if (candidate.method !== context.expectedMethod
+    || candidate.origin !== context.expectedOrigin
+    || candidate.path !== context.expectedPath) return;
+  context.trackedRequest = request;
+  COMFYUI_REQUESTS.set(request, context);
+});
+
+const recordRequestBodyWrite = (message: unknown) => {
+  const request = (message as { request?: unknown }).request;
+  if (!request || typeof request !== "object") return;
+  const context = COMFYUI_REQUESTS.get(request);
+  if (context) context.requestBytesWritten = true;
+};
+UNDICI_REQUEST_BODY_SENT.subscribe(recordRequestBodyWrite);
+UNDICI_REQUEST_BODY_CHUNK_SENT.subscribe(recordRequestBodyWrite);
 
 export function isApprovedRemoteAddress(
   remoteAddress: string | undefined,
@@ -69,6 +103,12 @@ export interface ComfyUIEndpointPolicyOptions {
   resolver?: BackendAddressResolver;
   connectTimeoutMs?: number;
   operationTimeoutMs?: number;
+  resolutionTimeoutMs?: number;
+  probeTimeoutMs?: number;
+  submitTimeoutMs?: number;
+  uploadTimeoutMs?: number;
+  downloadTimeoutMs?: number;
+  lifecycleSignal?: AbortSignal;
   socketFactory?: (options: ComfyUIEndpointDialOptions) => net.Socket | tls.TLSSocket;
   /** @internal Test seam for HTTP agent cleanup coverage. */
   httpAgentFactory?: (connector: ReturnType<typeof buildConnector>) => Agent;
@@ -90,10 +130,42 @@ export interface ComfyUIEndpointDialOptions {
   servername?: string;
 }
 
-export type ComfyUIOperationOutcome =
+export function parseComfyUIOperationTimeouts(
+  networkPolicy: unknown,
+): Pick<ComfyUIEndpointPolicyOptions,
+  "resolutionTimeoutMs" | "probeTimeoutMs" | "submitTimeoutMs" | "uploadTimeoutMs" | "downloadTimeoutMs"> {
+  if (!networkPolicy || typeof networkPolicy !== "object" || Array.isArray(networkPolicy)) return {};
+  const raw = (networkPolicy as Record<string, unknown>).comfyuiOperationTimeouts;
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("comfyuiOperationTimeouts must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  const mapping = {
+    resolutionMs: "resolutionTimeoutMs",
+    probeMs: "probeTimeoutMs",
+    submitMs: "submitTimeoutMs",
+    uploadMs: "uploadTimeoutMs",
+    downloadMs: "downloadTimeoutMs",
+  } as const;
+  const unknown = Object.keys(record).filter((key) => !(key in mapping));
+  if (unknown.length) throw new Error(`Unknown ComfyUI timeout setting: ${unknown.join(", ")}`);
+  const result: Record<string, number> = {};
+  for (const [source, target] of Object.entries(mapping)) {
+    const value = record[source];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 30 * 60_000) {
+      throw new Error(`ComfyUI ${source} must be an integer between 1 and 1800000`);
+    }
+    result[target] = value as number;
+  }
+  return result;
+}
+
+export type ComfyUISubmissionDisposition =
   | "definitely-not-submitted"
   | "submission-uncertain"
-  | "definitely-complete";
+  | "definitely-submitted";
 
 export interface ComfyUIOperationOptions {
   timeoutMs?: number;
@@ -102,7 +174,7 @@ export interface ComfyUIOperationOptions {
 
 export class ComfyUIOperationError extends Error {
   readonly code: string = "comfyui_operation_failed";
-  constructor(message: string, readonly outcome: ComfyUIOperationOutcome, cause?: unknown) {
+  constructor(message: string, readonly submissionDisposition: ComfyUISubmissionDisposition, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "ComfyUIOperationError";
   }
@@ -110,8 +182,8 @@ export class ComfyUIOperationError extends Error {
 
 export class ComfyUIOperationDeadlineError extends ComfyUIOperationError {
   override readonly code = "comfyui_operation_deadline";
-  constructor(outcome: ComfyUIOperationOutcome) {
-    super("ComfyUI operation deadline exceeded", outcome);
+  constructor(submissionDisposition: ComfyUISubmissionDisposition) {
+    super("ComfyUI operation deadline exceeded", submissionDisposition);
     this.name = "ComfyUIOperationDeadlineError";
   }
 }
@@ -233,7 +305,12 @@ export interface ComfyUITransport {
   /** Mutate one allow-listed ComfyUI resource. */
   post(path: string, body: unknown, options?: ComfyUIOperationOptions): Promise<Response>;
   /** Upload a bounded image into the ComfyUI input namespace. */
-  uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }, options?: ComfyUIOperationOptions): Promise<{ name: string; subfolder: string; type: string }>;
+  uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }, options?: ComfyUIOperationOptions): Promise<{
+    name: string;
+    subfolder: string;
+    type: string;
+    cleanup?: () => Promise<void>;
+  }>;
   /** 获取文件 */
   getFile(params: { filename: string; subfolder: string; type: string }, options?: ComfyUIOperationOptions): Promise<Response>;
   /** 建立 WebSocket 连接 */
@@ -267,9 +344,12 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
   private readonly baseUrl: string;
   private readonly controller: AbortController;
   private readonly headers: Readonly<Record<string, string>>;
-  private readonly operationTimeoutMs: number;
-  private readonly createOperationAgent: (signal: AbortSignal) => Agent;
-  private readonly activeOperationAgents = new Set<Agent>();
+  private readonly probeTimeoutMs: number;
+  private readonly submitTimeoutMs: number;
+  private readonly uploadTimeoutMs: number;
+  private readonly downloadTimeoutMs: number;
+  private readonly dispatcher: Agent;
+  private readonly removeLifecycleListener?: () => void;
   private readonly webSocketFactory: ComfyUIWebSocketFactory;
 
   constructor(
@@ -293,13 +373,30 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     if (!Number.isSafeInteger(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > 60_000) {
       throw new Error("ComfyUI connect timeout must be between 1 and 60000 milliseconds");
     }
-    this.operationTimeoutMs = options.operationTimeoutMs ?? 30_000;
-    if (!Number.isSafeInteger(this.operationTimeoutMs) || this.operationTimeoutMs < 1 || this.operationTimeoutMs > 30 * 60_000) {
-      throw new Error("ComfyUI operation timeout must be between 1 and 1800000 milliseconds");
+    const legacyTimeoutMs = options.operationTimeoutMs;
+    const operationTimeout = (name: string, value: number | undefined, fallback: number) => {
+      const timeout = value ?? legacyTimeoutMs ?? fallback;
+      if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 30 * 60_000) {
+        throw new Error(`ComfyUI ${name} timeout must be between 1 and 1800000 milliseconds`);
+      }
+      return timeout;
+    };
+    this.probeTimeoutMs = operationTimeout("probe", options.probeTimeoutMs, 30_000);
+    this.submitTimeoutMs = operationTimeout("submit", options.submitTimeoutMs, 30_000);
+    this.uploadTimeoutMs = operationTimeout("upload", options.uploadTimeoutMs, 5 * 60_000);
+    this.downloadTimeoutMs = operationTimeout("download", options.downloadTimeoutMs, 5 * 60_000);
+    if (options.lifecycleSignal) {
+      const abortLifecycle = () => this.controller.abort(options.lifecycleSignal?.reason);
+      if (options.lifecycleSignal.aborted) abortLifecycle();
+      else {
+        options.lifecycleSignal.addEventListener("abort", abortLifecycle, { once: true });
+        this.removeLifecycleListener = () => options.lifecycleSignal?.removeEventListener("abort", abortLifecycle);
+      }
     }
     const authorityHostname = canonicalizeUrlHostname(new URL(this.baseUrl).hostname);
     let nextAddress = 0;
-    const createConnector = (operationSignal?: AbortSignal): ReturnType<typeof buildConnector> => (connectOptions, callback) => {
+    const createConnector = (): ReturnType<typeof buildConnector> => (connectOptions, callback) => {
+      const operationSignal = COMFYUI_REQUEST_CONTEXT.getStore()?.controller.signal;
       const port = Number(connectOptions.port) || (connectOptions.protocol === "https:" ? 443 : 80);
       const startIndex = nextAddress++ % addresses.length;
       const candidates = addresses.map((_, index) => addresses[(startIndex + index) % addresses.length]);
@@ -414,8 +511,11 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       tryNext();
     };
     const connector = createConnector();
-    this.createOperationAgent = (signal) => options.httpAgentFactory?.(createConnector(signal))
-      ?? new Agent({ connect: createConnector(signal) });
+    this.dispatcher = options.httpAgentFactory?.(connector) ?? new Agent({
+      connect: connector,
+      connections: 4,
+      pipelining: 1,
+    });
     const policyDigest = createHash("sha256").update(JSON.stringify({
       endpoint: this.baseUrl,
       addresses: [...canonicalAddresses].sort(),
@@ -451,34 +551,27 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     return `${this.baseUrl}${path}`;
   }
 
-  private closeOperationAgent(agent: Agent): void {
-    if (!this.activeOperationAgents.delete(agent)) return;
-    closeAgentSafely(agent);
-  }
-
   private async request(
     url: string,
     init: NonNullable<Parameters<typeof undiciFetch>[1]>,
-    outcome: ComfyUIOperationOutcome,
+    submissionDisposition: ComfyUISubmissionDisposition,
+    defaultTimeoutMs: number,
     options: ComfyUIOperationOptions = {},
   ): Promise<Response> {
-    const timeoutMs = options.timeoutMs ?? this.operationTimeoutMs;
+    const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30 * 60_000) {
       throw new Error("ComfyUI operation timeout must be between 1 and 1800000 milliseconds");
     }
     const controller = new AbortController();
-    const operationAgent = this.createOperationAgent(controller.signal);
-    this.activeOperationAgents.add(operationAgent);
-    const tracksSubmission = outcome === "submission-uncertain";
-    let trackedRequest: object | undefined;
-    let requestBytesWritten = false;
-    const onRequestCreate = (message: unknown) => {
-      const request = (message as { request?: unknown }).request;
-      if (!trackedRequest && request && typeof request === "object") trackedRequest = request;
+    const requestUrl = new URL(url);
+    const context: ComfyUIRequestContext = {
+      controller,
+      expectedMethod: String(init.method ?? "GET").toUpperCase(),
+      expectedOrigin: requestUrl.origin,
+      expectedPath: `${requestUrl.pathname}${requestUrl.search}`,
+      requestBytesWritten: false,
     };
-    const onRequestBodySent = (message: unknown) => {
-      if ((message as { request?: unknown }).request === trackedRequest) requestBytesWritten = true;
-    };
+    const tracksSubmission = submissionDisposition === "submission-uncertain";
     const sources = [this.controller.signal, options.signal].filter((signal): signal is AbortSignal => Boolean(signal));
     const removeListeners: Array<() => void> = [];
     let deadlineError: ComfyUIOperationDeadlineError | undefined;
@@ -488,7 +581,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       cleaned = true;
       clearTimeout(timer);
       for (const remove of removeListeners) remove();
-      this.closeOperationAgent(operationAgent);
     };
     const forwardAbort = (signal: AbortSignal) => {
       if (!controller.signal.aborted) controller.abort(signal.reason);
@@ -502,39 +594,31 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       signal.addEventListener("abort", listener, { once: true });
       removeListeners.push(() => signal.removeEventListener("abort", listener));
     }
-    if (tracksSubmission) {
-      UNDICI_REQUEST_CREATE.subscribe(onRequestCreate);
-      UNDICI_REQUEST_BODY_SENT.subscribe(onRequestBodySent);
-      UNDICI_REQUEST_BODY_CHUNK_SENT.subscribe(onRequestBodySent);
-      removeListeners.push(() => UNDICI_REQUEST_BODY_SENT.unsubscribe(onRequestBodySent));
-      removeListeners.push(() => UNDICI_REQUEST_BODY_CHUNK_SENT.unsubscribe(onRequestBodySent));
-    }
-    const deadlineOutcome = (): ComfyUIOperationOutcome => {
-      if (!tracksSubmission) return outcome;
-      return trackedRequest && !requestBytesWritten ? "definitely-not-submitted" : "submission-uncertain";
+    const deadlineDisposition = (): ComfyUISubmissionDisposition => {
+      if (!tracksSubmission) return submissionDisposition;
+      return context.trackedRequest && !context.requestBytesWritten
+        ? "definitely-not-submitted"
+        : "submission-uncertain";
     };
     const classifyFailure = (error: unknown): unknown => {
       if (deadlineError) return deadlineError;
       if (!tracksSubmission || error instanceof ComfyUIOperationError) return error;
-      return new ComfyUIOperationError("ComfyUI submission operation failed", deadlineOutcome(), error);
+      return new ComfyUIOperationError("ComfyUI submission operation failed", deadlineDisposition(), error);
     };
     const timer = setTimeout(() => {
-      deadlineError = new ComfyUIOperationDeadlineError(deadlineOutcome());
+      deadlineError = new ComfyUIOperationDeadlineError(deadlineDisposition());
       controller.abort(deadlineError);
       cleanup();
     }, timeoutMs);
     try {
-      let responsePromise: ReturnType<typeof undiciFetch>;
-      try {
-        responsePromise = undiciFetch(url, {
+      const response = await COMFYUI_REQUEST_CONTEXT.run(
+        context,
+        () => undiciFetch(url, {
           ...init,
           signal: controller.signal,
-          dispatcher: operationAgent,
-        });
-      } finally {
-        if (tracksSubmission) UNDICI_REQUEST_CREATE.unsubscribe(onRequestCreate);
-      }
-      const response = await responsePromise;
+          dispatcher: this.dispatcher,
+        }),
+      );
       if (!response.body) {
         cleanup();
         return response as unknown as Response;
@@ -570,11 +654,17 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
           }
         },
       });
-      return new Response(body, {
+      const wrapped = new Response(body, {
         status: response.status,
         statusText: response.statusText,
         headers: Array.from(response.headers.entries()),
       });
+      Object.defineProperties(wrapped, {
+        url: { value: response.url, enumerable: true },
+        redirected: { value: response.redirected, enumerable: true },
+        type: { value: response.type, enumerable: true },
+      });
+      return wrapped;
     } catch (error) {
       cleanup();
       throw classifyFailure(error);
@@ -590,7 +680,7 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       method: "GET",
       headers: this.headers,
       redirect: "manual",
-    }, "definitely-not-submitted", options);
+    }, "definitely-not-submitted", this.probeTimeoutMs, options);
   }
 
   async post(path: string, body: unknown, options: ComfyUIOperationOptions = {}): Promise<Response> {
@@ -601,7 +691,8 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       headers: { ...this.headers, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       redirect: "manual",
-    }, path === "/prompt" ? "submission-uncertain" : "definitely-not-submitted", options);
+    }, path === "/prompt" ? "submission-uncertain" : "definitely-not-submitted",
+    path === "/prompt" ? this.submitTimeoutMs : this.probeTimeoutMs, options);
   }
 
   async uploadImage(input: { filename: string; bytes: Uint8Array; mimeType: string; subfolder?: string }, options: ComfyUIOperationOptions = {}): Promise<{ name: string; subfolder: string; type: string }> {
@@ -618,8 +709,11 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     if (input.subfolder) form.set("subfolder", input.subfolder);
     const response = await this.request(this.url("/upload/image"), {
       method: "POST", headers: this.headers, body: form, redirect: "manual",
-    }, "definitely-not-submitted", options);
-    if (!response.ok) throw new Error(`ComfyUI image upload failed (${response.status})`);
+    }, "definitely-not-submitted", this.uploadTimeoutMs, options);
+    if (!response.ok) {
+      await discardResponseBody(response);
+      throw new Error(`ComfyUI image upload failed (${response.status})`);
+    }
     const result = await readJsonLimited<Record<string, unknown>>(response, 256 * 1024);
     const name = typeof result.name === "string" ? result.name : "";
     const subfolder = typeof result.subfolder === "string" ? result.subfolder : "";
@@ -639,7 +733,7 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       method: "GET",
       headers: this.headers,
       redirect: "manual",
-    }, "definitely-complete", options);
+    }, "definitely-submitted", this.downloadTimeoutMs, options);
   }
 
   getWebSocketFactory(): ComfyUIWebSocketFactory {
@@ -651,12 +745,15 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
   }
 
   async interrupt(): Promise<void> {
-    await this.post("/interrupt", {});
+    const response = await this.post("/interrupt", {});
+    await discardResponseBody(response);
+    if (!response.ok) throw new Error(`ComfyUI interrupt failed (${response.status})`);
   }
 
   close(): void {
     this.cancel();
-    for (const agent of [...this.activeOperationAgents]) this.closeOperationAgent(agent);
+    this.removeLifecycleListener?.();
+    closeAgentSafely(this.dispatcher);
   }
 
 }
@@ -714,11 +811,15 @@ export async function submitPrompt(
   const response = await transport.post("/prompt", body, options);
 
   if (!response.ok) {
-    const text = await readTextLimited(response, 64 * 1024);
-    throw new Error(`ComfyUI prompt submission failed (${response.status}): ${text}`);
+    await readTextLimited(response, 64 * 1024);
+    throw new ComfyUIOperationError(
+      `ComfyUI prompt submission failed (${response.status})`,
+      "definitely-not-submitted",
+    );
   }
 
-  const raw = await readJsonLimited<Record<string, unknown>>(response, 2 * 1024 * 1024);
+  try {
+    const raw = await readJsonLimited<Record<string, unknown>>(response, 2 * 1024 * 1024);
 
   // ComfyUI 原生返回 snake_case，统一映射到本地 camelCase 类型
   const promptId = typeof raw.prompt_id === "string"
@@ -752,34 +853,60 @@ export async function submitPrompt(
     throw new Error(`ComfyUI workflow validation errors: ${errors}`);
   }
 
-  const result: ComfyPromptResponse = { promptId, number, queueRemaining };
+    const result: ComfyPromptResponse = { promptId, number, queueRemaining };
 
-  return result;
+    return result;
+  } catch (error) {
+    if (error instanceof ComfyUIOperationError) throw error;
+    throw new ComfyUIOperationError(
+      "ComfyUI accepted the submission but returned an invalid acknowledgement",
+      "submission-uncertain",
+      error,
+    );
+  }
+}
+
+async function discardResponseBody(response: Response): Promise<void> {
+  if (!response.body) return;
+  try {
+    await readTextLimited(response, 64 * 1024);
+  } catch {
+    await response.body?.cancel().catch(() => undefined);
+  }
 }
 
 /** 行为探测：获取系统信息 */
-export async function probeSystemInfo(transport: ComfyUITransport): Promise<ComfySystemInfo> {
-  const response = await transport.get("/system_stats");
-  if (!response.ok) throw new Error(`ComfyUI system probe failed (${response.status})`);
+export async function probeSystemInfo(transport: ComfyUITransport, options: ComfyUIOperationOptions = {}): Promise<ComfySystemInfo> {
+  const response = await transport.get("/system_stats", options);
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI system probe failed (${response.status})`);
+  }
   const result = await readJsonLimited<unknown>(response, 1024 * 1024);
   if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("ComfyUI system probe returned an invalid payload");
   return result as ComfySystemInfo;
 }
 
 /** 行为探测：获取节点对象信息 */
-export async function probeObjectInfo(transport: ComfyUITransport): Promise<ComfyObjectInfo> {
-  const response = await transport.get("/object_info");
-  if (!response.ok) throw new Error(`ComfyUI object_info probe failed (${response.status})`);
+export async function probeObjectInfo(transport: ComfyUITransport, options: ComfyUIOperationOptions = {}): Promise<ComfyObjectInfo> {
+  const response = await transport.get("/object_info", options);
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI object_info probe failed (${response.status})`);
+  }
   const result = await readJsonLimited<unknown>(response, 16 * 1024 * 1024);
   if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("ComfyUI object_info probe returned an invalid payload");
   return result as ComfyObjectInfo;
 }
 
 /** Return the exact model filenames exposed by one allow-listed ComfyUI model folder. */
-export async function probeModelFolder(transport: ComfyUITransport, folder: string): Promise<string[]> {
+export async function probeModelFolder(transport: ComfyUITransport, folder: string, options: ComfyUIOperationOptions = {}): Promise<string[]> {
   if (!/^[A-Za-z0-9._-]{1,120}$/.test(folder)) throw new Error("Invalid ComfyUI model folder");
-  const response = await transport.get(`/models/${folder}`);
-  if (!response.ok) throw new Error(`ComfyUI model probe failed (${response.status})`);
+  const response = await transport.get(`/models/${folder}`, options);
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI model probe failed (${response.status})`);
+  }
   const result = await readJsonLimited<unknown>(response, 4 * 1024 * 1024);
   if (!Array.isArray(result) || result.length > 100_000) throw new Error("ComfyUI model probe returned an invalid payload");
   const models = result.map((value) => {
@@ -831,12 +958,16 @@ function normalizeQueueEntry(value: unknown): ComfyQueueEntry | null {
 export async function probeQueueStatus(
   transport: ComfyUITransport,
   correlationId?: string,
+  options: ComfyUIOperationOptions = {},
 ): Promise<{
   queueRunning: ComfyQueueEntry[];
   queuePending: ComfyQueueEntry[];
 }> {
-  const response = await transport.get("/queue");
-  if (!response.ok) throw new Error(`ComfyUI queue probe failed (${response.status})`);
+  const response = await transport.get("/queue", options);
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI queue probe failed (${response.status})`);
+  }
   const data = await readJsonLimited<Record<string, unknown>>(response, 8 * 1024 * 1024);
   void correlationId;
   const runningRaw = Array.isArray(data.queue_running) ? data.queue_running : [];
@@ -856,7 +987,10 @@ export async function probeHistory(
 ): Promise<Record<string, ComfyExecutionResult>> {
   if (!/^[A-Za-z0-9._:-]+$/.test(promptId)) throw new Error("Invalid ComfyUI prompt ID");
   const response = await transport.get(`/history/${promptId}`, options);
-  if (!response.ok) throw new Error(`ComfyUI history probe failed (${response.status})`);
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI history probe failed (${response.status})`);
+  }
   void correlationId;
   return readJsonLimited<Record<string, ComfyExecutionResult>>(response, 16 * 1024 * 1024);
 }
@@ -874,11 +1008,33 @@ export async function createComfyUITransport(
   }
 
   // SSRF 防护
-  const validation = await validateBackendUrlResolved(
-    baseUrl,
-    topology as import("@/lib/security/network-policy").BackendTopology,
-    options.resolver,
-  );
+  const resolutionTimeoutMs = options.resolutionTimeoutMs ?? options.operationTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(resolutionTimeoutMs) || resolutionTimeoutMs < 1 || resolutionTimeoutMs > 30 * 60_000) {
+    throw new Error("ComfyUI resolution timeout must be between 1 and 1800000 milliseconds");
+  }
+  const resolutionController = new AbortController();
+  let resolutionDeadline: ComfyUIOperationDeadlineError | undefined;
+  const abortResolution = () => resolutionController.abort(options.lifecycleSignal?.reason);
+  if (options.lifecycleSignal?.aborted) abortResolution();
+  else options.lifecycleSignal?.addEventListener("abort", abortResolution, { once: true });
+  const resolutionTimer = setTimeout(() => {
+    resolutionDeadline = new ComfyUIOperationDeadlineError("definitely-not-submitted");
+    resolutionController.abort(resolutionDeadline);
+  }, resolutionTimeoutMs);
+  let validation: Awaited<ReturnType<typeof validateBackendUrlResolved>>;
+  try {
+    validation = await validateBackendUrlResolved(
+      baseUrl,
+      topology as import("@/lib/security/network-policy").BackendTopology,
+      options.resolver,
+      resolutionController.signal,
+    );
+  } catch (error) {
+    throw resolutionDeadline ?? error;
+  } finally {
+    clearTimeout(resolutionTimer);
+    options.lifecycleSignal?.removeEventListener("abort", abortResolution);
+  }
   if (!validation.valid) {
     throw new Error(`Invalid ComfyUI backend URL: ${validation.errors.join("; ")}`);
   }

@@ -6,7 +6,12 @@
  * 证据强度不足时保持不确定，进入人工处理。
  */
 
-import type { ComfyUITransport, ComfyExecutionResult, ComfyHistoryOutcome } from "./comfyui";
+import type {
+  ComfyUITransport,
+  ComfyExecutionResult,
+  ComfyHistoryOutcome,
+  ComfyUIOperationOptions,
+} from "./comfyui";
 import { classifyComfyHistory, probeHistory, probeQueueStatus } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 
@@ -71,6 +76,7 @@ export async function reconcileSubmission(
   _features: BackendFeatureSnapshot,
   _config: Partial<ReconciliationConfig> = {},
   correlationId?: string,
+  operationOptions: ComfyUIOperationOptions = {},
 ): Promise<ReconciliationResult> {
   const evidence: ReconciliationEvidence[] = [];
   const now = Date.now();
@@ -84,7 +90,7 @@ export async function reconcileSubmission(
   // 提交响应丢失时，先通过关联编号发现外部任务编号
   if (!externalJobId && correlationId) {
     try {
-      const queue = await probeQueueStatus(transport, correlationId);
+      const queue = await probeQueueStatus(transport, correlationId, operationOptions);
       const running = queue.queueRunning ?? [];
       const pending = queue.queuePending ?? [];
       const match = running.find((q) => q.correlationId === correlationId) ??
@@ -120,7 +126,7 @@ export async function reconcileSubmission(
   }
 
   try {
-    const history = await probeHistory(transport, resolvedExternalJobId, correlationId);
+    const history = await probeHistory(transport, resolvedExternalJobId, correlationId, operationOptions);
     if (history[resolvedExternalJobId]) {
       foundInHistory = true;
       executionResult = history[resolvedExternalJobId];
@@ -148,7 +154,7 @@ export async function reconcileSubmission(
   }
 
   try {
-    const queue = await probeQueueStatus(transport, correlationId);
+    const queue = await probeQueueStatus(transport, correlationId, operationOptions);
     const running = queue.queueRunning ?? [];
     const pending = queue.queuePending ?? [];
 

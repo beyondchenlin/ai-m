@@ -21,7 +21,7 @@ import {
   installFakeWebSocket,
   jsonResponse,
 } from "@/lib/test-helpers/fake-comfyui";
-import { ComfyUIOperationDeadlineError } from "@/lib/generation/transports/comfyui";
+import { ComfyUIOperationDeadlineError, ComfyUIOperationError } from "@/lib/generation/transports/comfyui";
 
 const mocks = vi.hoisted(() => ({
   acquireResourceSlot: vi.fn(),
@@ -110,8 +110,10 @@ describe("worker completion after cancellation intent", () => {
 
   async function arrangeExecution(
     scenario: "known-completed" | "completion-wins-after-queue-absence"
-      | "timeout-discovers-running" | "timeout-stays-unknown" | "prewrite-timeout",
+      | "timeout-discovers-running" | "timeout-stays-unknown" | "prewrite-timeout"
+      | "materialize-prewrite-timeout",
     fileHeaders?: HeadersInit,
+    networkPolicyJson: Record<string, unknown> = {},
   ) {
     const now = Date.now();
     const poolId = crypto.randomUUID();
@@ -135,7 +137,7 @@ describe("worker completion after cancellation intent", () => {
       authType: "none",
       authConfigJson: {},
       tlsConfigJson: {},
-      networkPolicyJson: {},
+      networkPolicyJson,
       resourcePoolId: poolId,
       capabilitiesJson: {},
       environmentFingerprint: "env:test",
@@ -248,8 +250,10 @@ describe("worker completion after cancellation intent", () => {
 
     const transport = new CancellationRaceTransport({
       promptId,
-      submitError: scenario === "timeout-discovers-running" || scenario === "timeout-stays-unknown"
+      submitError: scenario === "timeout-discovers-running"
         ? new Error("submission timeout")
+        : scenario === "timeout-stays-unknown"
+          ? new ComfyUIOperationError("invalid submission acknowledgement", "submission-uncertain")
         : scenario === "prewrite-timeout"
           ? new ComfyUIOperationDeadlineError("definitely-not-submitted")
         : undefined,
@@ -293,7 +297,17 @@ describe("worker completion after cancellation intent", () => {
     mocks.renewResourceSlot.mockResolvedValue(true);
     mocks.releaseResourceSlot.mockResolvedValue(true);
     const inputCleanup = vi.fn(async () => undefined);
-    mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: inputCleanup });
+    const partialInputCleanup = vi.fn(async () => undefined);
+    if (scenario === "materialize-prewrite-timeout") {
+      mocks.materializeWorkflowInputs.mockRejectedValue(Object.assign(
+        new Error("input materialization failed", {
+          cause: new ComfyUIOperationDeadlineError("definitely-not-submitted"),
+        }),
+        { cleanupOnFailure: partialInputCleanup },
+      ));
+    } else {
+      mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: inputCleanup });
+    }
     mocks.bindWorkflow.mockReturnValue({ "1": { class_type: "KSampler", inputs: {} } });
     mocks.loadActiveWorkflowPackage.mockResolvedValue({
       revision: { environmentLockDigest: "lock:test" },
@@ -351,6 +365,7 @@ describe("worker completion after cancellation intent", () => {
         return cancellationDispatchAtMs === null ? null : cancellationDispatchAtMs - now;
       },
       inputCleanup,
+      partialInputCleanup,
     };
   }
 
@@ -383,6 +398,26 @@ describe("worker completion after cancellation intent", () => {
     expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toEqual({ policyRevision: sha256({}) });
   });
 
+  it("propagates validated backend operation-class timeouts into the production transport", async () => {
+    const networkPolicyJson = {
+      comfyuiOperationTimeouts: {
+        resolutionMs: 2_000, probeMs: 3_000, submitMs: 4_000, uploadMs: 180_000, downloadMs: 240_000,
+      },
+    };
+    const arranged = await arrangeExecution("known-completed", undefined, networkPolicyJson);
+
+    await arranged.execute();
+
+    expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toMatchObject({
+      policyRevision: sha256(networkPolicyJson),
+      resolutionTimeoutMs: 2_000,
+      probeTimeoutMs: 3_000,
+      submitTimeoutMs: 4_000,
+      uploadTimeoutMs: 180_000,
+      downloadTimeoutMs: 240_000,
+    });
+  });
+
   it.each([undefined, "identity"])("binds a %s Content-Length to the artifact writer", async (contentEncoding) => {
     const arranged = await arrangeExecution("known-completed", {
       "content-length": "3", ...(contentEncoding ? { "content-encoding": contentEncoding } : {}),
@@ -404,7 +439,7 @@ describe("worker completion after cancellation intent", () => {
   it("retains the external prompt identity and leases when output streaming hits a deadline", async () => {
     const arranged = await arrangeExecution("known-completed");
     mocks.streamCommitArtifact.mockRejectedValueOnce(
-      new ComfyUIOperationDeadlineError("definitely-complete"),
+      new ComfyUIOperationDeadlineError("definitely-submitted"),
     );
 
     await expect(arranged.execute()).rejects.toThrow(/execution_callback_persistence_failed/);
@@ -516,6 +551,21 @@ describe("worker completion after cancellation intent", () => {
       claimDisposition: "release-terminal",
     });
     expect(arranged.inputCleanup).toHaveBeenCalledOnce();
+    expect(mocks.releaseResourceSlot).toHaveBeenCalledOnce();
+  });
+
+  it("cleans partial materialized inputs and releases the slot after a proven upload pre-write timeout", async () => {
+    const arranged = await arrangeExecution("materialize-prewrite-timeout");
+
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({
+      success: false,
+      finalPhase: "FAILED",
+      needsAttention: false,
+      claimDisposition: "release-terminal",
+    });
+    expect(arranged.partialInputCleanup).toHaveBeenCalledOnce();
     expect(mocks.releaseResourceSlot).toHaveBeenCalledOnce();
   });
 });

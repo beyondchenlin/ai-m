@@ -26,6 +26,7 @@ export interface AddressValidationResult {
 
 export type BackendAddressResolver = (
   hostname: string,
+  signal?: AbortSignal,
 ) => Promise<readonly { address: string; family: 4 | 6 }[]>;
 
 const METADATA_HOSTNAMES = new Set([
@@ -199,6 +200,7 @@ export async function validateBackendUrlResolved(
   topology: BackendTopology,
   resolver: BackendAddressResolver = async (hostname) => (await lookup(hostname, { all: true, verbatim: true }))
     .filter((entry): entry is { address: string; family: 4 | 6 } => entry.family === 4 || entry.family === 6),
+  signal?: AbortSignal,
 ): Promise<AddressValidationResult> {
   const initial = validateBackendUrl(baseUrl, topology);
   if (!initial.valid) return { valid: false, resolvedAddresses: [], errors: [initial.error ?? "Invalid URL"] };
@@ -210,8 +212,19 @@ export async function validateBackendUrlResolved(
     addresses = [hostname];
   } else {
     try {
-      addresses = (await resolver(hostname)).map((entry) => entry.address);
+      if (signal?.aborted) throw signal.reason;
+      const resolved = resolver(hostname, signal);
+      let removeAbortListener: (() => void) | undefined;
+      const aborted = signal && new Promise<never>((_, reject) => {
+        const onAbort = () => reject(signal.reason ?? new Error("Backend resolution aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      });
+      const result = await (aborted ? Promise.race([resolved, aborted]) : resolved)
+        .finally(() => removeAbortListener?.());
+      addresses = result.map((entry) => entry.address);
     } catch {
+      if (signal?.aborted) throw signal.reason;
       return { valid: false, resolvedAddresses: [], errors: ["Backend hostname cannot be resolved"] };
     }
   }

@@ -45,6 +45,9 @@ export type {
 } from "./workflows";
 export {
   ComfyUIHttpTransport,
+  ComfyUIOperationError,
+  ComfyUIOperationDeadlineError,
+  parseComfyUIOperationTimeouts,
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
@@ -78,6 +81,8 @@ export type {
   ComfySystemInfo,
   ComfyObjectInfo,
   ComfyWSMessage,
+  ComfyUIOperationOptions,
+  ComfyUISubmissionDisposition,
   BackendFeatureSnapshot,
   ExternalIdStrategy,
   CancellationCapabilities,
@@ -113,5 +118,5 @@ export {
   ContenType,
 } from "./archiving";
 export type { ArtifactStreamInput, ArtifactCommitResult } from "./archiving";
-export { materializeWorkflowInputs } from "./input-materializer";
+export { InputMaterializationError, materializeWorkflowInputs } from "./input-materializer";
 export type { MaterializedWorkflowInput } from "./input-materializer";

@@ -198,6 +198,13 @@ export interface MaterializedWorkflowInput {
   cleanup(): Promise<void>;
 }
 
+export class InputMaterializationError extends Error {
+  constructor(cause: unknown, readonly cleanupOnFailure: () => Promise<void>) {
+    super("Input materialization failed", { cause });
+    this.name = "InputMaterializationError";
+  }
+}
+
 export async function materializeWorkflowInputs(input: {
   job: typeof generationJobs.$inferSelect;
   attemptId: string;
@@ -206,9 +213,17 @@ export async function materializeWorkflowInputs(input: {
   request: Record<string, unknown>;
   metadata: Record<string, unknown>;
   maxReferenceInputs?: number;
+  signal?: AbortSignal;
 }): Promise<MaterializedWorkflowInput> {
   const parameters = structuredClone(input.request);
   const cleanupPaths: string[] = [];
+  const cleanupActions: Array<() => Promise<void>> = [];
+  const cleanup = async () => {
+    for (const action of cleanupActions.splice(0).reverse()) await action().catch(() => undefined);
+    const dirs = [...new Set(cleanupPaths.map((file) => path.dirname(file)))].sort((a, b) => b.length - a.length);
+    for (const file of cleanupPaths.splice(0)) await fs.rm(file, { force: true }).catch(() => undefined);
+    for (const dir of dirs) await fs.rmdir(dir).catch(() => undefined);
+  };
   const referenceRows = Array.isArray(input.metadata.referenceImages)
     ? input.metadata.referenceImages.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
     : [];
@@ -217,7 +232,9 @@ export async function materializeWorkflowInputs(input: {
   if (referenceRows.length > maxReferenceInputs) throw new Error(`Too many reference inputs; maximum is ${maxReferenceInputs}`);
   let referenceIndex = 0;
 
-  for (const binding of input.compiled.bindings) {
+  try {
+    for (const binding of input.compiled.bindings) {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("Input materialization aborted");
     const source = binding.source ?? "request";
     if (source === "request" || parameters[binding.key] !== undefined) continue;
     if (source === "reference-image") {
@@ -229,7 +246,11 @@ export async function materializeWorkflowInputs(input: {
           if (!artifact.mimeType.startsWith("image/")) throw new Error("Reference artifact is not an image");
           const bytes = await readBoundedArtifact(artifact, 20 * 1024 * 1024);
           const name = `${artifact.sha256}.${extensionForMime(artifact.mimeType)}`;
-          const result = await input.transport.uploadImage({ filename: name, bytes, mimeType: artifact.mimeType, subfolder: `ai-m/${input.job.id}/${input.attemptId}` });
+          const result = await input.transport.uploadImage(
+            { filename: name, bytes, mimeType: artifact.mimeType, subfolder: `ai-m/${input.job.id}/${input.attemptId}` },
+            { signal: input.signal },
+          );
+          if (result.cleanup) cleanupActions.push(result.cleanup);
           uploaded.push(result.subfolder ? `${result.subfolder}/${result.name}` : result.name);
         }
         if (uploaded.length > 0) parameters[binding.key] = uploaded;
@@ -240,7 +261,11 @@ export async function materializeWorkflowInputs(input: {
         if (!artifact.mimeType.startsWith("image/")) throw new Error("Reference artifact is not an image");
         const bytes = await readBoundedArtifact(artifact, 20 * 1024 * 1024);
         const name = `${artifact.sha256}.${extensionForMime(artifact.mimeType)}`;
-        const result = await input.transport.uploadImage({ filename: name, bytes, mimeType: artifact.mimeType, subfolder: `ai-m/${input.job.id}/${input.attemptId}` });
+        const result = await input.transport.uploadImage(
+          { filename: name, bytes, mimeType: artifact.mimeType, subfolder: `ai-m/${input.job.id}/${input.attemptId}` },
+          { signal: input.signal },
+        );
+        if (result.cleanup) cleanupActions.push(result.cleanup);
         parameters[binding.key] = result.subfolder ? `${result.subfolder}/${result.name}` : result.name;
       }
       continue;
@@ -281,14 +306,11 @@ export async function materializeWorkflowInputs(input: {
       cleanupPaths.push(destination);
       parameters[binding.key] = relative;
     }
-  }
+    }
 
-  return {
-    parameters,
-    async cleanup() {
-      for (const file of cleanupPaths) await fs.rm(file, { force: true }).catch(() => undefined);
-      const dirs = [...new Set(cleanupPaths.map((file) => path.dirname(file)))].sort((a, b) => b.length - a.length);
-      for (const dir of dirs) await fs.rmdir(dir).catch(() => undefined);
-    },
-  };
+    return { parameters, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw new InputMaterializationError(error, cleanup);
+  }
 }

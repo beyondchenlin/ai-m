@@ -84,10 +84,10 @@ async function cancelByTaskId(
 ): Promise<CancellationResult> {
   try {
     const response = await transport.post("/queue", { delete: [promptId] });
+    await readTextLimited(response, 16 * 1024).catch(() => "");
 
     if (!response.ok && response.status !== 404 && response.status !== 400) {
-      const text = await readTextLimited(response, 16 * 1024).catch(() => "");
-      throw new Error(`Queue delete failed (${response.status}): ${text.slice(0, 200)}`);
+      throw new Error(`Queue delete failed (${response.status})`);
     }
 
     return {
@@ -160,6 +160,7 @@ async function cancelWithGlobalInterruptVerified(
 async function doGlobalInterrupt(transport: ComfyUITransport): Promise<CancellationResult> {
   try {
     const response = await transport.post("/interrupt", {});
+    await readTextLimited(response, 16 * 1024).catch(() => "");
     if (!response.ok && response.status !== 400) {
       throw new Error(`Interrupt failed (${response.status})`);
     }

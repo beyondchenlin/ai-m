@@ -18,7 +18,7 @@ import {
   submitPrompt,
   probeHistory,
   probeQueueStatus,
-  type ComfyUIOperationOutcome,
+  type ComfyUISubmissionDisposition,
 } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 import {
@@ -167,7 +167,7 @@ export interface OrchestratorResult {
   errorClass?: string;
   cancellationRequested?: boolean;
   needsAttention?: boolean;
-  operationOutcome: ComfyUIOperationOutcome;
+  submissionDisposition: ComfyUISubmissionDisposition;
 }
 
 /**
@@ -203,7 +203,10 @@ export class ComfyUIExecutionOrchestrator {
   private submitTimeMs = 0;
   private reconciliationCount = 0;
   private outputCollected = false;
-  private operationOutcome: ComfyUIOperationOutcome = "definitely-not-submitted";
+  private submissionDisposition: ComfyUISubmissionDisposition = "definitely-not-submitted";
+  private readonly lifecycleSignal?: AbortSignal;
+  private readonly operationController = new AbortController();
+  private readonly removeLifecycleListener?: () => void;
 
   private wsUnregister: (() => void) | null = null;
   private progressListener: (() => void) | null = null;
@@ -214,6 +217,7 @@ export class ComfyUIExecutionOrchestrator {
     callbacks: ExecutionCallbacks = {},
     config: Partial<ExecutionConfig> = {},
     correlationId?: string,
+    lifecycleSignal?: AbortSignal,
   ) {
     this.transport = transport;
     this.features = features;
@@ -221,6 +225,14 @@ export class ComfyUIExecutionOrchestrator {
     this.config = { ...DEFAULT_CONFIG, ...config };
     const socketFactory = transport.getWebSocketFactory();
     this.correlationId = correlationId;
+    this.lifecycleSignal = lifecycleSignal;
+    this.stopped = lifecycleSignal?.aborted ?? false;
+    if (lifecycleSignal?.aborted) this.operationController.abort(lifecycleSignal.reason);
+    else if (lifecycleSignal) {
+      const onAbort = () => this.stop(lifecycleSignal.reason);
+      lifecycleSignal.addEventListener("abort", onAbort, { once: true });
+      this.removeLifecycleListener = () => lifecycleSignal.removeEventListener("abort", onAbort);
+    }
     const lease = connectionManagerRegistry.acquire(socketFactory);
     this.connectionMgr = lease.manager;
     this.clientId = lease.clientId;
@@ -235,11 +247,13 @@ export class ComfyUIExecutionOrchestrator {
    */
   async execute(workflow: Record<string, unknown>): Promise<OrchestratorResult> {
     this.startTimeMs = Date.now();
-    this.stopped = false;
 
     try {
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
       await this.setPhase("SUBMITTING");
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
       await this.connectionMgr.connect();
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
 
       const submitResult = await this.submitWithTimeout(workflow);
       if (!submitResult.success) {
@@ -327,8 +341,9 @@ export class ComfyUIExecutionOrchestrator {
   }
 
   /** 停止编排器（内部使用） */
-  stop(): void {
+  stop(reason?: unknown): void {
     this.stopped = true;
+    if (!this.operationController.signal.aborted) this.operationController.abort(reason);
   }
 
   private async setPhase(phase: OrchestratorPhase): Promise<void> {
@@ -346,9 +361,9 @@ export class ComfyUIExecutionOrchestrator {
         workflow,
         this.clientId,
         this.correlationId,
-        { timeoutMs: this.config.submitTimeoutMs },
+        { timeoutMs: this.config.submitTimeoutMs, signal: this.operationController.signal },
       );
-      this.operationOutcome = "definitely-complete";
+      this.submissionDisposition = "definitely-submitted";
       this.externalJobId = result.promptId;
       await this.callbacks.onExternalJobId?.(result.promptId);
       this.submitTimeMs = Date.now();
@@ -358,8 +373,8 @@ export class ComfyUIExecutionOrchestrator {
       const classification = classifySubmissionError(error);
 
       if (error instanceof ComfyUIOperationError) {
-        this.operationOutcome = error.outcome;
-        if (error.outcome === "definitely-not-submitted") {
+        this.submissionDisposition = error.submissionDisposition;
+        if (error.submissionDisposition === "definitely-not-submitted") {
           this.phase = "FAILED";
           await this.callbacks.onError?.(error, "submission_not_sent");
           return { success: false, needsReconciliation: false };
@@ -374,13 +389,13 @@ export class ComfyUIExecutionOrchestrator {
         error.message.includes("Failed to fetch") ||
         classification.errorClass === "network_error"
       ) {
-        this.operationOutcome = "submission-uncertain";
+        this.submissionDisposition = "submission-uncertain";
         this.submitTimeMs = Date.now();
         return { success: false, needsReconciliation: true };
       }
 
       if (classification.retryable) {
-        this.operationOutcome = "submission-uncertain";
+        this.submissionDisposition = "submission-uncertain";
         return { success: false, needsReconciliation: true };
       }
 
@@ -405,6 +420,7 @@ export class ComfyUIExecutionOrchestrator {
           maxAttempts: this.config.maxReconciliationAttempts,
         },
         this.correlationId,
+        { signal: this.operationController.signal },
       );
 
       // 对账过程中发现了外部任务编号（提交响应丢失场景）
@@ -417,7 +433,7 @@ export class ComfyUIExecutionOrchestrator {
       await this.callbacks.onReconciliation?.(result);
 
       if (result.exists && result.externalStatus) {
-        this.operationOutcome = "definitely-complete";
+        this.submissionDisposition = "definitely-submitted";
         if (result.externalStatus === "queued" || result.externalStatus === "running") {
           return true;
         }
@@ -487,14 +503,16 @@ export class ComfyUIExecutionOrchestrator {
       }
 
       try {
-        const data = await probeQueueStatus(this.transport);
+        const data = await probeQueueStatus(this.transport, undefined, { signal: this.operationController.signal });
         {
           const running = data.queueRunning.some((q) => q.promptId === this.externalJobId);
           if (running) {
             return true;
           }
 
-          const history = await probeHistory(this.transport, this.externalJobId);
+          const history = await probeHistory(
+            this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+          );
           const historyOutcome = classifyComfyHistory(history[this.externalJobId!]);
           if (historyOutcome === "completed") {
             await this.recordHistoryTermination("completed");
@@ -550,7 +568,9 @@ export class ComfyUIExecutionOrchestrator {
       }
 
       try {
-        const history = await probeHistory(this.transport, this.externalJobId);
+        const history = await probeHistory(
+          this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+        );
         const historyOutcome = classifyComfyHistory(history[this.externalJobId]);
         if (historyOutcome === "completed") {
           await this.recordHistoryTermination("completed");
@@ -600,7 +620,7 @@ export class ComfyUIExecutionOrchestrator {
         this.transport,
         this.externalJobId,
         undefined,
-        { timeoutMs: remainingCollectionMs() },
+        { timeoutMs: remainingCollectionMs(), signal: this.operationController.signal },
       );
       const result = history[this.externalJobId];
 
@@ -667,7 +687,10 @@ export class ComfyUIExecutionOrchestrator {
             if (!this.callbacks.onOutputStream) {
               throw new Error("A streaming output consumer is required");
             }
-            const response = await this.transport.getFile(file, { timeoutMs: remainingCollectionMs() });
+            const response = await this.transport.getFile(file, {
+              timeoutMs: remainingCollectionMs(),
+              signal: this.operationController.signal,
+            });
             if (!response.ok || !response.body) {
               throw new Error(`Output download failed (${response.status})`);
             }
@@ -729,7 +752,9 @@ export class ComfyUIExecutionOrchestrator {
     if (!this.externalJobId) return { outcome: "unknown" };
 
     try {
-      const history = await probeHistory(this.transport, this.externalJobId);
+      const history = await probeHistory(
+        this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+      );
       const result = history[this.externalJobId];
       const terminal = this.classifyCancellationHistory(result);
       if (terminal) return terminal;
@@ -738,10 +763,12 @@ export class ComfyUIExecutionOrchestrator {
     }
 
     try {
-      const queue = await probeQueueStatus(this.transport);
+      const queue = await probeQueueStatus(this.transport, undefined, { signal: this.operationController.signal });
       const ids = [...queue.queueRunning, ...queue.queuePending].map((entry) => entry.promptId);
       if (ids.includes(this.externalJobId)) return { outcome: "pending" };
-      const history = await probeHistory(this.transport, this.externalJobId);
+      const history = await probeHistory(
+        this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+      );
       const terminal = this.classifyCancellationHistory(history[this.externalJobId]);
       if (terminal) return terminal;
     } catch {
@@ -817,6 +844,7 @@ export class ComfyUIExecutionOrchestrator {
   }
 
   private cleanup(): void {
+    this.removeLifecycleListener?.();
     if (this.wsUnregister) {
       this.wsUnregister();
       this.wsUnregister = null;
@@ -843,7 +871,7 @@ export class ComfyUIExecutionOrchestrator {
         (this.phase === "FAILED" && (this.reconciliationCount > 0 || this.cancelRequested))
         || (this.stopped && Boolean(this.externalJobId) && this.phase !== "SUCCEEDED" && this.phase !== "CANCELLED"),
       outputs: this.outputCollected ? [] : undefined,
-      operationOutcome: this.operationOutcome,
+      submissionDisposition: this.submissionDisposition,
     };
   }
 }

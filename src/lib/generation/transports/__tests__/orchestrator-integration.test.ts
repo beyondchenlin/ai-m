@@ -5,7 +5,7 @@
  * 提交不确定（SUBMISSION_UNKNOWN）与对账、以及取消路径。
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   ComfyUIExecutionOrchestrator,
   ExecutionCallbackPersistenceError,
@@ -110,6 +110,57 @@ function makeCorrelationTerminalTransport(promptId: string, correlationId: strin
 }
 
 describe("PR-11: 编排器假后端集成", () => {
+  it("does not submit when its lifecycle is already aborted", async () => {
+    const transport = new FakeComfyUITransport({
+      promptId: "must-not-submit",
+      history: makeCompletedHistory("must-not-submit"),
+      fileBytes: pngArrayBuffer,
+    });
+    const post = vi.spyOn(transport, "post");
+    const lifecycle = new AbortController();
+    lifecycle.abort(new Error("ownership lost"));
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {},
+      fastConfig(),
+      "pre-aborted",
+      lifecycle.signal,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(false);
+    expect(post).not.toHaveBeenCalledWith("/prompt", expect.anything(), expect.anything());
+  });
+
+  it("does not submit when ownership is aborted while persisting SUBMITTING", async () => {
+    const transport = new FakeComfyUITransport({
+      promptId: "must-not-submit",
+      history: makeCompletedHistory("must-not-submit"),
+      fileBytes: pngArrayBuffer,
+    });
+    const post = vi.spyOn(transport, "post");
+    const lifecycle = new AbortController();
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onPhaseChange: async (phase) => {
+          if (phase === "SUBMITTING") lifecycle.abort(new Error("ownership lost"));
+        },
+      },
+      fastConfig(),
+      "abort-during-phase",
+      lifecycle.signal,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(false);
+    expect(post).not.toHaveBeenCalledWith("/prompt", expect.anything(), expect.anything());
+  });
+
   let restoreWebSocket: (() => void) | null = null;
 
   beforeEach(() => {
@@ -147,7 +198,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
     expect(result.externalJobId).toBe(promptId);
-    expect(result.operationOutcome).toBe("definitely-complete");
+    expect(result.submissionDisposition).toBe("definitely-submitted");
     expect(outputs).toHaveLength(1);
   });
 
@@ -198,10 +249,31 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result).toMatchObject({
       success: false,
       phase: "FAILED",
-      operationOutcome: "definitely-not-submitted",
+      submissionDisposition: "definitely-not-submitted",
       needsAttention: false,
     });
     expect(reconciliations).toEqual([]);
+  });
+
+  it("reconciles but never resubmits an accepted prompt with an invalid acknowledgement", async () => {
+    const transport = new FakeComfyUITransport({
+      submitError: new ComfyUIOperationError(
+        "ComfyUI accepted the submission but returned an invalid acknowledgement",
+        "submission-uncertain",
+      ),
+    });
+    const post = vi.spyOn(transport, "post");
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {},
+      { ...fastConfig(), maxReconciliationAttempts: 1 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.submissionDisposition).toBe("submission-uncertain");
+    expect(post.mock.calls.filter(([path]) => path === "/prompt")).toHaveLength(1);
   });
 
   it("uses one absolute collection deadline across every output download", async () => {
@@ -294,7 +366,7 @@ describe("PR-11: 编排器假后端集成", () => {
 
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
-    expect(result.operationOutcome).toBe("definitely-complete");
+    expect(result.submissionDisposition).toBe("definitely-submitted");
     expect(result.externalJobId).toBe(promptId);
     expect(reconciliations.length).toBeGreaterThan(0);
     expect(reconciliations[0]).toBe("conclusive");
@@ -326,7 +398,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(false);
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(true);
-    expect(result.operationOutcome).toBe("submission-uncertain");
+    expect(result.submissionDisposition).toBe("submission-uncertain");
     expect(terminalEvidence).toEqual([]);
   });
 

@@ -92,6 +92,38 @@ describe("PR-05: 取消策略", () => {
     expect(result.needsReconciliation).toBe(true);
   });
 
+  it("consumes the status-only cancellation acknowledgement body", async () => {
+    let bodyFinished = false;
+    let pulls = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        if (pulls === 1) controller.enqueue(new TextEncoder().encode("{}"));
+        else {
+          controller.close();
+          bodyFinished = true;
+        }
+      },
+      cancel() { bodyFinished = true; },
+    }), { status: 200 });
+    const transport = { ...mockTransport, post: async () => response };
+
+    await safeCancelJob(transport, sharedFeatures, "test-id", { isShared: true });
+
+    expect(bodyFinished).toBe(true);
+  });
+
+  it("does not expose a cancellation response body in its safe message", async () => {
+    const transport = {
+      ...mockTransport,
+      post: async () => new Response("Bearer cancellation-secret", { status: 500 }),
+    };
+
+    const result = await safeCancelJob(transport, sharedFeatures, "test-id", { isShared: true });
+
+    expect(result.safeMessage).not.toContain("cancellation-secret");
+  });
+
   it("专用后端无按任务取消时尝试全局中断", async () => {
     const dedicatedFeatures: BackendFeatureSnapshot = {
       ...sharedFeatures,
