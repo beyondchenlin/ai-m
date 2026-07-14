@@ -13,6 +13,7 @@ import {
   baselineJournalLessDatabase,
   applyPendingMigrations,
   computeMigrationsManifestDigest,
+  loadValidatedMigrationBundle,
   prepareMigrationJournal,
   resolveMigrationsFolder,
 } from "../index";
@@ -371,5 +372,28 @@ describe("migration journal startup ordering", () => {
       if (previousHash === undefined) delete process.env.AI_M_MIGRATIONS_SHA256; else process.env.AI_M_MIGRATIONS_SHA256 = previousHash;
       fs.rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("executes the frozen bytes that passed validation even if disk changes afterward", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-bundle-snapshot-"));
+    const copy = path.join(directory, "drizzle");
+    fs.cpSync(path.resolve("drizzle"), copy, { recursive: true });
+    try {
+      const bundle = loadValidatedMigrationBundle(copy);
+      expect(Object.isFrozen(bundle)).toBe(true);
+      expect(Object.isFrozen(bundle.migrations)).toBe(true);
+      expect(Object.isFrozen(bundle.migrations[59])).toBe(true);
+      expect(Object.isFrozen(bundle.migrations[59].sql)).toBe(true);
+
+      fs.appendFileSync(path.join(copy, "0059_pr13_review2_hardening.sql"),
+        "\n--> statement-breakpoint\nCREATE TABLE disk_mutation_was_executed (id integer);");
+      const sqlite = new Database(":memory:");
+      sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+      try {
+        expect(applyPendingMigrations(sqlite, bundle.migrations as unknown as typeof repositoryMigrations)).toBe(60);
+        expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='disk_mutation_was_executed'").get())
+          .toBeUndefined();
+      } finally { sqlite.close(); }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 });

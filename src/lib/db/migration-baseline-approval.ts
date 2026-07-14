@@ -22,26 +22,47 @@ function scalar(sqlite: SqliteDatabase, pragma: string): number {
 
 function quoteIdentifier(value: string): string { return `"${value.replace(/"/g, '""')}"`; }
 
+function frame(hash: ReturnType<typeof createHash>, value: string): void {
+  const bytes = Buffer.from(value, "utf8");
+  const length = Buffer.alloc(8);
+  length.writeBigUInt64BE(BigInt(bytes.length));
+  hash.update(length).update(bytes);
+}
+
 function logicalDataDigest(sqlite: SqliteDatabase): string {
   const tables = sqlite.prepare<[], { name: string }>(`
     SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'
       AND name!='__drizzle_migrations' ORDER BY name
   `).all();
-  const snapshot = tables.map(({ name }) => {
+  const hash = createHash("sha256");
+  for (const { name } of tables) {
     const columns = sqlite.prepare<[], { name: string; type: string }>(
       `PRAGMA table_xinfo(${quoteIdentifier(name)})`,
     ).all();
-    const projections = columns.flatMap((column, index) => [
-      `typeof(${quoteIdentifier(column.name)}) AS t${index}`,
-      `quote(${quoteIdentifier(column.name)}) AS q${index}`,
-    ]).join(",");
-    const rows = sqlite.prepare<[], Record<string, string>>(
-      `SELECT ${projections} FROM ${quoteIdentifier(name)}`,
-    ).all().map((row) => columns.map((_column, index) => [row[`t${index}`], row[`q${index}`]]));
-    rows.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-    return { name, columns, rows };
-  });
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+    frame(hash, name);
+    for (const column of columns) {
+      frame(hash, column.name);
+      frame(hash, column.type);
+    }
+    const canonical = columns.map((column) => {
+      const identifier = quoteIdentifier(column.name);
+      return `CASE typeof(${identifier})
+        WHEN 'null' THEN '0:'
+        WHEN 'integer' THEN '1:' || printf('%lld', ${identifier})
+        WHEN 'real' THEN '2:' || printf('%!.26g', ${identifier})
+        WHEN 'text' THEN '3:' || hex(CAST(${identifier} AS BLOB))
+        WHEN 'blob' THEN '4:' || hex(${identifier}) END`;
+    });
+    const projections = canonical.map((expression, index) => `${expression} AS c${index}`).join(",");
+    const orderBy = canonical.join(",");
+    for (const row of sqlite.prepare<[], Record<string, string>>(
+      `SELECT ${projections} FROM ${quoteIdentifier(name)} ORDER BY ${orderBy}`,
+    ).iterate()) {
+      frame(hash, "row");
+      for (let index = 0; index < columns.length; index += 1) frame(hash, row[`c${index}`]);
+    }
+  }
+  return hash.digest("hex");
 }
 
 function inspectBaselineApprovalLocked(
@@ -96,12 +117,32 @@ export async function approveBaseline(
   boundaryCount: number,
   approvalToken: string,
   backupPath: string,
+  afterBackup?: () => void,
 ): Promise<void> {
-  await sqlite.backup(path.resolve(backupPath));
+  const absoluteBackupPath = path.resolve(backupPath);
+  if (absoluteBackupPath === path.resolve(databasePath)) throw new Error("Backup path must differ from the live database");
+  if (fs.existsSync(absoluteBackupPath)) throw new Error("Backup path already exists; refusing to overwrite");
+  await sqlite.backup(absoluteBackupPath);
+  afterBackup?.();
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+  const backup = new Database(absoluteBackupPath, { fileMustExist: true });
+  let backupManifest: BaselineApprovalManifest;
+  try {
+    const integrity = backup.pragma("integrity_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`Backup integrity check failed: ${String(integrity)}`);
+    backupManifest = inspectBaselineApproval(backup, absoluteBackupPath, migrations, boundaryCount);
+  } finally { backup.close(); }
   sqlite.transaction(() => {
     const manifest = inspectBaselineApprovalLocked(sqlite, databasePath, migrations, boundaryCount);
     if (manifest.approvalToken !== approvalToken) {
       throw new Error("Approval token does not match current database identity, prefix, and evidence");
+    }
+    if (backupManifest.evidenceDigest !== manifest.evidenceDigest
+      || backupManifest.dataDigest !== manifest.dataDigest
+      || backupManifest.prefixDigest !== manifest.prefixDigest
+      || backupManifest.journalRowCount !== manifest.journalRowCount) {
+      throw new Error("Backup evidence does not match the locked live database state");
     }
     const insert = sqlite.prepare<[string, number]>(
       'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',

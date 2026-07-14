@@ -36,16 +36,27 @@ export function getSqlite(): SqliteConnection {
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
 
   const sqlite = new Database(absolutePath);
-  // Cache one connection per process in every environment. The worker and web
-  // processes are isolated, while opening a connection for every property
-  // access in production leaks file descriptors and defeats WAL coordination.
-  globalForDb.sqlite = sqlite;
-
   // Web and worker processes share the same SQLite file. Give short-lived
   // writers time to finish instead of surfacing transient SQLITE_BUSY errors.
   sqlite.pragma("busy_timeout = 5000");
-  sqlite.pragma("journal_mode = WAL");
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try {
+      sqlite.pragma("journal_mode = WAL");
+      break;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "SQLITE_BUSY" || Date.now() >= deadline) {
+        sqlite.close();
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
   sqlite.pragma("foreign_keys = ON");
+
+  // Cache one fully configured connection per process. Do not retain a handle
+  // whose initialization failed partway through.
+  globalForDb.sqlite = sqlite;
 
   return sqlite;
 }
@@ -205,34 +216,33 @@ export function prepareMigrationJournal(
   }
 }
 
-export function resolveMigrationsFolder(): string {
-  const configured = process.env.AI_M_MIGRATIONS_DIR;
-  const folder = configured ? path.resolve(configured) : path.resolve(__dirname, "../../../drizzle");
+export type ValidatedMigrationBundle = Readonly<{
+  folder: string;
+  manifestDigest: string;
+  migrations: readonly Readonly<MigrationMetadata>[];
+}>;
+
+function migrationFolderCandidate(): string {
+  return process.env.AI_M_MIGRATIONS_DIR
+    ? path.resolve(process.env.AI_M_MIGRATIONS_DIR)
+    : path.resolve(__dirname, "../../../drizzle");
+}
+
+function readValidatedMigrationBundle(folder: string, expectedManifestDigest?: string): ValidatedMigrationBundle {
   const journalPath = path.join(folder, "meta", "_journal.json");
   if (!fs.existsSync(journalPath)) throw new Error(`Migration journal not found at ${journalPath}`);
   const journalBytes = fs.readFileSync(journalPath);
-  if (configured) {
-    const expectedHash = process.env.AI_M_MIGRATIONS_SHA256?.toLowerCase();
-    const actualHash = computeMigrationsManifestDigest(folder);
-    if (!expectedHash || expectedHash !== actualHash) {
-      throw new Error("Configured migrations directory identity does not match AI_M_MIGRATIONS_SHA256");
-    }
-  }
-  const journal = JSON.parse(journalBytes.toString("utf8")) as { entries?: Array<{ idx: number; tag: string }> };
+  const journal = JSON.parse(journalBytes.toString("utf8")) as {
+    entries?: Array<{ idx: number; tag: string; when: number; breakpoints: boolean }>;
+  };
   const expectedFiles = journal.entries?.map((entry) => `${entry.tag}.sql`) ?? [];
   const actualFiles = fs.readdirSync(folder).filter((name) => name.endsWith(".sql")).sort();
-  if (!journal.entries?.length || journal.entries.some((entry, index) => entry.idx !== index)
+  if (!journal.entries?.length || journal.entries.some((entry, index) => entry.idx !== index
+    || typeof entry.tag !== "string" || !/^\d{4}_[a-z0-9_]+$/i.test(entry.tag)
+    || !Number.isSafeInteger(entry.when) || typeof entry.breakpoints !== "boolean")
     || JSON.stringify([...expectedFiles].sort()) !== JSON.stringify(actualFiles)) {
     throw new Error("Migration journal structure does not match its SQL files");
   }
-  return folder;
-}
-
-export function computeMigrationsManifestDigest(folder: string): string {
-  const journalPath = path.join(folder, "meta", "_journal.json");
-  const journalBytes = fs.readFileSync(journalPath);
-  const journal = JSON.parse(journalBytes.toString("utf8")) as { entries?: Array<{ idx: number; tag: string }> };
-  if (!journal.entries?.length) throw new Error("Migration journal has no entries");
   const hash = createHash("sha256");
   const frame = (name: string, bytes: Buffer) => {
     const nameBytes = Buffer.from(name, "utf8");
@@ -242,11 +252,44 @@ export function computeMigrationsManifestDigest(folder: string): string {
     hash.update(lengths).update(nameBytes).update(bytes);
   };
   frame("meta/_journal.json", journalBytes);
+  const migrations: MigrationMetadata[] = [];
   for (const entry of journal.entries) {
     const name = `${entry.tag}.sql`;
-    frame(name, fs.readFileSync(path.join(folder, name)));
+    const bytes = fs.readFileSync(path.join(folder, name));
+    frame(name, bytes);
+    const source = bytes.toString("utf8");
+    migrations.push(Object.freeze({
+      folderMillis: entry.when,
+      hash: createHash("sha256").update(bytes).digest("hex"),
+      sql: Object.freeze(source.split("--> statement-breakpoint")) as unknown as string[],
+    }));
   }
-  return hash.digest("hex");
+  const manifestDigest = hash.digest("hex");
+  if (expectedManifestDigest !== undefined) {
+    if (!expectedManifestDigest || expectedManifestDigest.toLowerCase() !== manifestDigest) {
+      throw new Error("Configured migrations directory identity does not match AI_M_MIGRATIONS_SHA256");
+    }
+  }
+  return Object.freeze({ folder, manifestDigest, migrations: Object.freeze(migrations) });
+}
+
+export function loadValidatedMigrationBundle(folder = migrationFolderCandidate()): ValidatedMigrationBundle {
+  const resolvedFolder = path.resolve(folder);
+  const configuredFolder = process.env.AI_M_MIGRATIONS_DIR
+    ? path.resolve(process.env.AI_M_MIGRATIONS_DIR)
+    : undefined;
+  const expectedDigest = configuredFolder === resolvedFolder
+    ? (process.env.AI_M_MIGRATIONS_SHA256 ?? "")
+    : undefined;
+  return readValidatedMigrationBundle(resolvedFolder, expectedDigest);
+}
+
+export function resolveMigrationsFolder(): string {
+  return loadValidatedMigrationBundle().folder;
+}
+
+export function computeMigrationsManifestDigest(folder: string): string {
+  return readValidatedMigrationBundle(path.resolve(folder)).manifestDigest;
 }
 
 export function applyPendingMigrations(
@@ -273,13 +316,9 @@ export function applyPendingMigrations(
 
 export function runMigrations() {
   const sqlite = getSqlite();
-  const migrationsFolder = resolveMigrationsFolder();
+  const bundle = loadValidatedMigrationBundle();
   ensureMigrationsTable(sqlite);
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { readMigrationFiles } = require("drizzle-orm/migrator") as {
-    readMigrationFiles: (config: { migrationsFolder: string }) => MigrationMetadata[];
-  };
-  const migrations = readMigrationFiles({ migrationsFolder });
+  const migrations = bundle.migrations as unknown as MigrationMetadata[];
   prepareMigrationJournal(sqlite, migrations);
 
   const confirmedBaselineCount = baselineJournalLessDatabase(sqlite, migrations);
