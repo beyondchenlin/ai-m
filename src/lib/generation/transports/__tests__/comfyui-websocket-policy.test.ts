@@ -85,6 +85,25 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     }
   });
 
+  it("consumes a rejected main HTTP agent close operation", () => {
+    const consumeRejection = vi.fn(() => Promise.resolve());
+    const close = vi.fn(() => ({ catch: consumeRejection }) as unknown as Promise<void>);
+    const transport = new ComfyUIHttpTransport(
+      "http://comfy.policy.test:8188",
+      {},
+      ["127.0.0.1"],
+      {
+        policyRevision: "revision-http-agent-close",
+        httpAgentFactory: () => ({ close }),
+      } as unknown as ConstructorParameters<typeof ComfyUIHttpTransport>[3],
+    );
+
+    transport.close();
+
+    expect(close).toHaveBeenCalledOnce();
+    expect(consumeRejection).toHaveBeenCalledOnce();
+  });
+
   it("fails over from a refused approved address to a healthy approved address", async () => {
     const server = http.createServer((_request, response) => {
       response.setHeader("content-type", "application/json");

@@ -65,6 +65,8 @@ export interface ComfyUIEndpointPolicyOptions {
   resolver?: BackendAddressResolver;
   connectTimeoutMs?: number;
   socketFactory?: (options: ComfyUIEndpointDialOptions) => net.Socket | tls.TLSSocket;
+  /** @internal Test seam for HTTP agent cleanup coverage. */
+  httpAgentFactory?: (connector: ReturnType<typeof buildConnector>) => Agent;
   /** @internal Test seam for synchronous constructor-failure coverage. */
   webSocketAgentFactory?: (connector: ReturnType<typeof buildConnector>) => Agent;
   /** @internal Test seam for synchronous constructor-failure coverage. */
@@ -359,9 +361,7 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       }, connectTimeoutMs);
       tryNext();
     };
-    this.dispatcher = new Agent({
-      connect: connector,
-    });
+    this.dispatcher = options.httpAgentFactory?.(connector) ?? new Agent({ connect: connector });
     const policyDigest = createHash("sha256").update(JSON.stringify({
       endpoint: this.baseUrl,
       addresses: [...canonicalAddresses].sort(),
@@ -479,7 +479,7 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
 
   close(): void {
     this.cancel();
-    void this.dispatcher?.close();
+    if (this.dispatcher) closeAgentSafely(this.dispatcher);
   }
 
 }
