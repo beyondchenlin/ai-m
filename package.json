@@ -1,6 +1,6 @@
 {
   "name": "ai-comic-builder",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "private": true,
   "scripts": {
     "preflight:runtime": "node scripts/runtime-preflight.mjs",

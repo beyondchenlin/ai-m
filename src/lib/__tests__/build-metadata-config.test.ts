@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import packageJson from "../../../package.json";
+
 type EmbeddedConfig = Readonly<Record<string, string>>;
 
 const root = path.resolve(__dirname, "../../..");
@@ -42,7 +44,7 @@ describe("Next build metadata boundary", () => {
     });
 
     expect(embedded).toEqual({
-      AI_M_INTERNAL_EMBEDDED_VERSION: "0.1.0",
+      AI_M_INTERNAL_EMBEDDED_VERSION: packageJson.version,
       AI_M_INTERNAL_EMBEDDED_COMMIT: "abcdef0123456789",
       AI_M_INTERNAL_EMBEDDED_BUILD_TIME: "2026-07-14T12:34:56.000Z",
     });
@@ -58,7 +60,7 @@ describe("Next build metadata boundary", () => {
     });
 
     expect(embedded).toEqual({
-      AI_M_INTERNAL_EMBEDDED_VERSION: "0.1.0",
+      AI_M_INTERNAL_EMBEDDED_VERSION: packageJson.version,
       AI_M_INTERNAL_EMBEDDED_COMMIT: "",
       AI_M_INTERNAL_EMBEDDED_BUILD_TIME: "",
     });
