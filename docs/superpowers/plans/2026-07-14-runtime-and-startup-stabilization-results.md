@@ -1,6 +1,6 @@
 # Runtime and startup stabilization results
 
-Date: 2026-07-14 18:46-19:23 +08:00
+Date: 2026-07-14 18:46-19:40 +08:00
 Evidence commit before this report: `1eef98c`
 Platform: Windows x64
 
@@ -39,7 +39,7 @@ All three commands exited `0`.
 
 Known, repeatable passing-gate output was reviewed rather than silently omitted:
 
-- Vitest prints: `The plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the resolve.tsconfigPaths option. You can remove the plugin and set resolve.tsconfigPaths: true in your Vite config instead.` This is a stable dependency deprecation notice.
+- Vitest prints: `The plugin "vite-tsconfig-paths" is detected. Vite now supports tsconfig paths resolution natively via the resolve.tsconfigPaths option. You can remove the plugin and set resolve.tsconfigPaths: true in your Vite config instead.` This is a stable compatibility/configuration notice.
 - The Windows ACL negative test intentionally prints `Backup file DACL is not current-SID-only FullControl with inheritance removed` and its PowerShell `OperationStopped`/`RuntimeException` context to stderr. The assertion expects that fail-closed rejection; the focused suite still exited `0` with 8/8 tests passing.
 - ESLint's 105 warnings are pre-existing warnings; there were 0 errors and the aggregate static gate exited `0`.
 
@@ -104,18 +104,51 @@ Two harness configuration failures were diagnosed before the successful run and 
 
 The old main-worktree Web process could not be recreated from its current checkout after the production process released port 3000. Its startup reached migrations and then failed with `Migration journal drift at index 0; refusing to guess schema state`. Read-only diagnosis established that the live database was not drifted: all 60 journal rows matched all 60 current migration `(hash, created_at)` pairs exactly when read in insertion (`rowid`) order. Sorting by `created_at, rowid` instead produced the permutation `52,53,1,0,2...51,54...59`, because migrations 0052 and 0053 have earlier timestamps; the old validator therefore rejected a valid journal. No journal row was inserted, updated, deleted, or reordered.
 
-To restore the user interface without changing the real database or the main worktree, the main `.env` was copied temporarily to this reviewed worktree. The copy is ignored, untracked, absent from `git status`, content-identical, and protected with the same effective ACL rules; its contents and digest were never printed. Relative database configuration was resolved back to the main repository only in the child process environment. The reviewed worktree migration directory and its freshly computed manifest digest were also supplied only in that process environment.
+To restore the user interface without changing the real database or the main worktree, the main `.env` was copied temporarily to this reviewed worktree. The copy is ignored, untracked, absent from `git status`, and content-identical; its contents and digest were never printed. Before the final restart, its Windows DACL was protected with inheritance removed, its owner was verified as the current SID, and its single explicit ACE was verified as current-SID-only `Allow FullControl`. Relative database configuration was resolved back to the main repository only in the child process environment. The reviewed worktree migration directory and its freshly computed manifest digest were also supplied only in that process environment.
 
 The reviewed HEAD now provides the temporary port-3000 UI:
 
-- Listener PID: `51988`; its command line resolves to this reviewed worktree.
+- Runtime preflight passed immediately before the final restart.
+- The prior reviewed-worktree Web tree was stopped without touching the main Worker. The replacement was started through the direct local Next CLI with explicit `--hostname 127.0.0.1 --port 3000` arguments.
+- Listener PID: `1636`; its command line resolves to this reviewed worktree.
+- `Get-NetTCPConnection` reported exactly one port-3000 listener at `127.0.0.1`; there was no `0.0.0.0`, `::`, or LAN binding.
 - The startup log contains `[Bootstrap] Ready.`.
-- `GET http://127.0.0.1:3000/zh` returned HTTP 200, contained `lang="zh"`, and had response length 92,920 characters.
+- `GET http://127.0.0.1:3000/zh` returned HTTP 200, contained `lang="zh"`, and had response length 92,929 characters.
 - The original main Worker PIDs `51216` and `46564` remained alive throughout.
 - A post-start read-only check again found 60 journal rows matching 60 migrations exactly in `rowid` order.
-- Exact retained logs: `${TEMP}/ai-m-task4-reviewed-ui-53c4439cb39e4ce88d612e37a3f54164/web.stdout.log` and `${TEMP}/ai-m-task4-reviewed-ui-53c4439cb39e4ce88d612e37a3f54164/web.stderr.log`.
+- No reload or compilation error was found after the HTTP check.
+- Exact retained logs: `${TEMP}/ai-m-task4-loopback-ui-d955f0617e9948ab8c6d97e9c891c8c7/web.stdout.log` and `${TEMP}/ai-m-task4-loopback-ui-d955f0617e9948ab8c6d97e9c891c8c7/web.stderr.log`.
 
 This temporary Web process and ignored `.env` must remain until Task 5 merges the reviewed code into the main checkout and switches port 3000 back to the main worktree. The ignored `.env` must then be removed immediately.
+
+## Minimal sanitized reproduction runbook
+
+Use an isolated `${REPO}` checkout and unique `${TEMP_ROOT}`. Runtime values are injected into child-process environment variables without printing them; no secret belongs in a command line, log, or committed file. The variables include the isolated or explicitly selected database path, storage roots, test identity/admin values, public origins, `${REPO}/drizzle`, and its computed manifest digest.
+
+```text
+cd ${REPO}
+corepack pnpm preflight:runtime
+corepack pnpm quality:static
+corepack pnpm worker:build
+corepack pnpm build
+
+# After secure process-only environment injection:
+${NODE} ${REPO}/node_modules/next/dist/bin/next dev --hostname 127.0.0.1 --port 3000
+Invoke-WebRequest http://127.0.0.1:3000/zh
+Get-NetTCPConnection -State Listen -LocalPort 3000
+Get-CimInstance Win32_Process -Filter "ProcessId=${LISTENER_PID}"
+
+# Bound cleanup: first prove both targets belong to ${REPO}/${TEMP_ROOT}.
+taskkill /PID ${WEB_ROOT_PID} /T /F
+Remove-Item -LiteralPath ${TEMP_ROOT} -Recurse -Force
+
+git diff dev...HEAD --stat
+git diff dev...HEAD --name-status
+git status --short
+git diff --check
+```
+
+Acceptance requires the listener to be only `127.0.0.1:3000`, the reviewed command path to belong to `${REPO}`, `[Bootstrap] Ready.`, `/zh` HTTP 200 with `lang="zh"`, no orphan process after bounded cleanup, and zero archives, environment files, logs, databases/WAL/SHM, backups, dependency/build directories, private keys, binary artifacts, machine-specific absolute paths, or credential values in the committed scope.
 
 ## Build and temporary cleanup
 
@@ -137,7 +170,7 @@ git diff --check
 git rev-list --count dev..HEAD
 ```
 
-Before this correction, `dev...HEAD` contained 24 commits and 26 changed files, with 4,734 insertions and 265 deletions. The tracked worktree was clean, and `git diff --check` passed.
+Before this ACL/binding correction, `dev...HEAD` contained 25 commits and 26 changed files, with 4,761 insertions and 265 deletions. The tracked worktree was clean, and `git diff --check` passed.
 
 Only committed paths in `dev...HEAD` were scanned. Counts were reported by category without printing candidate secret values:
 
