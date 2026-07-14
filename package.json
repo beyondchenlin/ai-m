@@ -23,7 +23,7 @@
     "seed:local-speech": "tsx scripts/seed-local-speech-workflow.ts",
     "promote:local-speech": "tsx scripts/promote-local-speech.ts",
     "typecheck": "node scripts/runtime-preflight.mjs && tsc --noEmit",
-    "worker:build": "esbuild src/worker/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/worker/index.cjs --external:better-sqlite3 --external:sharp",
+    "worker:build": "node scripts/runtime-preflight.mjs && esbuild src/worker/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/worker/index.cjs --external:better-sqlite3 --external:sharp",
     "quality:static": "node scripts/runtime-preflight.mjs && corepack pnpm typecheck && corepack pnpm lint && corepack pnpm test && corepack pnpm test:runtime && corepack pnpm test:validate-examples && corepack pnpm test:migrations && corepack pnpm test:pr12-static && corepack pnpm test:pr13-static",
     "quality": "node scripts/runtime-preflight.mjs && corepack pnpm quality:static && corepack pnpm worker:build && corepack pnpm build",
     "test:migrations": "python tools/test_migrations.py",
