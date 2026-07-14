@@ -89,7 +89,7 @@ export function checkRuntime({
       `Expected Node version: ${expectedNodeVersion ? `v${expectedNodeVersion}` : 'unavailable'}`,
       `Detected pnpm version: ${detectedPnpmVersion || 'unknown'}`,
       `Expected pnpm version: ${EXPECTED_PNPM_VERSION}`,
-      `Recovery: from a Node ${expectedNodeVersion || '22'} shell, run "corepack enable" and "corepack prepare pnpm@${EXPECTED_PNPM_VERSION} --activate", then use "corepack pnpm <command>".`,
+      `Recovery: from a Node ${expectedNodeVersion || '22'} shell, run "corepack enable", "corepack prepare pnpm@${EXPECTED_PNPM_VERSION} --activate", and "corepack pnpm install --frozen-lockfile"; then use "corepack pnpm <command>".`,
     ],
   };
 }
@@ -99,7 +99,15 @@ function main() {
   if (!result.ok) {
     console.error(result.diagnostics.join('\n'));
     process.exitCode = 1;
+    return;
   }
+
+  const pnpmVersion = /(?:^|\s)pnpm\/([^\s]+)/.exec(
+    process.env.npm_config_user_agent ?? '',
+  )?.[1];
+  console.log(
+    `Runtime preflight passed: Node v${cleanVersion(process.version)}; pnpm ${pnpmVersion}.`,
+  );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

@@ -1,10 +1,16 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import path from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { checkRuntime } from '../runtime-preflight.mjs';
 
 const expectedNodeVersion = '22.16.0';
 const expectedPnpmVersion = '10.12.1';
+const scriptsDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const projectRoot = path.resolve(scriptsDirectory, '..');
+const preflightScript = path.join(scriptsDirectory, 'runtime-preflight.mjs');
 
 function check(overrides = {}) {
   return checkRuntime({
@@ -65,7 +71,7 @@ test('rejects an unreadable pnpm launcher', () => {
 
   assert.equal(result.ok, false);
   assert.match(result.diagnostics.join('\n'), /pnpm launcher Node version: unreadable \(access denied\)/);
-  assert.match(result.diagnostics.join('\n'), /corepack pnpm/);
+  assert.match(result.diagnostics.join('\n'), /corepack pnpm install --frozen-lockfile/);
 });
 
 test('accepts a pnpm launcher that reports the pinned Node 22 version', () => {
@@ -78,5 +84,22 @@ test('accepts a pnpm launcher that reports the pinned Node 22 version', () => {
       },
     }),
     { ok: true, diagnostics: [] },
+  );
+});
+
+test('successful CLI execution reports the pinned Node and pnpm versions', () => {
+  const output = execFileSync(process.execPath, [preflightScript], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      npm_config_user_agent: `pnpm/${expectedPnpmVersion} npm/? node/v${expectedNodeVersion} win32 x64`,
+      npm_node_execpath: process.execPath,
+    },
+  });
+
+  assert.equal(
+    output.trim(),
+    `Runtime preflight passed: Node v${expectedNodeVersion}; pnpm ${expectedPnpmVersion}.`,
   );
 });
