@@ -48,7 +48,7 @@ def derive_node_engine(pin_contents: str) -> str:
         pinned_version = pin_contents
 
     match = re.fullmatch(
-        r"(?P<major>0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
+        r"(?P<major>0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",
         pinned_version,
     )
     if not match:

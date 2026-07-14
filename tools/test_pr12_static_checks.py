@@ -43,6 +43,10 @@ class NodeEngineDerivationTests(unittest.TestCase):
             "22",
             "v22.16.0",
             "22.16.0 junk",
+            "2٢.1٦.1٠",
+            "2٢.16.0",
+            "22.1٦.0",
+            "22.16.1٠",
             "",
         ]
 
