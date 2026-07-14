@@ -87,6 +87,7 @@ def main() -> int:
             raise AssertionError(f"model store does not securely scope browser credentials: {token}")
 
     settings = require("src/app/[locale]/settings/page.tsx")
+    settings += require("src/app/[locale]/settings/settings-page-client.tsx")
     if 'capability="speech"' not in settings:
         raise AssertionError("settings page does not expose speech capability")
 
