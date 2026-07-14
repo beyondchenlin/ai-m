@@ -94,6 +94,10 @@ corepack pnpm worker:build
 corepack pnpm worker
 ```
 
+See [Artifact completeness guarantees and limits](docs/artifact-completeness.md) before relying on archived media as evidence of a complete upstream response.
+
+#### Legacy artifact recovery cutoff
+
 During a mixed-version rollout, leave `AI_M_LEGACY_ARTIFACT_RECOVERY_BEFORE_MS` unset so new workers never claim lease-less artifacts from old writers. After every pre-0062 writer is confirmed drained, an operator may set it to an epoch-millisecond cutoff; only legacy rows created at or before that cutoff become eligible for fenced recovery. Invalid or future values fail closed.
 
 ### 构建版本信息
