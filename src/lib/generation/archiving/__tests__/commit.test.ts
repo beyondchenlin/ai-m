@@ -264,12 +264,18 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     });
     await streamStarted;
     let artifact: typeof generationArtifacts.$inferSelect | undefined;
+    let stagedSize = -1;
     for (let retry = 0; retry < 100; retry++) {
       [artifact] = await db.select().from(generationArtifacts);
-      if (artifact) break;
+      const stagingKey = (artifact?.metadataJson as { stagingPath?: string } | undefined)?.stagingPath;
+      stagedSize = stagingKey
+        ? (await fs.stat(resolveArtifactStoragePath(stagingKey)).catch(() => null))?.size ?? -1
+        : -1;
+      if (artifact?.status === "STAGING" && stagedSize === pngBytes.byteLength) break;
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(artifact).toBeDefined();
+    expect(stagedSize).toBe(pngBytes.byteLength);
     await db.update(generationArtifacts).set({
       writerLeaseOwner: "new-owner", writerLeaseToken: "new-token",
       writerLeaseExpiresAtMs: Date.now() - 1,
@@ -282,6 +288,82 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     const [fenced] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, artifact!.id));
     expect(fenced.status).toBe("COMMITTED");
     await expect(fs.readFile(resolveArtifactStoragePath(fenced.storageKey))).resolves.toEqual(Buffer.from(pngBytes));
+  });
+
+  it("removes its exclusively-owned late staging file when recovery already quarantined missing output", async () => {
+    const execution = await createExecution();
+    let releaseOpen!: () => void;
+    let reachedOpen!: (filePath: string) => void;
+    const openRelease = new Promise<void>((resolve) => { releaseOpen = resolve; });
+    const openReached = new Promise<string>((resolve) => { reachedOpen = resolve; });
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1, writerOwner: "late-writer",
+      logicalName: "late.png", kind: ArtifactKind.IMAGE, mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+      read: () => new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(pngBytes); controller.close(); },
+      }),
+    }, {
+      openStagingFile: async (filePath) => {
+        reachedOpen(filePath);
+        await openRelease;
+        return fs.open(filePath, "wx", 0o600);
+      },
+    });
+
+    let stagingPath: string | undefined;
+    try {
+      stagingPath = await Promise.race([
+        openReached,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 250)),
+      ]);
+      expect(stagingPath).toBeDefined();
+      const [artifact] = await db.select().from(generationArtifacts);
+      expect(artifact.status).toBe("STAGING");
+      await expect(fs.stat(stagingPath!)).rejects.toThrow();
+      await db.update(generationArtifacts).set({ writerLeaseExpiresAtMs: Date.now() - 1 })
+        .where(eq(generationArtifacts.id, artifact.id));
+      await expect(recoverStagingArtifacts({ recoveryOwner: "missing-file-recovery" }))
+        .resolves.toEqual({ claimed: 1, committed: 0, quarantined: 1 });
+    } finally {
+      releaseOpen();
+    }
+
+    await expect(writing).rejects.toThrow(/writer lease was lost/i);
+    await expect(fs.stat(stagingPath!)).rejects.toThrow();
+    const [terminal] = await db.select().from(generationArtifacts);
+    expect(terminal.status).toBe("QUARANTINED");
+    await expect(fs.stat(resolveArtifactStoragePath(terminal.storageKey))).rejects.toThrow();
+  });
+
+  it("refuses to publish a staging path that no longer names its opened file", async () => {
+    const execution = await createExecution();
+    let stagingPath = "";
+    let displacedPath = "";
+    const successorBytes = new Uint8Array([...pngBytes, 0xaa]);
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1, writerOwner: "replaced-path-writer",
+      logicalName: "replaced.png", kind: ArtifactKind.IMAGE, mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+      read: () => new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(pngBytes); controller.close(); },
+      }),
+    }, {
+      openStagingFile: async (filePath) => {
+        stagingPath = filePath;
+        displacedPath = `${filePath}.displaced`;
+        const handle = await fs.open(filePath, "wx", 0o600);
+        await fs.rename(filePath, displacedPath);
+        await fs.writeFile(filePath, successorBytes, { flag: "wx", mode: 0o600 });
+        return handle;
+      },
+    });
+
+    await expect(writing).rejects.toThrow(/staging file ownership was lost/i);
+    await expect(fs.readFile(stagingPath)).resolves.toEqual(Buffer.from(successorBytes));
+    const [artifact] = await db.select().from(generationArtifacts);
+    await expect(fs.stat(resolveArtifactStoragePath(artifact.storageKey))).rejects.toThrow();
+    await fs.rm(displacedPath, { force: true });
   });
 
   it("authorizes by project ownership without exposing files cross-user", async () => {

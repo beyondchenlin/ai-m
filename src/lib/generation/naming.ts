@@ -104,6 +104,7 @@ export type ExternalIdStrategy = (typeof ExternalIdStrategy)[keyof typeof Extern
 /** 工件状态 */
 export const ArtifactStatus = {
   STAGING: "STAGING",
+  RECOVERING: "RECOVERING",
   COMMITTED: "COMMITTED",
   QUARANTINED: "QUARANTINED",
   DELETED: "DELETED",

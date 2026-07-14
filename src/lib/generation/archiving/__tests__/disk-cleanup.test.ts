@@ -118,6 +118,18 @@ describe("PR-12 disk cleanup safety", () => {
     await expect(fs.access(file)).rejects.toThrow();
   });
 
+  it("leaves .staging namespaces to token-aware writer and recovery cleanup", async () => {
+    const artifactRoot = path.join(root, "generation-artifacts");
+    const file = path.join(artifactRoot, ".staging", "attempt", "owned.part");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, pngBytes);
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(file, old, old);
+    const stats = await cleanupOrphanedArtifacts(artifactRoot, { orphanGraceMs: 60_000 });
+    expect(stats.deletedFiles).toBe(0);
+    await expect(fs.access(file)).resolves.toBeUndefined();
+  });
+
   it("rejects content beyond the configured stream limit", async () => {
     const { attemptId } = await createMinimalAttempt();
     await expect(commitArtifactFromBuffer(new Uint8Array(1024), {

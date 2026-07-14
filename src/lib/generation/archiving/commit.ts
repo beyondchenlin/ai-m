@@ -1,7 +1,8 @@
 /** Durable, streamed, two-phase media artifact commit. */
 import { createHash } from "node:crypto";
-import { constants as fsConstants, createReadStream, createWriteStream } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
 import { db, type DB } from "@/lib/db";
@@ -74,6 +75,10 @@ export interface ArtifactRecoveryResult {
   quarantined: number;
 }
 
+export interface ArtifactCommitDependencies {
+  openStagingFile?: (filePath: string) => Promise<FileHandle>;
+}
+
 const WRITER_LEASE_MS = 30_000;
 const WRITER_RENEW_INTERVAL_MS = 10_000;
 const RECOVERY_LEASE_MS = 30_000;
@@ -123,13 +128,12 @@ export function validateMagicBytes(header: Uint8Array, mimeType: string): boolea
 
 async function writeWebStreamToFile(
   stream: ReadableStream<Uint8Array>,
-  filePath: string,
+  fileHandle: FileHandle,
   maxBytes: number,
   readTimeoutMs: number,
 ): Promise<{ sizeBytes: number; sha256: string; header: Uint8Array }> {
   const hash = createHash("sha256");
   const reader = stream.getReader();
-  const writer = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
   let sizeBytes = 0;
   let header = new Uint8Array(0);
   try {
@@ -152,17 +156,13 @@ async function writeWebStreamToFile(
         header = combined;
       }
       hash.update(value);
-      if (!writer.write(value)) await new Promise<void>((resolve) => writer.once("drain", resolve));
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const { bytesWritten } = await fileHandle.write(value, offset, value.byteLength - offset, null);
+        if (bytesWritten <= 0) throw new Error("Artifact staging write made no progress");
+        offset += bytesWritten;
+      }
     }
-    await new Promise<void>((resolve, reject) => writer.end((error?: Error | null) => error ? reject(error) : resolve()));
-  } catch (error) {
-    if (!writer.destroyed) {
-      await new Promise<void>((resolve) => {
-        writer.once("close", resolve);
-        writer.destroy();
-      });
-    }
-    throw error;
   } finally {
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
@@ -246,7 +246,37 @@ async function renewWriterLease(
   return Boolean(changed[0]);
 }
 
-export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<ArtifactCommitResult> {
+type OwnedStagingIdentity = Readonly<{ dev: string; ino: string; size: string }>;
+
+function stagingIdentity(stat: Awaited<ReturnType<FileHandle["stat"]>>): OwnedStagingIdentity {
+  return { dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size) };
+}
+
+async function removeOwnedStagingFile(filePath: string, identity: OwnedStagingIdentity): Promise<void> {
+  const current = await fs.lstat(filePath).catch(() => null);
+  if (!current || !stagingPathMatchesIdentity(current, identity)) return;
+  await fs.unlink(filePath).catch(() => undefined);
+}
+
+function stagingPathMatchesIdentity(
+  current: Awaited<ReturnType<typeof fs.lstat>>,
+  identity: OwnedStagingIdentity,
+): boolean {
+  return !current.isSymbolicLink() && current.isFile()
+    && String(current.dev) === identity.dev
+    && String(current.ino) === identity.ino
+    && String(current.size) === identity.size;
+}
+
+async function ownsStagingPath(filePath: string, identity: OwnedStagingIdentity): Promise<boolean> {
+  const current = await fs.lstat(filePath).catch(() => null);
+  return Boolean(current && stagingPathMatchesIdentity(current, identity));
+}
+
+export async function streamCommitArtifact(
+  input: ArtifactStreamInput,
+  dependencies: ArtifactCommitDependencies = {},
+): Promise<ArtifactCommitResult> {
   if (!isEnabled(FF.V2_MEDIA_ARCHIVING)) throw new Error("v2.0 media archiving is not enabled");
   if (!EXTENSIONS[input.mimeType]) throw new Error(`Unsupported artifact MIME type: ${input.mimeType}`);
   const expectedKind = input.mimeType.startsWith("image/") ? "image"
@@ -259,12 +289,14 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
   const maxBytes = input.maxSizeBytes ?? 100 * 1024 * 1024;
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 10 * 1024 * 1024 * 1024) throw new Error("Invalid artifact size limit");
   const id = genId();
-  const relativeFinal = path.posix.join(safeSegment(input.attemptId), `${id}.${EXTENSIONS[input.mimeType]}`);
-  const finalPath = resolveArtifactStoragePath(relativeFinal);
-  const stagingKey = path.posix.join(".staging", safeSegment(input.attemptId), `${id}.part`);
-  const stagingPath = resolveArtifactStoragePath(stagingKey);
   const writerOwner = input.writerOwner?.trim() || `writer-${process.pid}`;
   const writerToken = genId();
+  const relativeFinal = path.posix.join(safeSegment(input.attemptId), `${id}.${EXTENSIONS[input.mimeType]}`);
+  const finalPath = resolveArtifactStoragePath(relativeFinal);
+  const stagingKey = path.posix.join(
+    ".staging", safeSegment(input.attemptId), `${id}.${safeSegment(writerToken)}.part`,
+  );
+  const stagingPath = resolveArtifactStoragePath(stagingKey);
   await fs.mkdir(path.dirname(finalPath), { recursive: true });
   await fs.mkdir(path.dirname(stagingPath), { recursive: true });
 
@@ -286,6 +318,8 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
   });
 
   let renamed = false;
+  let stagingHandle: FileHandle | null = null;
+  let ownedStagingIdentity: OwnedStagingIdentity | null = null;
   let leaseLost = false;
   let renewal = Promise.resolve();
   const renewalTimer = setInterval(() => {
@@ -297,17 +331,35 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
   try {
     const readTimeoutMs = input.readTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1_000 || readTimeoutMs > 5 * 60 * 1000) throw new Error("Invalid artifact read timeout");
-    const written = await writeWebStreamToFile(input.read(), stagingPath, maxBytes, readTimeoutMs);
+    if (!await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
+      throw new Error("Artifact writer lease was lost before staging open");
+    }
+    stagingHandle = await (dependencies.openStagingFile
+      ? dependencies.openStagingFile(stagingPath)
+      : fs.open(stagingPath, "wx", 0o600));
+    const openedStat = await stagingHandle.stat();
+    if (!openedStat.isFile()) throw new Error("Artifact staging handle is not a regular file");
+    ownedStagingIdentity = stagingIdentity(openedStat);
+    if (!await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
+      throw new Error("Artifact writer lease was lost after staging open");
+    }
+    const written = await writeWebStreamToFile(input.read(), stagingHandle, maxBytes, readTimeoutMs);
+    await stagingHandle.sync();
+    ownedStagingIdentity = stagingIdentity(await stagingHandle.stat());
+    await stagingHandle.close();
+    stagingHandle = null;
     await renewal;
     if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
       throw new Error("Artifact writer lease was lost");
     }
     if (!validateMagicBytes(written.header, input.mimeType)) throw new Error(`Content signature does not match ${input.mimeType}`);
     await assertAttemptFence(input.attemptId, input.expectedJobClaimFencingToken);
-    await syncFile(stagingPath);
     await renewal;
     if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
       throw new Error("Artifact writer lease was lost before publish");
+    }
+    if (!ownedStagingIdentity || !await ownsStagingPath(stagingPath, ownedStagingIdentity)) {
+      throw new Error("Artifact staging file ownership was lost before publish");
     }
     await fs.rename(stagingPath, finalPath);
     await syncDirectory(path.dirname(finalPath));
@@ -366,6 +418,11 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
   } catch (error) {
     clearInterval(renewalTimer);
     await renewal.catch(() => undefined);
+    if (stagingHandle) {
+      ownedStagingIdentity = await stagingHandle.stat().then(stagingIdentity).catch(() => ownedStagingIdentity);
+      await stagingHandle.close().catch(() => undefined);
+      stagingHandle = null;
+    }
     if (renamed) {
       // Preserve STAGING: startup reconciliation can finish the rename/database
       // crash window without losing a valid immutable output.
@@ -379,7 +436,7 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
       )).catch(() => undefined);
     } else {
       const failedAt = Date.now();
-      const changed = await db.update(generationArtifacts).set({
+      await db.update(generationArtifacts).set({
         status: "QUARANTINED",
         metadataJson: { ...(input.metadata ?? {}), failure: error instanceof Error ? error.message.slice(0, 300) : "artifact_commit_failed" },
         writerLeaseOwner: null, writerLeaseToken: null, writerLeaseExpiresAtMs: null,
@@ -388,8 +445,8 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
         eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"),
         eq(generationArtifacts.writerLeaseOwner, writerOwner), eq(generationArtifacts.writerLeaseToken, writerToken),
         gt(generationArtifacts.writerLeaseExpiresAtMs, failedAt),
-      )).returning({ id: generationArtifacts.id }).catch(() => []);
-      if (changed[0]) await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+      )).catch(() => undefined);
+      if (ownedStagingIdentity) await removeOwnedStagingFile(stagingPath, ownedStagingIdentity);
     }
     throw error;
   }
