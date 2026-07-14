@@ -60,8 +60,8 @@ AI 驱动的漫剧生成器 — 从剧本到动画视频的全自动流水线。
 
 ### 环境要求
 
-- Node.js 18+
-- pnpm
+- Node.js 22.16.0（仓库通过 `.node-version` 固定 Node 22 运行时契约）
+- pnpm 10.12.1（通过 Corepack 使用）
 - FFmpeg（视频合成功能需要）
 
 ### 安装
@@ -83,6 +83,16 @@ pnpm dev
 ```
 
 访问 [http://localhost:3000](http://localhost:3000)
+
+### Worker
+
+开发 Worker 显式读取项目根目录的 `.env`；构建后的生产 Worker 仅使用部署进程提供的环境变量，不会自行读取开发 `.env`。
+
+```bash
+corepack pnpm worker:dev
+corepack pnpm worker:build
+corepack pnpm worker
+```
 
 ## Docker 部署
 

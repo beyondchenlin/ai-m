@@ -4,8 +4,8 @@
  * 手册 §12：与 Next.js 网页进程分离，通过数据库原子领取任务。
  * 支持优雅关闭、租约续期、恢复扫描和取消响应。
  *
- * 启动: npx tsx src/worker/index.ts
- * 生产: node dist/worker/index.js
+ * 开发: corepack pnpm worker:dev（直接运行 tsx --env-file=.env src/worker/index.ts）
+ * 生产: corepack pnpm worker（运行 dist/worker/index.cjs，不自动加载开发 .env）
  */
 
 import { claimJob, renewJobClaim, releaseJobClaim, scanExpiredClaims, LEASE_CONFIG } from "@/lib/generation/resources/leases";
