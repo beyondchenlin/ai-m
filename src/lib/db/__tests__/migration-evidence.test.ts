@@ -76,6 +76,14 @@ describe("DML postcondition registry", () => {
     expect(() => validateMigrationStatementEvidence([{ folderMillis: 2, hash: "ctas", sql: [
       "CREATE TABLE copied AS SELECT * FROM source",
     ] }], [])).toThrow(/data-bearing create/i);
+    for (const sql of [
+      "CREATE TEMP TABLE copied AS SELECT * FROM source",
+      "CREATE TEMPORARY TABLE copied AS WITH rows AS (SELECT 1) SELECT * FROM rows",
+      "CREATE TABLE IF NOT EXISTS copied AS VALUES (1), (2)",
+    ]) {
+      expect(() => validateMigrationStatementEvidence([{ folderMillis: 2, hash: "ctas", sql: [sql] }], []))
+        .toThrow(/data-bearing create/i);
+    }
     expect(() => validateMigrationStatementEvidence([{ folderMillis: 3, hash: "pragma", sql: [
       "PRAGMA writable_schema=ON",
     ] }], [])).toThrow(/unsupported state-changing/i);

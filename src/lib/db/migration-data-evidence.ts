@@ -57,6 +57,13 @@ export const DATA_POSTCONDITION_REGISTRY: readonly DataPostconditionRegistration
 
 /** Return the outer statement kind, ignoring comments, quoted bytes, and trigger bodies. */
 export function topLevelStatementKind(sql: string): string {
+  const tokens = topLevelTokens(sql);
+  const first = tokens[0] ?? "";
+  if (first !== "WITH") return first;
+  return tokens.find((token) => ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(token)) ?? "WITH";
+}
+
+function topLevelTokens(sql: string): string[] {
   const tokens: Array<{ value: string; depth: number }> = [];
   let depth = 0;
   for (let index = 0; index < sql.length;) {
@@ -94,10 +101,7 @@ export function topLevelStatementKind(sql: string): string {
     }
     index += 1;
   }
-  const first = tokens.find((token) => token.depth === 0)?.value ?? "";
-  if (first !== "WITH") return first;
-  return tokens.find((token) => token.depth === 0
-    && ["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(token.value))?.value ?? "WITH";
+  return tokens.filter((token) => token.depth === 0).map((token) => token.value);
 }
 
 function migrationsWithDml(migrations: MigrationMetadata[]): MigrationMetadata[] {
@@ -172,10 +176,16 @@ export function validateMigrationStatementEvidence(
       const kind = topLevelStatementKind(statement);
       if (["INSERT", "UPDATE", "DELETE", "REPLACE"].includes(kind)) continue;
       if (kind === "CREATE") {
-        const normalized = statement.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)+/, "").toUpperCase();
-        if (/^CREATE\s+(?:TEMP\s+)?VIRTUAL\s+TABLE\b/.test(normalized)
-          || /^CREATE\s+(?:TEMP\s+)?TABLE\b[\s\S]*\bAS\s+SELECT\b/.test(normalized)) {
-          throw new Error(`Migration ${migration.folderMillis} uses data-bearing CREATE without independent evidence`);
+        const tokens = topLevelTokens(statement);
+        let cursor = 1;
+        if (tokens[cursor] === "TEMP" || tokens[cursor] === "TEMPORARY") cursor += 1;
+        if (tokens[cursor] === "UNIQUE") cursor += 1;
+        const objectKind = tokens[cursor];
+        if (!['TABLE', 'INDEX', 'TRIGGER', 'VIEW'].includes(objectKind ?? "")) {
+          throw new Error(`Migration ${migration.folderMillis} uses ambiguous or data-bearing CREATE`);
+        }
+        if (objectKind === "TABLE" && tokens.includes("AS")) {
+          throw new Error(`Migration ${migration.folderMillis} uses data-bearing CREATE TABLE AS`);
         }
         continue;
       }

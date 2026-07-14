@@ -5,7 +5,6 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { buildSync } from "esbuild";
 import {
   LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
@@ -13,6 +12,7 @@ import {
 import {
   baselineJournalLessDatabase,
   applyPendingMigrations,
+  computeMigrationsManifestDigest,
   prepareMigrationJournal,
   resolveMigrationsFolder,
 } from "../index";
@@ -91,9 +91,15 @@ describe("migration journal startup ordering", () => {
     }
   });
 
-  it("fails closed when the timestamp index name is occupied by a wrong definition", () => {
+  it.each([
+    ['CREATE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (hash)'],
+    ['CREATE UNIQUE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (created_at) WHERE created_at IS NOT NULL'],
+    ['CREATE UNIQUE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (created_at, hash)'],
+    ['CREATE UNIQUE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (created_at DESC)'],
+    ['CREATE UNIQUE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (created_at COLLATE NOCASE)'],
+  ])("fails closed when the timestamp index name is occupied by: %s", (indexSql) => {
     const sqlite = legacyVisualDatabase([]);
-    sqlite.exec('CREATE INDEX "__drizzle_migrations_created_at_unique" ON "__drizzle_migrations" (hash)');
+    sqlite.exec(indexSql);
     try {
       expect(() => prepareMigrationJournal(sqlite, repositoryMigrations)).toThrow(/incompatible definition/i);
     } finally { sqlite.close(); }
@@ -256,8 +262,7 @@ describe("migration journal startup ordering", () => {
     const filename = path.join(directory, "app.sqlite");
     const release = path.join(directory, "release");
     const migrationRoot = path.resolve("drizzle");
-    const journalHash = createHash("sha256")
-      .update(fs.readFileSync(path.join(migrationRoot, "meta", "_journal.json"))).digest("hex");
+    const journalHash = computeMigrationsManifestDigest(migrationRoot);
     const run = (index: number) => new Promise<void>((resolve, reject) => {
       const ready = path.join(directory, `ready-${index}`);
       const script = `
@@ -272,7 +277,7 @@ describe("migration journal startup ordering", () => {
           ...process.env,
           DATABASE_URL: filename,
           AI_M_MIGRATIONS_DIR: migrationRoot,
-          AI_M_MIGRATIONS_JOURNAL_SHA256: journalHash,
+          AI_M_MIGRATIONS_SHA256: journalHash,
         },
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -301,8 +306,7 @@ describe("migration journal startup ordering", () => {
     const directory = fs.mkdtempSync(path.join(path.resolve("."), ".bundle-root-test-"));
     const outfile = path.join(directory, "db.cjs");
     const migrationRoot = path.resolve("drizzle");
-    const journalHash = createHash("sha256")
-      .update(fs.readFileSync(path.join(migrationRoot, "meta", "_journal.json"))).digest("hex");
+    const journalHash = computeMigrationsManifestDigest(migrationRoot);
     try {
       buildSync({
         entryPoints: [path.resolve("src/lib/db/index.ts")],
@@ -315,18 +319,57 @@ describe("migration journal startup ordering", () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const bundled = require(outfile) as { resolveMigrationsFolder: () => string };
       const previousDir = process.env.AI_M_MIGRATIONS_DIR;
-      const previousHash = process.env.AI_M_MIGRATIONS_JOURNAL_SHA256;
+      const previousHash = process.env.AI_M_MIGRATIONS_SHA256;
       const previousCwd = process.cwd();
       try {
         process.env.AI_M_MIGRATIONS_DIR = migrationRoot;
-        process.env.AI_M_MIGRATIONS_JOURNAL_SHA256 = journalHash;
+        process.env.AI_M_MIGRATIONS_SHA256 = journalHash;
         process.chdir(directory);
         expect(bundled.resolveMigrationsFolder()).toBe(migrationRoot);
       } finally {
         process.chdir(previousCwd);
         if (previousDir === undefined) delete process.env.AI_M_MIGRATIONS_DIR; else process.env.AI_M_MIGRATIONS_DIR = previousDir;
-        if (previousHash === undefined) delete process.env.AI_M_MIGRATIONS_JOURNAL_SHA256; else process.env.AI_M_MIGRATIONS_JOURNAL_SHA256 = previousHash;
+        if (previousHash === undefined) delete process.env.AI_M_MIGRATIONS_SHA256; else process.env.AI_M_MIGRATIONS_SHA256 = previousHash;
       }
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("binds migration identity to ordered journal and every exact SQL byte", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-manifest-"));
+    const copy = path.join(directory, "drizzle");
+    fs.cpSync(path.resolve("drizzle"), copy, { recursive: true });
+    const originalDigest = computeMigrationsManifestDigest(copy);
+    const previousDir = process.env.AI_M_MIGRATIONS_DIR;
+    const previousHash = process.env.AI_M_MIGRATIONS_SHA256;
+    try {
+      process.env.AI_M_MIGRATIONS_DIR = copy;
+      process.env.AI_M_MIGRATIONS_SHA256 = originalDigest;
+      expect(resolveMigrationsFolder()).toBe(copy);
+
+      fs.appendFileSync(path.join(copy, "0059_pr13_review2_hardening.sql"), "\n-- changed byte");
+      expect(computeMigrationsManifestDigest(copy)).not.toBe(originalDigest);
+      expect(() => resolveMigrationsFolder()).toThrow(/identity/i);
+
+      fs.rmSync(copy, { recursive: true, force: true });
+      fs.cpSync(path.resolve("drizzle"), copy, { recursive: true });
+      fs.writeFileSync(path.join(copy, "9999_extra.sql"), "SELECT 1");
+      expect(() => resolveMigrationsFolder()).toThrow(/structure/i);
+
+      fs.rmSync(path.join(copy, "9999_extra.sql"));
+      fs.rmSync(path.join(copy, "0059_pr13_review2_hardening.sql"));
+      expect(() => resolveMigrationsFolder()).toThrow();
+
+      fs.rmSync(copy, { recursive: true, force: true });
+      fs.cpSync(path.resolve("drizzle"), copy, { recursive: true });
+      const journalPath = path.join(copy, "meta", "_journal.json");
+      const journal = JSON.parse(fs.readFileSync(journalPath, "utf8")) as { entries: unknown[] };
+      [journal.entries[0], journal.entries[1]] = [journal.entries[1], journal.entries[0]];
+      fs.writeFileSync(journalPath, JSON.stringify(journal));
+      expect(() => resolveMigrationsFolder()).toThrow(/identity|structure/i);
+    } finally {
+      if (previousDir === undefined) delete process.env.AI_M_MIGRATIONS_DIR; else process.env.AI_M_MIGRATIONS_DIR = previousDir;
+      if (previousHash === undefined) delete process.env.AI_M_MIGRATIONS_SHA256; else process.env.AI_M_MIGRATIONS_SHA256 = previousHash;
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

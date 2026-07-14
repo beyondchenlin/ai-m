@@ -191,13 +191,16 @@ export function prepareMigrationJournal(
     CREATE UNIQUE INDEX IF NOT EXISTS "__drizzle_migrations_created_at_unique"
     ON "__drizzle_migrations" (created_at)
   `);
-  const index = sqlite.prepare<[], { name: string; unique: number }>(
+  const index = sqlite.prepare<[], { name: string; unique: number; partial: number; origin: string }>(
     'PRAGMA index_list("__drizzle_migrations")',
   ).all().find((candidate) => candidate.name === "__drizzle_migrations_created_at_unique");
-  const keyColumns = sqlite.prepare<[], { name: string | null; key: number }>(
+  const keyColumns = sqlite.prepare<[], { name: string | null; key: number; cid: number; desc: number; coll: string | null }>(
     'PRAGMA index_xinfo("__drizzle_migrations_created_at_unique")',
   ).all().filter((column) => Number(column.key) === 1);
-  if (Number(index?.unique) !== 1 || keyColumns.length !== 1 || keyColumns[0].name !== "created_at") {
+  if (Number(index?.unique) !== 1 || Number(index?.partial) !== 0 || index?.origin !== "c"
+    || keyColumns.length !== 1 || keyColumns[0].name !== "created_at"
+    || Number(keyColumns[0].cid) < 0 || Number(keyColumns[0].desc) !== 0
+    || keyColumns[0].coll?.toLowerCase() !== "binary") {
     throw new Error("Migration timestamp index exists with an incompatible definition");
   }
 }
@@ -209,18 +212,41 @@ export function resolveMigrationsFolder(): string {
   if (!fs.existsSync(journalPath)) throw new Error(`Migration journal not found at ${journalPath}`);
   const journalBytes = fs.readFileSync(journalPath);
   if (configured) {
-    const expectedHash = process.env.AI_M_MIGRATIONS_JOURNAL_SHA256?.toLowerCase();
-    const actualHash = createHash("sha256").update(journalBytes).digest("hex");
+    const expectedHash = process.env.AI_M_MIGRATIONS_SHA256?.toLowerCase();
+    const actualHash = computeMigrationsManifestDigest(folder);
     if (!expectedHash || expectedHash !== actualHash) {
-      throw new Error("Configured migrations directory journal identity does not match AI_M_MIGRATIONS_JOURNAL_SHA256");
+      throw new Error("Configured migrations directory identity does not match AI_M_MIGRATIONS_SHA256");
     }
   }
   const journal = JSON.parse(journalBytes.toString("utf8")) as { entries?: Array<{ idx: number; tag: string }> };
-  if (!journal.entries?.length || journal.entries.some((entry, index) =>
-    entry.idx !== index || !fs.existsSync(path.join(folder, `${entry.tag}.sql`)))) {
+  const expectedFiles = journal.entries?.map((entry) => `${entry.tag}.sql`) ?? [];
+  const actualFiles = fs.readdirSync(folder).filter((name) => name.endsWith(".sql")).sort();
+  if (!journal.entries?.length || journal.entries.some((entry, index) => entry.idx !== index)
+    || JSON.stringify([...expectedFiles].sort()) !== JSON.stringify(actualFiles)) {
     throw new Error("Migration journal structure does not match its SQL files");
   }
   return folder;
+}
+
+export function computeMigrationsManifestDigest(folder: string): string {
+  const journalPath = path.join(folder, "meta", "_journal.json");
+  const journalBytes = fs.readFileSync(journalPath);
+  const journal = JSON.parse(journalBytes.toString("utf8")) as { entries?: Array<{ idx: number; tag: string }> };
+  if (!journal.entries?.length) throw new Error("Migration journal has no entries");
+  const hash = createHash("sha256");
+  const frame = (name: string, bytes: Buffer) => {
+    const nameBytes = Buffer.from(name, "utf8");
+    const lengths = Buffer.alloc(16);
+    lengths.writeBigUInt64BE(BigInt(nameBytes.length), 0);
+    lengths.writeBigUInt64BE(BigInt(bytes.length), 8);
+    hash.update(lengths).update(nameBytes).update(bytes);
+  };
+  frame("meta/_journal.json", journalBytes);
+  for (const entry of journal.entries) {
+    const name = `${entry.tag}.sql`;
+    frame(name, fs.readFileSync(path.join(folder, name)));
+  }
+  return hash.digest("hex");
 }
 
 export function applyPendingMigrations(
