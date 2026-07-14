@@ -20,12 +20,17 @@ const readme = readFileSync(path.join(projectRoot, "README.md"), "utf8");
 const pinnedNodeVersion = readFileSync(path.join(projectRoot, ".node-version"), "utf8").trim();
 
 function commandSegments(command: string): string[][] {
-  const tokens: string[] = [];
+  type CommandToken =
+    | { kind: "argument"; value: string }
+    | { kind: "and-operator" };
+  const tokens: CommandToken[] = [];
   let token = "";
+  let tokenStarted = false;
   let quote: "'" | '"' | undefined;
   const flush = () => {
-    if (token) tokens.push(token);
+    if (tokenStarted) tokens.push({ kind: "argument", value: token });
     token = "";
+    tokenStarted = false;
   };
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index];
@@ -34,26 +39,39 @@ function commandSegments(command: string): string[][] {
       else if (character === "\\" && quote === '"' && index + 1 < command.length) {
         token += command[index += 1];
       } else token += character;
+      tokenStarted = true;
     } else if (character === "'" || character === '"') {
       quote = character;
+      tokenStarted = true;
     } else if (character === "&" && command[index + 1] === "&") {
       flush();
-      tokens.push("&&");
+      tokens.push({ kind: "and-operator" });
       index += 1;
+    } else if (character === "&" || "|;<>()`".includes(character)
+      || (character === "$" && ["(", "{"].includes(command[index + 1] ?? ""))) {
+      return [];
     } else if (/\s/.test(character)) {
       flush();
     } else if (character === "\\" && index + 1 < command.length) {
       token += command[index += 1];
+      tokenStarted = true;
+    } else if (character === "^" && command[index + 1] === "&") {
+      token += "&";
+      tokenStarted = true;
+      index += 1;
+    } else if (character === "^") {
+      return [];
     } else {
       token += character;
+      tokenStarted = true;
     }
   }
   if (quote) return [];
   flush();
   const segments: string[][] = [[]];
   for (const item of tokens) {
-    if (item === "&&") segments.push([]);
-    else segments.at(-1)!.push(item);
+    if (item.kind === "and-operator") segments.push([]);
+    else segments.at(-1)!.push(item.value);
   }
   return segments.some((segment) => segment.length === 0) ? [] : segments;
 }
@@ -135,6 +153,24 @@ function mutate(
 }
 
 describe("worker startup command contract", () => {
+  it.each([
+    ['double-quoted operator', 'node "&&" tsx', [["node", "&&", "tsx"]]],
+    ["single-quoted operator", "node '&&' tsx", [["node", "&&", "tsx"]]],
+    ["backslash-escaped operator", "node \\&\\& tsx", [["node", "&&", "tsx"]]],
+    ["Windows caret-escaped operator", "node ^&^& tsx", [["node", "&&", "tsx"]]],
+    ['quoted embedded operator text', 'node "foo&&bar"', [["node", "foo&&bar"]]],
+    ["unspaced real operator", "node preflight&&tsx worker", [["node", "preflight"], ["tsx", "worker"]]],
+  ] as const)("parses %s without confusing literal arguments with operators", (_name, command, expected) => {
+    expect(commandSegments(command)).toEqual(expected);
+  });
+
+  it.each(["node preflight || tsx worker", "node preflight ; tsx worker", "node preflight | tsx worker", "node preflight & tsx worker"])(
+    "fails closed for unsupported shell syntax in %s",
+    (command) => {
+      expect(commandSegments(command)).toEqual([]);
+    },
+  );
+
   it("keeps development env loading explicit and production env-neutral", () => {
     expect(validateWorkerStartupContract(packageJson)).toEqual([]);
   });
@@ -148,6 +184,9 @@ describe("worker startup command contract", () => {
     ["env option after entrypoint", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] = "node scripts/runtime-preflight.mjs && tsx src/worker/index.ts --env-file=.env"; }, "between tsx and the entrypoint"],
     ["extra command segment", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] += " && echo done"; }, "exactly a preflight and worker segment"],
     ["no-op command segment", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] = "node scripts/runtime-preflight.mjs && true && tsx --env-file=.env src/worker/index.ts"; }, "exactly a preflight and worker segment"],
+    ["quoted operator bypass", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] = 'node scripts/runtime-preflight.mjs "&&" tsx --env-file=.env src/worker/index.ts'; }, "exactly a preflight and worker segment"],
+    ["single-quoted operator bypass", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] = "node scripts/runtime-preflight.mjs '&&' tsx --env-file=.env src/worker/index.ts"; }, "exactly a preflight and worker segment"],
+    ["escaped operator bypass", (manifest: PackageContract) => { manifest.scripts!["worker:dev"] = "node scripts/runtime-preflight.mjs \\&\\& tsx --env-file=.env src/worker/index.ts"; }, "exactly a preflight and worker segment"],
     ["missing build preflight", (manifest: PackageContract) => { manifest.scripts!["worker:build"] = "esbuild src/worker/index.ts --target=node22"; }, "build must run runtime preflight"],
     ["wrong worker build runtime", (manifest: PackageContract) => { manifest.scripts!["worker:build"] = manifest.scripts!["worker:build"].replace("node22", "node20"); }, "target the pinned Node 22"],
     ["production env loading", (manifest: PackageContract) => { manifest.scripts!.worker = "node --env-file=.env dist/worker/index.cjs"; }, "production worker must not load"],
