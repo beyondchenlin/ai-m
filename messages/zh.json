@@ -331,7 +331,19 @@
     "workflowProfiles": "工作流配置",
     "fetchWorkflowProfiles": "获取工作流",
     "noModelsFound": "没有找到可用模型或工作流",
-    "credentialsSessionOnly": "为降低密钥泄露风险，云端访问密钥仅保留在当前浏览器标签页会话中；关闭标签页后需要重新填写。"
+    "credentialsSessionOnly": "为降低密钥泄露风险，云端访问密钥仅保留在当前浏览器标签页会话中；关闭标签页后需要重新填写。",
+    "versionInfo": {
+      "title": "关于",
+      "description": "用于支持与问题诊断的构建标识。",
+      "version": "版本",
+      "commit": "提交",
+      "buildTime": "构建时间",
+      "development": "开发版本",
+      "notProvided": "未提供",
+      "copy": "复制版本信息",
+      "copied": "已复制版本信息",
+      "copyFailed": "无法复制版本信息"
+    }
   },
   "promptTemplates": {
     "title": "提示词管理",

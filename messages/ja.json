@@ -330,7 +330,19 @@
     "workflowProfiles": "ワークフロー設定",
     "fetchWorkflowProfiles": "ワークフローを取得",
     "noModelsFound": "利用可能なモデルまたはワークフローがありません",
-    "credentialsSessionOnly": "認証情報の漏えいリスクを抑えるため、クラウド API キーは現在のブラウザータブのセッション内だけに保持され、タブを閉じた後は再入力が必要です。"
+    "credentialsSessionOnly": "認証情報の漏えいリスクを抑えるため、クラウド API キーは現在のブラウザータブのセッション内だけに保持され、タブを閉じた後は再入力が必要です。",
+    "versionInfo": {
+      "title": "このアプリについて",
+      "description": "サポートと診断に使用するビルド情報です。",
+      "version": "バージョン",
+      "commit": "コミット",
+      "buildTime": "ビルド日時",
+      "development": "開発版",
+      "notProvided": "未提供",
+      "copy": "バージョン情報をコピー",
+      "copied": "バージョン情報をコピーしました",
+      "copyFailed": "バージョン情報をコピーできませんでした"
+    }
   },
   "promptTemplates": {
     "title": "プロンプト管理",

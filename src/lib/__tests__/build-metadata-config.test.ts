@@ -11,7 +11,7 @@ const inspectConfig = String.raw`
   process.stdout.write(JSON.stringify(config.env));
 `;
 
-function loadConfig(overrides: NodeJS.ProcessEnv = {}): EmbeddedConfig {
+function loadConfig(overrides: Readonly<Record<string, string | undefined>> = {}): EmbeddedConfig {
   const output = execFileSync(process.execPath, [
     "--import", "tsx",
     "--input-type=module",

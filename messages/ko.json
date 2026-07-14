@@ -330,7 +330,19 @@
     "workflowProfiles": "워크플로 프로필",
     "fetchWorkflowProfiles": "워크플로 가져오기",
     "noModelsFound": "사용 가능한 모델 또는 워크플로가 없습니다",
-    "credentialsSessionOnly": "자격 증명 노출 위험을 줄이기 위해 클라우드 API 키는 현재 브라우저 탭 세션에만 유지되며 탭을 닫은 후 다시 입력해야 합니다."
+    "credentialsSessionOnly": "자격 증명 노출 위험을 줄이기 위해 클라우드 API 키는 현재 브라우저 탭 세션에만 유지되며 탭을 닫은 후 다시 입력해야 합니다.",
+    "versionInfo": {
+      "title": "앱 정보",
+      "description": "지원 및 진단을 위한 빌드 정보입니다.",
+      "version": "버전",
+      "commit": "커밋",
+      "buildTime": "빌드 시간",
+      "development": "개발 버전",
+      "notProvided": "제공되지 않음",
+      "copy": "버전 정보 복사",
+      "copied": "버전 정보를 복사했습니다",
+      "copyFailed": "버전 정보를 복사할 수 없습니다"
+    }
   },
   "promptTemplates": {
     "title": "프롬프트 관리",

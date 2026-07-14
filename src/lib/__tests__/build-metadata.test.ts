@@ -86,13 +86,14 @@ describe("resolveBuildMetadata", () => {
 
 describe("embedded build metadata", () => {
   it("reads only the three internal embedded fields and validates them again", () => {
-    const metadata = readEmbeddedBuildMetadata({
+    const environment = {
       AI_M_INTERNAL_EMBEDDED_VERSION: "1.2.3",
       AI_M_INTERNAL_EMBEDDED_COMMIT: "ABCDEF0123456",
       AI_M_INTERNAL_EMBEDDED_BUILD_TIME: canonicalTime,
       DATABASE_URL: "must-not-leak",
       HOSTNAME: "must-not-leak",
-    });
+    };
+    const metadata = readEmbeddedBuildMetadata(environment);
 
     expect(metadata).toEqual({
       version: "1.2.3",

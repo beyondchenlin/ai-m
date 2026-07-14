@@ -330,7 +330,19 @@
     "workflowProfiles": "Workflow profiles",
     "fetchWorkflowProfiles": "Fetch workflows",
     "noModelsFound": "No models or workflows found",
-    "credentialsSessionOnly": "To reduce credential exposure, cloud API keys are kept only for the current browser-tab session and must be entered again after the tab is closed."
+    "credentialsSessionOnly": "To reduce credential exposure, cloud API keys are kept only for the current browser-tab session and must be entered again after the tab is closed.",
+    "versionInfo": {
+      "title": "About",
+      "description": "Build identity for support and diagnostics.",
+      "version": "Version",
+      "commit": "Commit",
+      "buildTime": "Build time",
+      "development": "Development",
+      "notProvided": "Not provided",
+      "copy": "Copy version information",
+      "copied": "Version information copied",
+      "copyFailed": "Could not copy version information"
+    }
   },
   "promptTemplates": {
     "title": "Prompt Templates",
