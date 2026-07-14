@@ -3,12 +3,12 @@ import * as schema from "./schema";
 import fs from "node:fs";
 import path from "node:path";
 import {
-  detectJournalLessBaselineMigrationCount,
   selectLegacyVisualSubjectJournalRepair,
   validateMigrationJournal,
   type MigrationJournalRow,
   type MigrationMetadata,
 } from "./migration-journal";
+import { detectJournalLessBaselineMigrationCount } from "./migration-schema-evidence";
 
 type DrizzleDB = ReturnType<typeof drizzle<typeof schema>>;
 type SqliteConnection = import("better-sqlite3").Database;
@@ -102,23 +102,33 @@ function getAppTableCount(sqlite: SqliteConnection) {
   return Number(row?.count ?? 0);
 }
 
-function baselineMigrations(
+export function baselineJournalLessDatabase(
   sqlite: SqliteConnection,
   migrations: MigrationMetadata[],
-  confirmedCount: number,
-) {
-  if (confirmedCount > migrations.length) {
-    throw new Error(`Confirmed migration count ${confirmedCount} exceeds available migrations ${migrations.length}`);
-  }
+): number {
+  let confirmedCount = 0;
   const insert = sqlite.prepare<[string, number]>(
     'INSERT INTO "__drizzle_migrations" ("hash", "created_at") VALUES (?, ?)',
   );
 
   sqlite.transaction(() => {
+    const recordedMigrationCount = getRecordedMigrationCount(sqlite);
+    if (recordedMigrationCount !== 0) {
+      validateRecordedMigrationJournal(sqlite, migrations);
+      return;
+    }
+    confirmedCount = detectJournalLessBaselineMigrationCount({
+      journalRowCount: recordedMigrationCount,
+      appTableCount: getAppTableCount(sqlite),
+      readActualInventory: () => sqlite,
+    }, migrations);
+    if (confirmedCount === 0) return;
     for (const migration of migrations.slice(0, confirmedCount)) {
       insert.run(migration.hash, migration.folderMillis);
     }
-  })();
+    validateRecordedMigrationJournal(sqlite, migrations);
+  }).immediate();
+  return confirmedCount;
 }
 
 function readMigrationJournal(sqlite: SqliteConnection): MigrationJournalRow[] {
@@ -176,11 +186,19 @@ export function prepareMigrationJournal(
   validateRecordedMigrationJournal(sqlite, migrations);
   reconcileLegacyVisualSubjectJournalGap(sqlite, migrations);
   validateRecordedMigrationJournal(sqlite, migrations);
+  sqlite.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS "__drizzle_migrations_created_at_unique"
+    ON "__drizzle_migrations" (created_at)
+  `);
+}
+
+export function resolveMigrationsFolder(): string {
+  return path.resolve(__dirname, "../../../drizzle");
 }
 
 export function runMigrations() {
   const sqlite = getSqlite();
-  const migrationsFolder = path.resolve("drizzle");
+  const migrationsFolder = resolveMigrationsFolder();
   ensureMigrationsTable(sqlite);
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { readMigrationFiles } = require("drizzle-orm/migrator") as {
@@ -189,14 +207,9 @@ export function runMigrations() {
   const migrations = readMigrationFiles({ migrationsFolder });
   prepareMigrationJournal(sqlite, migrations);
 
-  const confirmedBaselineCount = detectJournalLessBaselineMigrationCount({
-    journalRowCount: getRecordedMigrationCount(sqlite),
-    appTableCount: getAppTableCount(sqlite),
-    readActualInventory: () => sqlite,
-  }, migrations);
+  const confirmedBaselineCount = baselineJournalLessDatabase(sqlite, migrations);
   if (confirmedBaselineCount > 0) {
     console.log(`[DB] Existing schema detected. Baselining ${confirmedBaselineCount} confirmed migrations...`);
-    baselineMigrations(sqlite, migrations, confirmedBaselineCount);
   }
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
