@@ -41,6 +41,24 @@ class SettingsBoundaryStaticChecksTest(unittest.TestCase):
     def test_current_server_client_boundary_passes(self) -> None:
         self.check()
 
+    def test_server_wrapper_must_not_have_use_client_directive(self) -> None:
+        page = self.root / "src/app/[locale]/settings/page.tsx"
+        source = page.read_text(encoding="utf-8")
+        page.write_text(
+            '\ufeff  // leading comment\n/* boundary comment */\n  "use client";\n' + source,
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "must remain a server component"):
+            self.check()
+
+    def test_non_directive_use_client_string_is_allowed(self) -> None:
+        page = self.root / "src/app/[locale]/settings/page.tsx"
+        source = page.read_text(encoding="utf-8")
+        page.write_text(source + '\nconst diagnostic = "use client";\n', encoding="utf-8")
+
+        self.check()
+
     def test_speech_capability_must_remain_in_the_client(self) -> None:
         client = self.root / "src/app/[locale]/settings/settings-page-client.tsx"
         source = client.read_text(encoding="utf-8")

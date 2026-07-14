@@ -22,6 +22,20 @@ def _require_at(root: Path, path: str) -> str:
     return file.read_text(encoding="utf-8")
 
 
+def _top_level_directives(source: str) -> list[str]:
+    position = 1 if source.startswith("\ufeff") else 0
+    directives: list[str] = []
+    trivia = re.compile(r"(?:\s+|//[^\r\n]*(?:\r?\n|$)|/\*.*?\*/)*", re.DOTALL)
+    directive = re.compile(r"([\"'])([^\"'\r\n]*)\1\s*;?")
+    while True:
+        position = trivia.match(source, position).end()
+        match = directive.match(source, position)
+        if match is None:
+            return directives
+        directives.append(match.group(2))
+        position = match.end()
+
+
 def check_settings_page_invariants(root: Path = ROOT) -> None:
     page_path = root / "src/app/[locale]/settings/page.tsx"
     client_path = root / "src/app/[locale]/settings/settings-page-client.tsx"
@@ -32,6 +46,8 @@ def check_settings_page_invariants(root: Path = ROOT) -> None:
 
     page = page_path.read_text(encoding="utf-8")
     client = client_path.read_text(encoding="utf-8")
+    if "use client" in _top_level_directives(page):
+        raise AssertionError("settings server wrapper must remain a server component")
     if not re.search(
         r'import\s*{\s*SettingsPageClient\s*}\s*from\s*["\']\./settings-page-client["\']',
         page,
