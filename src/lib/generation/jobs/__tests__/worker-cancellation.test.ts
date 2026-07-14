@@ -174,6 +174,34 @@ describe("worker terminal transitions", () => {
     expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
   });
 
+  it("rejects finalization when only the attempt fencing token is stale", async () => {
+    const { now, jobId, attemptId } = await seedOwnedExecution();
+    await db.update(generationAttempts).set({ jobClaimFencingToken: 12 })
+      .where(eq(generationAttempts.id, attemptId));
+
+    const result = finalizeOwnedExecution({
+      jobId, attemptId, workerId: "worker-a", jobFencingToken: 11,
+    }, {
+      now,
+      expectedJobStatuses: ["CANCEL_REQUESTED"],
+      expectedAttemptPhases: ["CANCEL_REQUESTED"],
+      attemptValues: { phase: "CANCELLED", finishedAtMs: now },
+      jobValues: { status: "CANCELLED", completedAtMs: now },
+      event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },
+    });
+
+    expect(result).toEqual({ status: "ownership-lost" });
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, attemptId));
+    expect(job).toMatchObject({
+      status: "CANCEL_REQUESTED",
+      claimOwner: "worker-a",
+      claimFencingToken: 11,
+    });
+    expect(attempt).toMatchObject({ phase: "CANCEL_REQUESTED", jobClaimFencingToken: 12 });
+    expect(await db.select().from(generationEvents).where(eq(generationEvents.jobId, jobId))).toHaveLength(0);
+  });
+
   it("rolls back job and attempt when the terminal event cannot be inserted", async () => {
     const { now, jobId, attemptId } = await seedOwnedExecution();
     secondConnection.exec(`
