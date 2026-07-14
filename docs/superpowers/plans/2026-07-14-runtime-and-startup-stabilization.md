@@ -151,7 +151,13 @@ Create `validateMigrationJournal(rows, migrations)` and `selectLegacyVisualSubje
 
 `src/lib/db/index.ts` must query rows/schema facts, call the pure policy, and perform at most one exact journal insert. Keep the insert atomic. Rename the misleading prefix validator to journal validation. Do not generalize schema guessing or repair arbitrary hash drift.
 
-- [ ] **Step 6: Verify focused and migration suites**
+- [ ] **Step 6: Replace sparse journal-less baselining with full schema evidence**
+
+For a database that has application tables but no Drizzle journal, do not infer a migration boundary from a few marker tables or columns. Build expected schema inventories by applying the repository migrations to an isolated in-memory SQLite database, then compare every expected application table/column signature, named index signature, and trigger definition for the candidate boundary. Extra user objects may be tolerated, but a partially present later migration must be rejected as schema drift rather than skipped or replayed. Keep this path limited to journal-less legacy databases so normal startup has no additional cost.
+
+Add tests proving that a complete legacy boundary is recognized, a missing table/column/index/trigger is never baselined past its migration, and a partially present later migration fails closed. The comparison must automatically include future migration objects instead of maintaining another hand-written marker list.
+
+- [ ] **Step 7: Verify focused and migration suites**
 
 Run:
 
@@ -162,7 +168,7 @@ corepack pnpm test:migrations
 
 Expected: all focused tests pass; empty DB applies 60 migrations; legacy 0053 and 0058 upgrades pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```powershell
 git add src/lib/db/index.ts src/lib/db/migration-journal.ts src/lib/db/__tests__/migration-journal.test.ts
