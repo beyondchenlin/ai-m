@@ -1,6 +1,6 @@
 /** Durable, streamed, two-phase media artifact commit. */
 import { createHash } from "node:crypto";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +12,7 @@ import { isEnabled, FF } from "@/lib/feature-flags";
 import type { ArtifactKind, ArtifactVisibility } from "@/lib/generation/naming";
 import { writeAuditEvent, AuditAction, AuditTargetType } from "@/lib/security/audit";
 import { probeMediaDurationMs } from "../media-probe";
+import { validateCompleteMediaFile } from "./media-completeness";
 
 export const ContentType = { IMAGE_PNG: "image/png", IMAGE_JPEG: "image/jpeg", IMAGE_WEBP: "image/webp", IMAGE_GIF: "image/gif", VIDEO_MP4: "video/mp4", AUDIO_WAV: "audio/wav", AUDIO_MP3: "audio/mpeg" } as const;
 /** @deprecated Use ContentType. Kept for source compatibility until the next major release. */
@@ -68,6 +69,10 @@ export interface ArtifactRecoveryOptions {
   writerGraceMs?: number;
   recoveryLeaseMs?: number;
   legacyRecoveryBeforeMs?: number;
+  /** Synchronous seam used to model Windows open-handle deletion failures. */
+  removeRecoveryFile?: (filePath: string) => void;
+  /** Crash-injection seam after durable files are gone but before the terminal DB CAS. */
+  afterRecoveryFilesRemoved?: () => void;
 }
 
 export interface ArtifactRecoveryResult {
@@ -243,47 +248,6 @@ async function assertAttemptFence(attemptId: string, expectedToken: number | und
   }
 }
 
-async function validateCompleteFile(filePath: string, mimeType: string, sizeBytes: number): Promise<boolean> {
-  const handle = await fs.open(filePath, "r");
-  try {
-    if (mimeType === "image/png") {
-      if (sizeBytes < 20) return false;
-      const tail = Buffer.alloc(12);
-      await handle.read(tail, 0, tail.length, sizeBytes - tail.length);
-      return tail.readUInt32BE(0) === 0 && tail.subarray(4, 8).toString("ascii") === "IEND";
-    }
-    if (mimeType === "video/mp4") {
-      let offset = 0;
-      let sawFtyp = false;
-      let sawMedia = false;
-      while (offset + 8 <= sizeBytes) {
-        const box = Buffer.alloc(16);
-        const { bytesRead } = await handle.read(box, 0, 16, offset);
-        if (bytesRead < 8) return false;
-        let boxSize = box.readUInt32BE(0);
-        const type = box.subarray(4, 8).toString("ascii");
-        let headerSize = 8;
-        if (boxSize === 1) {
-          if (bytesRead < 16) return false;
-          const extended = box.readBigUInt64BE(8);
-          if (extended > BigInt(Number.MAX_SAFE_INTEGER)) return false;
-          boxSize = Number(extended);
-          headerSize = 16;
-        } else if (boxSize === 0) boxSize = sizeBytes - offset;
-        if (boxSize < headerSize || offset + boxSize > sizeBytes) return false;
-        if (offset === 0 && type !== "ftyp") return false;
-        if (type === "ftyp") sawFtyp = true;
-        if (type === "moov" || type === "mdat") sawMedia = true;
-        offset += boxSize;
-      }
-      return offset === sizeBytes && sawFtyp && sawMedia;
-    }
-    return true;
-  } finally {
-    await handle.close();
-  }
-}
-
 async function renewWriterLease(
   artifactId: string,
   owner: string,
@@ -406,7 +370,11 @@ export async function streamCommitArtifact(
     ownedStagingIdentity = stagingIdentity(await stagingHandle.stat());
     await stagingHandle.close();
     stagingHandle = null;
-    if (!await validateCompleteFile(writingPath, input.mimeType, written.sizeBytes)) {
+    await renewal;
+    if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
+      throw new Error("Artifact writer lease was lost before container validation");
+    }
+    if (!await validateCompleteMediaFile(writingPath, input.mimeType, written.sizeBytes)) {
       throw new Error(`Artifact container is incomplete for ${input.mimeType}`);
     }
     await renewal;
@@ -548,6 +516,93 @@ async function renewRecoveryLease(
   return Boolean(changed[0]);
 }
 
+function recoveryStagingCleanupPaths(
+  artifact: typeof generationArtifacts.$inferSelect,
+  metadata: Record<string, unknown>,
+  legacyClaimAuthorized: boolean,
+): string[] {
+  const attempt = safeSegment(artifact.attemptId);
+  const artifactId = safeSegment(artifact.id);
+  const prefix = `.staging/${attempt}/${artifactId}`;
+  const modernKeys = [metadata.writingPath, metadata.readyPath]
+    .filter((value): value is string => typeof value === "string");
+  const modernPrefixes = new Set<string>();
+  const resolved = new Set<string>();
+  for (const key of modernKeys) {
+    const normalized = key.replace(/\\/g, "/");
+    const suffix = normalized.endsWith(".writing") ? ".writing"
+      : normalized.endsWith(".ready") ? ".ready" : null;
+    if (!suffix) throw new Error("unsafe_recovery_cleanup_path");
+    const pathPrefix = normalized.slice(0, -suffix.length);
+    const token = pathPrefix.startsWith(`${prefix}.`) ? pathPrefix.slice(prefix.length + 1) : "";
+    if (!token || token !== safeSegment(token)) {
+      throw new Error("unsafe_recovery_cleanup_path");
+    }
+    modernPrefixes.add(pathPrefix);
+    resolved.add(resolveArtifactStoragePath(normalized));
+    resolved.add(resolveArtifactStoragePath(`${pathPrefix}.writing`));
+    resolved.add(resolveArtifactStoragePath(`${pathPrefix}.ready`));
+  }
+  if (modernPrefixes.size > 1) throw new Error("mismatched_recovery_cleanup_tokens");
+  if (legacyClaimAuthorized && typeof metadata.stagingPath === "string") {
+    const normalized = metadata.stagingPath.replace(/\\/g, "/");
+    const basename = normalized.startsWith(`${prefix}.`) ? normalized.slice(prefix.length + 1) : "";
+    if (!(normalized === `${prefix}.part`
+      || (basename.endsWith(".part") && basename.slice(0, -5) === safeSegment(basename.slice(0, -5))))) {
+      throw new Error("unsafe_legacy_recovery_cleanup_path");
+    }
+    resolved.add(resolveArtifactStoragePath(normalized));
+  }
+  return [...resolved];
+}
+
+function terminalizeRecoveredArtifact(options: {
+  database: DB;
+  artifact: typeof generationArtifacts.$inferSelect;
+  recoveryOwner: string;
+  recoveryToken: string;
+  terminalAt: number;
+  status: "COMMITTED" | "QUARANTINED";
+  values: Partial<typeof generationArtifacts.$inferInsert>;
+  cleanupPaths: string[];
+  removeFile?: (filePath: string) => void;
+  afterFilesRemoved?: () => void;
+}): boolean {
+  try {
+    return options.database.transaction((tx) => {
+      const owned = tx.select({ id: generationArtifacts.id }).from(generationArtifacts).where(and(
+        eq(generationArtifacts.id, options.artifact.id),
+        eq(generationArtifacts.status, "RECOVERING"),
+        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
+        eq(generationArtifacts.recoveryLeaseToken, options.recoveryToken),
+        gt(generationArtifacts.recoveryLeaseExpiresAtMs, options.terminalAt),
+      )).get();
+      if (!owned) return false;
+      const removeFile = options.removeFile ?? ((filePath: string) => rmSync(filePath, { force: true }));
+      for (const filePath of options.cleanupPaths) removeFile(filePath);
+      options.afterFilesRemoved?.();
+      const changed = tx.update(generationArtifacts).set({
+        ...options.values,
+        status: options.status,
+        updatedAtMs: options.terminalAt,
+        recoveryLeaseOwner: null,
+        recoveryLeaseToken: null,
+        recoveryLeaseExpiresAtMs: null,
+      }).where(and(
+        eq(generationArtifacts.id, options.artifact.id),
+        eq(generationArtifacts.status, "RECOVERING"),
+        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
+        eq(generationArtifacts.recoveryLeaseToken, options.recoveryToken),
+        gt(generationArtifacts.recoveryLeaseExpiresAtMs, options.terminalAt),
+      )).returning({ id: generationArtifacts.id }).get();
+      if (!changed) throw new Error("recovery_terminal_cas_lost");
+      return true;
+    }, { behavior: "immediate" });
+  } catch {
+    return false;
+  }
+}
+
 /** Atomically claim and recover abandoned writer output. */
 export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions): Promise<ArtifactRecoveryResult> {
   const database = options.database ?? db;
@@ -566,6 +621,16 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
   for (const candidateRow of rows) {
     const recoveryToken = genId();
     const legacyCutoff = options.legacyRecoveryBeforeMs;
+    const initialLegacyClaimAuthorized = candidateRow.status === "STAGING"
+      && candidateRow.writerLeaseOwner === null
+      && candidateRow.writerLeaseToken === null
+      && candidateRow.writerLeaseExpiresAtMs === null
+      && legacyCutoff !== undefined
+      && Number.isSafeInteger(legacyCutoff)
+      && legacyCutoff > 0
+      && legacyCutoff <= now
+      && candidateRow.createdAtMs <= legacyCutoff
+      && candidateRow.updatedAtMs <= now - graceMs;
     const legacyEligible = legacyCutoff !== undefined && Number.isSafeInteger(legacyCutoff)
       && legacyCutoff > 0 && legacyCutoff <= now
       ? and(
@@ -594,11 +659,23 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
       recoveryLeaseOwner: options.recoveryOwner,
       recoveryLeaseToken: recoveryToken,
       recoveryLeaseExpiresAtMs: now + leaseMs,
+      metadataJson: initialLegacyClaimAuthorized ? {
+        ...(candidateRow.metadataJson as Record<string, unknown>), recoveryLegacyCutoffMs: legacyCutoff,
+      } : candidateRow.metadataJson,
       updatedAtMs: now,
     }).where(and(eq(generationArtifacts.id, candidateRow.id), claimCondition))
       .returning();
     if (!artifact) continue;
     claimed++;
+    const claimedMetadata = artifact.metadataJson as Record<string, unknown>;
+    const persistedLegacyCutoff = claimedMetadata.recoveryLegacyCutoffMs;
+    const legacyClaimAuthorized = initialLegacyClaimAuthorized
+      || (candidateRow.status === "RECOVERING"
+        && typeof persistedLegacyCutoff === "number"
+        && Number.isSafeInteger(persistedLegacyCutoff)
+        && persistedLegacyCutoff > 0
+        && persistedLegacyCutoff <= now
+        && artifact.createdAtMs <= persistedLegacyCutoff);
     let recoveryLeaseLost = false;
     let recoveryRenewal = Promise.resolve();
     const recoveryRenewalTimer = setInterval(() => {
@@ -610,11 +687,16 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
     }, Math.max(500, Math.floor(leaseMs / 3)));
     recoveryRenewalTimer.unref?.();
     const finalPath = resolveArtifactStoragePath(artifact.storageKey);
-    const metadata = artifact.metadataJson as Record<string, unknown>;
+    const metadata = claimedMetadata;
     const readyKey = typeof metadata.readyPath === "string" ? metadata.readyPath : null;
     const readyPath = readyKey ? resolveArtifactStoragePath(readyKey) : null;
-    const writingKey = typeof metadata.writingPath === "string" ? metadata.writingPath : null;
-    const writingPath = writingKey ? resolveArtifactStoragePath(writingKey) : null;
+    let stagingCleanupPaths: string[];
+    try {
+      stagingCleanupPaths = recoveryStagingCleanupPaths(artifact, metadata, legacyClaimAuthorized);
+    } catch {
+      stagingCleanupPaths = [];
+      recoveryLeaseLost = true;
+    }
     const usableFile = async (filePath: string): Promise<string | null> => {
       const info = await fs.lstat(filePath).catch(() => null);
       return info && !info.isSymbolicLink() && info.isFile() ? filePath : null;
@@ -624,17 +706,13 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
       clearInterval(recoveryRenewalTimer);
       await recoveryRenewal;
       const terminalAt = clock();
-      const changed = await database.update(generationArtifacts).set({
-        status: "QUARANTINED", updatedAtMs: terminalAt,
-        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
-        metadataJson: { ...metadata, recovery: "file_missing" },
-      }).where(and(
-        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
-        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
-        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
-        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
-      )).returning({ id: generationArtifacts.id });
-      if (changed[0]) quarantined++;
+      if (!recoveryLeaseLost && terminalizeRecoveredArtifact({
+        database, artifact, recoveryOwner: options.recoveryOwner, recoveryToken, terminalAt,
+        status: "QUARANTINED", values: { metadataJson: { ...metadata, recovery: "file_missing" } },
+        cleanupPaths: stagingCleanupPaths,
+        removeFile: options.removeRecoveryFile,
+        afterFilesRemoved: options.afterRecoveryFilesRemoved,
+      })) quarantined++;
       continue;
     }
     let recoveryTempPath: string | null = null;
@@ -678,7 +756,7 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
       }
       const inspected = await inspectFile(candidate, recoveryMaxBytes);
       if (!validateMagicBytes(inspected.header, artifact.mimeType)) throw new Error("content_mismatch");
-      if (!await validateCompleteFile(candidate, artifact.mimeType, inspected.sizeBytes)) throw new Error("incomplete_container");
+      if (!await validateCompleteMediaFile(candidate, artifact.mimeType, inspected.sizeBytes)) throw new Error("incomplete_container");
       const expectedKind = artifact.mimeType.startsWith("image/") ? "image"
         : artifact.mimeType.startsWith("video/") ? "video"
         : artifact.mimeType.startsWith("audio/") ? "audio" : null;
@@ -704,36 +782,31 @@ export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions):
         throw new Error("recovery_lease_lost");
       }
       const terminalAt = clock();
-      const changed = await database.update(generationArtifacts).set({
-        status: "COMMITTED", sizeBytes: inspected.sizeBytes, sha256: inspected.sha256,
-        durationMs, committedAtMs: terminalAt, updatedAtMs: terminalAt, metadataJson: { ...metadata, recovery: "completed" },
-        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
-      }).where(and(
-        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
-        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
-        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
-        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
-      )).returning({ id: generationArtifacts.id });
-      if (changed[0]) {
+      if (terminalizeRecoveredArtifact({
+        database, artifact, recoveryOwner: options.recoveryOwner, recoveryToken, terminalAt,
+        status: "COMMITTED", values: {
+          sizeBytes: inspected.sizeBytes, sha256: inspected.sha256, durationMs, committedAtMs: terminalAt,
+          metadataJson: { ...metadata, recovery: "completed" },
+        },
+        cleanupPaths: [...stagingCleanupPaths, ...(recoveryTempPath ? [recoveryTempPath] : [])],
+        removeFile: options.removeRecoveryFile,
+        afterFilesRemoved: options.afterRecoveryFilesRemoved,
+      })) {
         committed++;
-        if (readyPath) await fs.rm(readyPath, { force: true }).catch(() => undefined);
-        if (writingPath) await fs.rm(writingPath, { force: true }).catch(() => undefined);
       }
     } catch (error) {
+      clearInterval(recoveryRenewalTimer);
+      await recoveryRenewal.catch(() => { recoveryLeaseLost = true; });
       const terminalAt = clock();
-      const changed = await database.update(generationArtifacts).set({
-        status: "QUARANTINED", updatedAtMs: terminalAt,
-        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
-        metadataJson: { ...metadata, recovery: error instanceof Error ? error.message.slice(0, 120) : "recovery_failed" },
-      }).where(and(
-        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
-        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
-        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
-        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
-      )).returning({ id: generationArtifacts.id });
-      if (changed[0]) {
-        quarantined++;
-      }
+      if (!recoveryLeaseLost && terminalizeRecoveredArtifact({
+        database, artifact, recoveryOwner: options.recoveryOwner, recoveryToken, terminalAt,
+        status: "QUARANTINED", values: {
+          metadataJson: { ...metadata, recovery: error instanceof Error ? error.message.slice(0, 120) : "recovery_failed" },
+        },
+        cleanupPaths: [...stagingCleanupPaths, ...(recoveryTempPath ? [recoveryTempPath] : [])],
+        removeFile: options.removeRecoveryFile,
+        afterFilesRemoved: options.afterRecoveryFilesRemoved,
+      })) quarantined++;
     } finally {
       clearInterval(recoveryRenewalTimer);
       await recoveryRenewal.catch(() => undefined);

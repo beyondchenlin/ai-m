@@ -32,6 +32,19 @@ const pngBytes = new Uint8Array(Buffer.from(
   "base64",
 ));
 const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+const completeJpegBytes = new Uint8Array(Buffer.from(
+  "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjEzLjEwMAD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABMAAEBAAAAAAAAAAAAAAAAAAAABgEBAQAAAAAAAAAAAAAAAAAABgcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAACAAIDASIAAhEAAxEA/9oADAMBAAIRAxEAPwCLAE1/f//Z",
+  "base64",
+));
+const completeWebpBytes = new Uint8Array(Buffer.from(
+  "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAgA0JaACdLoB+AADsAD+8Oj3/yC5YXXI1/8gP+QH/ID/+PIAAAA=",
+  "base64",
+));
+const completeGifBytes = new Uint8Array(Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64"));
+const completeMp4Bytes = new Uint8Array(Buffer.from(
+  "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMWbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAACgAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAkF0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAACgAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAIAAAACAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAAoAAAAAAABAAAAAAG5bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAyAAAAAgBVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABZG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAASRzdGJsAAAAwHN0c2QAAAAAAAAAAQAAALBhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAIAAgBIAAAASAAAAAAAAAABFUxhdmM2Mi4xMy4xMDAgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANmF2Y0MBZAAK/+EAGWdkAAqs2V+IiMBEAAADAAQAAAMAyDxIllgBAAZo6+PLIsD9+PgAAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAACLdAAAAAAAAAAGHN0dHMAAAAAAAAAAQAAAAEAAAIAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAABAAAAAQAAABRzdHN6AAAAAAAAAsoAAAABAAAAFHN0Y28AAAAAAAAAAQAAA0YAAABhdWR0YQAAAFltZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAACxpbHN0AAAAJKl0b28AAAAcZGF0YQAAAAEAAAAATGF2ZjYyLjQuMTAwAAAACGZyZWUAAALSbWRhdAAAAq4GBf//qtxF6b3m2Ui3lizYINkj7u94MjY0IC0gY29yZSAxNjUgcjMyMjIgYjM1NjA1YSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIwMjUgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0xIHJlZj0zIGRlYmxvY2s9MTowOjAgYW5hbHlzZT0weDM6MHgxMTMgbWU9aGV4IHN1Ym1lPTcgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MSBtZV9yYW5nZT0xNiBjaHJvbWFfbWU9MSB0cmVsbGlzPTEgOHg4ZGN0PTEgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9LTIgdGhyZWFkcz0xIGxvb2thaGVhZF90aHJlYWRzPTEgc2xpY2VkX3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdHJhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MyBiX3B5cmFtaWQ9MiBiX2FkYXB0PTEgYl9iaWFzPTAgZGlyZWN0PTEgd2VpZ2h0Yj0xIG9wZW5fZ29wPTAgd2VpZ2h0cD0yIGtleWludD0yNTAga2V5aW50X21pbj0yNSBzY2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmNfbG9va2FoZWFkPTQwIHJjPWNyZiBtYnRyZWU9MSBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0xOjEuMDAAgAAAABRliIQAK//+2OfzLJOXerfoNNpEvQ==",
+  "base64",
+));
 
 async function createExecution(ownerId = "owner") {
   const now = Date.now();
@@ -185,6 +198,47 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     });
     await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));
     expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test", legacyRecoveryBeforeMs: Date.now() })).toEqual({ claimed: 1, committed: 0, quarantined: 1 });
+  });
+
+  it.each([
+    ["image/jpeg", "jpg", completeJpegBytes],
+    ["image/webp", "webp", completeWebpBytes],
+    ["image/gif", "gif", completeGifBytes],
+    ["video/mp4", "mp4", completeMp4Bytes],
+  ] as const)("accepts a complete %s container", async (mimeType, extension, bytes) => {
+    const execution = await createExecution();
+    await expect(commitArtifactFromBuffer(bytes, {
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1,
+      logicalName: `complete.${extension}`, kind: mimeType === "video/mp4" ? ArtifactKind.VIDEO : ArtifactKind.IMAGE,
+      mimeType, visibility: ArtifactVisibility.PROJECT,
+    })).resolves.toMatchObject({ mimeType });
+  });
+
+  it.each([
+    ["image/jpeg", completeJpegBytes.subarray(0, completeJpegBytes.byteLength - 2)],
+    ["image/webp", completeWebpBytes.subarray(0, completeWebpBytes.byteLength - 1)],
+    ["image/gif", completeGifBytes.subarray(0, completeGifBytes.byteLength - 1)],
+    ["video/mp4", completeMp4Bytes.subarray(0, completeMp4Bytes.byteLength - 1)],
+  ] as const)("rejects a structurally truncated %s container", async (mimeType, bytes) => {
+    const execution = await createExecution();
+    await expect(commitArtifactFromBuffer(bytes, {
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1,
+      logicalName: "truncated", kind: mimeType === "video/mp4" ? ArtifactKind.VIDEO : ArtifactKind.IMAGE,
+      mimeType, visibility: ArtifactVisibility.PROJECT,
+    })).rejects.toThrow(/container is incomplete/i);
+  });
+
+  it("rejects a bounded MP4 that has ftyp and mdat but no moov", async () => {
+    const execution = await createExecution();
+    const withoutMoov = Buffer.concat([
+      Buffer.from([0, 0, 0, 16]), Buffer.from("ftyp"), Buffer.from("isom\0\0\0\0"),
+      Buffer.from([0, 0, 0, 8]), Buffer.from("mdat"),
+    ]);
+    await expect(commitArtifactFromBuffer(withoutMoov, {
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1,
+      logicalName: "no-moov.mp4", kind: ArtifactKind.VIDEO, mimeType: "video/mp4",
+      visibility: ArtifactVisibility.PROJECT,
+    })).rejects.toThrow(/container is incomplete/i);
   });
 
   it("does not recover a live delayed writer with a renewable STAGING lease", async () => {
