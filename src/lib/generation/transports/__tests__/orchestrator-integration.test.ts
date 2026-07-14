@@ -66,6 +66,20 @@ function makeCompletedHistory(promptId: string) {
   };
 }
 
+function makeTerminalErrorHistory(promptId: string, messageType: string) {
+  return {
+    [promptId]: {
+      promptId,
+      outputs: {},
+      status: {
+        statusStr: "error",
+        completed: true,
+        messages: [[messageType, {}] as [string, Record<string, unknown>]],
+      },
+    },
+  };
+}
+
 describe("PR-11: 编排器假后端集成", () => {
   let restoreWebSocket: (() => void) | null = null;
 
@@ -209,7 +223,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.cancellationRequested).toBe(true);
   });
 
-  it("执行中请求取消应进入 CANCELLED 状态", async () => {
+  it("escalates when cancellation termination remains unconfirmed", async () => {
     const promptId = "cancel-during-run";
     const transport = new FakeComfyUITransport({
       promptId,
@@ -229,12 +243,68 @@ describe("PR-11: 编排器假后端集成", () => {
           }
         },
       },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(result.cancellationRequested).toBe(true);
+  });
+
+  it("confirms cancellation only from an explicit cancelled history terminal", async () => {
+    const promptId = "cancel-history-terminal";
+    const confirmations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalErrorHistory(promptId, "execution_interrupted"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onPhaseChange: (phase) => {
+          if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();
+        },
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+      },
       fastConfig(),
     );
 
     const result = await orchestrator.execute(workflow);
 
     expect(result.phase).toBe("CANCELLED");
-    expect(result.cancellationRequested).toBe(true);
+    expect(confirmations).toEqual(["history-terminal-cancelled"]);
+  });
+
+  it("classifies an ordinary failed history terminal as failure, not cancellation", async () => {
+    const promptId = "cancel-race-failed";
+    const confirmations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalErrorHistory(promptId, "execution_error"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onPhaseChange: (phase) => {
+          if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();
+        },
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+      },
+      fastConfig(),
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(confirmations).toEqual([]);
   });
 });

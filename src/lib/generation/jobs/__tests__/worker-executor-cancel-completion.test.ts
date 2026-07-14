@@ -16,6 +16,7 @@ import {
   FakeComfyUITransport,
   defaultBackendFeatures,
   installFakeWebSocket,
+  jsonResponse,
 } from "@/lib/test-helpers/fake-comfyui";
 
 const mocks = vi.hoisted(() => ({
@@ -103,7 +104,8 @@ describe("worker completion after cancellation intent", () => {
   });
 
   async function arrangeExecution(
-    scenario: "known-completed" | "timeout-discovers-running" | "timeout-stays-unknown",
+    scenario: "known-completed" | "completion-wins-after-queue-absence"
+      | "timeout-discovers-running" | "timeout-stays-unknown",
   ) {
     const now = Date.now();
     const poolId = crypto.randomUUID();
@@ -183,6 +185,7 @@ describe("worker completion after cancellation intent", () => {
       private cancellationDispatched = false;
       private correlationId: string | undefined;
       private correlationProbeCount = 0;
+      private historyProbeCount = 0;
 
       override async get(path: string): Promise<Response> {
         if (scenario === "known-completed" && path === "/queue" && !this.cancellationPersisted) {
@@ -199,10 +202,22 @@ describe("worker completion after cancellation intent", () => {
             this.scenario.queueRunning = [{ prompt_id: promptId, correlation_id: this.correlationId }];
           }
         }
+        if (path === `/history/${promptId}` && scenario === "completion-wins-after-queue-absence") {
+          this.historyProbeCount++;
+          if (this.historyProbeCount === 1) return jsonResponse({});
+        }
         return super.get(path);
       }
 
       override async post(path: string, body: unknown): Promise<Response> {
+        if (path === "/prompt" && scenario === "completion-wins-after-queue-absence") {
+          const response = await super.post(path, body);
+          await db.update(generationJobs).set({
+            status: "CANCEL_REQUESTED",
+            cancelRequestedAtMs: Date.now(),
+          }).where(eq(generationJobs.id, jobId));
+          return response;
+        }
         if (path === "/prompt" && scenario !== "known-completed") {
           const record = body as { extra_data?: { correlation_id?: string } };
           const correlationId = record.extra_data?.correlation_id;
@@ -227,9 +242,11 @@ describe("worker completion after cancellation intent", () => {
 
     const transport = new CancellationRaceTransport({
       promptId,
-      submitError: scenario === "known-completed" ? undefined : new Error("submission timeout"),
+      submitError: scenario === "timeout-discovers-running" || scenario === "timeout-stays-unknown"
+        ? new Error("submission timeout")
+        : undefined,
       queueRunning: scenario === "known-completed" ? [{ prompt_id: promptId }] : [],
-      history: scenario === "known-completed" ? {
+      history: scenario === "known-completed" || scenario === "completion-wins-after-queue-absence" ? {
         [promptId]: {
           promptId,
           outputs: { "node-1": { images: [{ filename: "completed.png", subfolder: "", type: "output" }] } },
@@ -343,7 +360,7 @@ describe("worker completion after cancellation intent", () => {
     });
   });
 
-  it("reconciles a timed-out submission before safely cancelling the discovered prompt", async () => {
+  it("retains a discovered prompt when cancellation termination remains unknown", async () => {
     const arranged = await arrangeExecution("timeout-discovers-running");
     const result = await arranged.execute();
 
@@ -351,15 +368,35 @@ describe("worker completion after cancellation intent", () => {
     expect(arranged.cancellationDispatchDelayMs).toBeGreaterThan(60_000);
     expect(result).toMatchObject({
       success: false,
-      finalPhase: "CANCELLED",
+      finalPhase: "NEEDS_ATTENTION",
+      needsAttention: true,
+      claimDisposition: "release-terminal",
+    });
+    expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    const events = await db.select().from(generationEvents)
+      .where(eq(generationEvents.jobId, arranged.jobId));
+    expect(events.filter((event) => event.eventType === "external_cancellation_confirmed")).toHaveLength(0);
+    expect(events.filter((event) => event.eventType === "job_cancelled")).toHaveLength(0);
+    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
+      .toBe("NEEDS_ATTENTION");
+  });
+
+  it("lets a completion observed after queue absence win the cancellation race", async () => {
+    const arranged = await arrangeExecution("completion-wins-after-queue-absence");
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({
+      success: true,
+      finalPhase: "SUCCEEDED",
       claimDisposition: "release-terminal",
     });
     const events = await db.select().from(generationEvents)
       .where(eq(generationEvents.jobId, arranged.jobId));
-    expect(events.filter((event) => event.eventType === "external_cancellation_confirmed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "job_cancelled")).toHaveLength(1);
+    expect(events.some((event) => event.eventType === "external_cancellation_confirmed")).toBe(false);
+    expect(events.some((event) => event.eventType === "job_cancelled")).toBe(false);
+    expect(events.some((event) => event.eventType === "job_succeeded")).toBe(true);
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0].status)
-      .toBe("CANCELLED");
+      .toBe("SUCCEEDED");
   });
 
   it("escalates an uncorrelated timed-out submission without releasing its resource", async () => {

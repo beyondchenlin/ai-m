@@ -72,7 +72,7 @@ export interface ExecutionCallbacks {
 
 export interface CancellationConfirmationEvidence {
   outcome: "confirmed-cancelled";
-  source: "dispatch-ack-and-queue-absence";
+  source: "history-terminal-cancelled" | "strong-cancel-receipt";
   externalJobId: string;
   method: CancellationResult["method"];
   observedAtMs: number;
@@ -669,9 +669,8 @@ export class ComfyUIExecutionOrchestrator {
     try {
       const history = await probeHistory(this.transport, this.externalJobId);
       const result = history[this.externalJobId];
-      if (result?.status.completed) {
-        return { outcome: result.status.statusStr === "error" ? "failed" : "completed" };
-      }
+      const terminal = this.classifyCancellationHistory(result);
+      if (terminal) return terminal;
     } catch {
       // Fall through to queue evidence.
     }
@@ -680,23 +679,42 @@ export class ComfyUIExecutionOrchestrator {
       const queue = await probeQueueStatus(this.transport);
       const ids = [...queue.queueRunning, ...queue.queuePending].map((entry) => entry.promptId);
       if (ids.includes(this.externalJobId)) return { outcome: "pending" };
-      if (this.cancellationResult?.requested
-        && this.cancellationResult.evidenceKind === "dispatch-acknowledged") {
-        return {
-          outcome: "confirmed-cancelled",
-          evidence: {
-            outcome: "confirmed-cancelled",
-            source: "dispatch-ack-and-queue-absence",
-            externalJobId: this.externalJobId,
-            method: this.cancellationResult.method,
-            observedAtMs: Date.now(),
-          },
-        };
-      }
+      const history = await probeHistory(this.transport, this.externalJobId);
+      const terminal = this.classifyCancellationHistory(history[this.externalJobId]);
+      if (terminal) return terminal;
     } catch {
       // Absence of evidence is not evidence of cancellation.
     }
     return { outcome: "unknown" };
+  }
+
+  private classifyCancellationHistory(result: ComfyExecutionResult | undefined): CancellationOutcome | null {
+    if (!result?.status.completed) return null;
+
+    const status = result.status.statusStr.trim().toLowerCase();
+    const messageTypes = (result.status.messages ?? []).map(([type]) => type.trim().toLowerCase());
+    const explicitlyCancelled = ["cancelled", "canceled", "interrupted"].includes(status)
+      || messageTypes.some((type) => [
+        "execution_cancelled",
+        "execution_canceled",
+        "execution_interrupted",
+      ].includes(type));
+
+    if (explicitlyCancelled) {
+      return {
+        outcome: "confirmed-cancelled",
+        evidence: {
+          outcome: "confirmed-cancelled",
+          source: "history-terminal-cancelled",
+          externalJobId: this.externalJobId!,
+          method: this.cancellationResult?.method ?? "none",
+          observedAtMs: Date.now(),
+        },
+      };
+    }
+
+    if (["error", "failed", "failure"].includes(status)) return { outcome: "failed" };
+    return { outcome: "completed" };
   }
 
   private async refreshCancellationState(): Promise<boolean> {
@@ -716,8 +734,9 @@ export class ComfyUIExecutionOrchestrator {
     const interval = 100;
     const steps = Math.ceil(ms / interval);
     for (let i = 0; i < steps && !this.stopped; i++) {
+      const cancellationWasRequested = this.cancelRequested;
       const cancellationRequested = await this.refreshCancellationState();
-      if (cancellationRequested && interruptOnCancellation) break;
+      if (cancellationRequested && !cancellationWasRequested && interruptOnCancellation) break;
       await new Promise((r) => setTimeout(r, interval));
     }
   }

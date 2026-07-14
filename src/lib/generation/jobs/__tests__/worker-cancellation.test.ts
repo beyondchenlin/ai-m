@@ -370,7 +370,7 @@ describe("worker terminal transitions", () => {
       eventType: "external_cancellation_confirmed",
       severity: "info",
       safePayloadJson: {
-        source: "dispatch-ack-and-queue-absence",
+        source: "history-terminal-cancelled",
         externalJobId: "external-terminal",
       },
       createdAtMs: now,
