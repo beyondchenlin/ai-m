@@ -397,6 +397,15 @@ export class ComfyUIExecutionOrchestrator {
         if (result.externalStatus === "completed") {
           return true;
         }
+        if (result.externalStatus === "cancelled") {
+          const cancellation = this.classifyCancellationHistory(result.executionResult);
+          if (this.cancelRequested && cancellation?.outcome === "confirmed-cancelled") {
+            await this.confirmCancellation(cancellation);
+            return false;
+          }
+          this.phase = "FAILED";
+          return false;
+        }
         if (result.externalStatus === "failed") {
           this.phase = "FAILED";
           return false;
@@ -433,8 +442,7 @@ export class ComfyUIExecutionOrchestrator {
           return false;
         }
         if (cancellation.outcome === "confirmed-cancelled") {
-          await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
-          this.phase = "CANCELLED";
+          await this.confirmCancellation(cancellation);
           return false;
         }
       }
@@ -489,8 +497,7 @@ export class ComfyUIExecutionOrchestrator {
           return false;
         }
         if (cancellation.outcome === "confirmed-cancelled") {
-          await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
-          this.phase = "CANCELLED";
+          await this.confirmCancellation(cancellation);
           return false;
         }
       }
@@ -705,6 +712,13 @@ export class ComfyUIExecutionOrchestrator {
     if (historyOutcome === "failed") return { outcome: "failed" };
     if (historyOutcome === "completed") return { outcome: "completed" };
     return null;
+  }
+
+  private async confirmCancellation(
+    cancellation: Extract<CancellationOutcome, { outcome: "confirmed-cancelled" }>,
+  ): Promise<void> {
+    await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
+    this.phase = "CANCELLED";
   }
 
   private async refreshCancellationState(): Promise<boolean> {

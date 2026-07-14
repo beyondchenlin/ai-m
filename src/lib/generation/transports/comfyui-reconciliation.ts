@@ -6,7 +6,7 @@
  * 证据强度不足时保持不确定，进入人工处理。
  */
 
-import type { ComfyUITransport, ComfyExecutionResult } from "./comfyui";
+import type { ComfyUITransport, ComfyExecutionResult, ComfyHistoryOutcome } from "./comfyui";
 import { classifyComfyHistory, probeHistory, probeQueueStatus } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 
@@ -20,7 +20,9 @@ export interface ReconciliationResult {
   /** 证据强度 */
   evidenceStrength: EvidenceStrength;
   /** 外部任务状态（如找到） */
-  externalStatus?: "queued" | "running" | "completed" | "failed";
+  externalStatus?: "queued" | "running" | "completed" | "cancelled" | "failed";
+  /** Typed interpretation of a history record, kept separate from queue state. */
+  historyOutcome?: ComfyHistoryOutcome;
   /** 历史记录（如找到） */
   executionResult?: ComfyExecutionResult;
   /** 对账过程中发现的外部任务编号（提交响应丢失时用于恢复） */
@@ -189,14 +191,17 @@ export async function reconcileSubmission(
   const exists = foundInHistory || foundInQueueRunning || foundInQueuePending;
 
   let externalStatus: ReconciliationResult["externalStatus"];
+  const historyOutcome: ComfyHistoryOutcome | undefined = executionResult
+    ? classifyComfyHistory(executionResult)
+    : undefined;
   if (foundInQueueRunning) {
     externalStatus = "running";
   } else if (foundInQueuePending) {
     externalStatus = "queued";
   } else if (executionResult) {
-    const historyOutcome = classifyComfyHistory(executionResult);
     if (historyOutcome === "completed") externalStatus = "completed";
-    if (historyOutcome === "failed" || historyOutcome === "cancelled") externalStatus = "failed";
+    if (historyOutcome === "cancelled") externalStatus = "cancelled";
+    if (historyOutcome === "failed") externalStatus = "failed";
   }
 
   const evidenceStrength = computeOverallStrength(evidence, exists);
@@ -205,6 +210,7 @@ export async function reconcileSubmission(
     exists,
     evidenceStrength,
     externalStatus,
+    historyOutcome,
     executionResult,
     discoveredExternalJobId,
     evidence,

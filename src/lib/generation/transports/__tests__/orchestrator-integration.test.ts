@@ -85,6 +85,29 @@ function makeTerminalHistory(
   };
 }
 
+function makeCorrelationTerminalTransport(promptId: string, correlationId: string) {
+  class CorrelationTerminalTransport extends FakeComfyUITransport {
+    private queueProbes = 0;
+
+    override async get(path: string): Promise<Response> {
+      if (path === "/queue") {
+        this.queueProbes++;
+        this.scenario.queueRunning = this.queueProbes === 1
+          ? [{ prompt_id: promptId, correlation_id: correlationId }]
+          : [];
+      }
+      return super.get(path);
+    }
+  }
+
+  return new CorrelationTerminalTransport({
+    submitError: new Error("timeout"),
+    promptId,
+    queueRunning: [{ prompt_id: promptId, correlation_id: correlationId }],
+    history: makeTerminalHistory(promptId, "error", false, "execution_interrupted"),
+  });
+}
+
 describe("PR-11: 编排器假后端集成", () => {
   let restoreWebSocket: (() => void) | null = null;
 
@@ -256,6 +279,58 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(true);
     expect(result.cancellationRequested).toBe(true);
+  });
+
+  it("confirms a correlated interrupted history only in cancellation context", async () => {
+    const promptId = "correlated-interrupted-cancel";
+    const correlationId = "corr-interrupted-cancel";
+    const confirmations: string[] = [];
+    const reconciliationOutcomes: Array<string | undefined> = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      makeCorrelationTerminalTransport(promptId, correlationId),
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        isCancellationRequested: () => true,
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
+        onReconciliation: (result) => { reconciliationOutcomes.push(result.historyOutcome); },
+      },
+      fastConfig(),
+      correlationId,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("CANCELLED");
+    expect(result.externalJobId).toBe(promptId);
+    expect(confirmations).toEqual([promptId]);
+    expect(reconciliationOutcomes).toEqual(["cancelled"]);
+  });
+
+  it("treats a correlated interrupted history as failure without cancellation context", async () => {
+    const promptId = "correlated-interrupted-no-cancel";
+    const correlationId = "corr-interrupted-no-cancel";
+    const confirmations: string[] = [];
+    const reconciliationOutcomes: Array<string | undefined> = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      makeCorrelationTerminalTransport(promptId, correlationId),
+      defaultBackendFeatures(),
+      "http://localhost:8188",
+      {
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
+        onReconciliation: (result) => { reconciliationOutcomes.push(result.historyOutcome); },
+      },
+      fastConfig(),
+      correlationId,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(result.externalJobId).toBe(promptId);
+    expect(confirmations).toEqual([]);
+    expect(reconciliationOutcomes).toEqual(["cancelled"]);
   });
 
   it("confirms cancellation only from an explicit cancelled history terminal", async () => {
