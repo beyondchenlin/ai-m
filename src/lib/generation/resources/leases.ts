@@ -327,6 +327,11 @@ export interface ExpiredSlotSnapshot {
   attemptPhase: typeof generationAttempts.$inferSelect.phase | null;
   backendId: string | null;
   externalJobId: string | null;
+  attemptJobClaimFencingToken: number | null;
+  attemptResourcePoolId: string | null;
+  attemptResourceSlotNo: number | null;
+  attemptResourceLeaseToken: string | null;
+  attemptResourceFencingToken: number | null;
   jobStatus: typeof generationJobs.$inferSelect.status | null;
 }
 
@@ -335,7 +340,7 @@ export interface SlotReconciliationOutcome {
   slotNo: number;
   ownerAttemptId: string;
   disposition: "retained" | "reconciled";
-  reason: "pre-submission-safe" | "termination-proven" | "termination-proof-missing" | "slot-changed" | "live-job-claim";
+  reason: "pre-submission-safe" | "pre-submission-placeholder" | "termination-proven" | "termination-proof-missing" | "slot-changed" | "live-job-claim";
 }
 
 class SlotReconciliationRollback extends Error {}
@@ -349,13 +354,29 @@ export async function readExpiredSlotCandidates(
     attemptPhase: generationAttempts.phase,
     backendId: generationAttempts.backendId,
     externalJobId: generationAttempts.externalJobId,
+    attemptJobClaimFencingToken: generationAttempts.jobClaimFencingToken,
+    attemptResourcePoolId: generationAttempts.resourcePoolId,
+    attemptResourceSlotNo: generationAttempts.resourceSlotNo,
+    attemptResourceLeaseToken: generationAttempts.resourceLeaseToken,
+    attemptResourceFencingToken: generationAttempts.resourceFencingToken,
     jobStatus: generationJobs.status,
   }).from(resourcePoolSlots)
     .leftJoin(generationAttempts, eq(generationAttempts.id, resourcePoolSlots.ownerAttemptId))
     .leftJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
     .where(sql`${resourcePoolSlots.expiresAtMs} < ${scanNow} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`);
 
-  return rows.flatMap(({ slot, attemptPhase, backendId, externalJobId, jobStatus }) => {
+  return rows.flatMap(({
+    slot,
+    attemptPhase,
+    backendId,
+    externalJobId,
+    attemptJobClaimFencingToken,
+    attemptResourcePoolId,
+    attemptResourceSlotNo,
+    attemptResourceLeaseToken,
+    attemptResourceFencingToken,
+    jobStatus,
+  }) => {
     if (!slot.ownerAttemptId || !slot.leaseToken || slot.expiresAtMs === null) return [];
     return [{
       resourcePoolId: slot.resourcePoolId,
@@ -367,6 +388,11 @@ export async function readExpiredSlotCandidates(
       attemptPhase,
       backendId,
       externalJobId,
+      attemptJobClaimFencingToken,
+      attemptResourcePoolId,
+      attemptResourceSlotNo,
+      attemptResourceLeaseToken,
+      attemptResourceFencingToken,
       jobStatus,
     }];
   });
@@ -389,20 +415,43 @@ export async function applyExpiredSlotCandidates(
           || currentAttempt.phase !== slot.attemptPhase
           || currentAttempt.backendId !== slot.backendId
           || currentAttempt.externalJobId !== slot.externalJobId
-          || currentAttempt.resourcePoolId !== slot.resourcePoolId
-          || currentAttempt.resourceSlotNo !== slot.slotNo
-          || currentAttempt.resourceLeaseToken !== slot.leaseToken
-          || currentAttempt.resourceFencingToken !== slot.fencingToken) {
+          || currentAttempt.jobClaimFencingToken !== slot.attemptJobClaimFencingToken
+          || currentAttempt.resourcePoolId !== slot.attemptResourcePoolId
+          || currentAttempt.resourceSlotNo !== slot.attemptResourceSlotNo
+          || currentAttempt.resourceLeaseToken !== slot.attemptResourceLeaseToken
+          || currentAttempt.resourceFencingToken !== slot.attemptResourceFencingToken) {
+          return { disposition: "retained", reason: "slot-changed" } as const;
+        }
+
+        const isUnboundPlaceholder = currentAttempt.phase === "PREPARING"
+          && currentAttempt.externalJobId === null
+          && currentAttempt.resourcePoolId === slot.resourcePoolId
+          && currentAttempt.resourceSlotNo === 0
+          && currentAttempt.resourceLeaseToken === `pending-${currentAttempt.id}`
+          && currentAttempt.resourceFencingToken === 0;
+        if (!isUnboundPlaceholder
+          && (currentAttempt.resourcePoolId !== slot.resourcePoolId
+            || currentAttempt.resourceSlotNo !== slot.slotNo
+            || currentAttempt.resourceLeaseToken !== slot.leaseToken
+            || currentAttempt.resourceFencingToken !== slot.fencingToken)) {
           return { disposition: "retained", reason: "slot-changed" } as const;
         }
 
         const safeBeforeSubmission = preSubmissionPhases.has(currentAttempt.phase)
           && currentAttempt.externalJobId === null;
         const currentJob = safeBeforeSubmission ? tx.select({
+          status: generationJobs.status,
           currentAttemptId: generationJobs.currentAttemptId,
           claimOwner: generationJobs.claimOwner,
           claimUntilMs: generationJobs.claimUntilMs,
+          claimFencingToken: generationJobs.claimFencingToken,
         }).from(generationJobs).where(eq(generationJobs.id, currentAttempt.jobId)).get() : undefined;
+        if (isUnboundPlaceholder && (!currentJob
+          || currentJob.currentAttemptId !== currentAttempt.id
+          || (currentJob.status !== "RUNNING" && currentJob.status !== "CANCEL_REQUESTED")
+          || currentJob.claimFencingToken !== currentAttempt.jobClaimFencingToken)) {
+          return { disposition: "retained", reason: "slot-changed" } as const;
+        }
         if (currentJob?.currentAttemptId === currentAttempt.id
           && currentJob.claimOwner !== null
           && (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= scanNow)) {
@@ -454,7 +503,9 @@ export async function applyExpiredSlotCandidates(
         }
         return {
           disposition: "reconciled",
-          reason: safeBeforeSubmission ? "pre-submission-safe" : "termination-proven",
+          reason: isUnboundPlaceholder
+            ? "pre-submission-placeholder"
+            : safeBeforeSubmission ? "pre-submission-safe" : "termination-proven",
         } as const;
       }, { behavior: "immediate" });
       outcomes.push({

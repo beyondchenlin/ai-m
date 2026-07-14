@@ -184,6 +184,159 @@ describe("resource slot reconciliation concurrency", () => {
     return { poolId, backendId, jobId, attemptId, leaseToken, fencingToken, expiresAtMs };
   }
 
+  async function seedProductionPlaceholder(input: {
+    claimOwner: string | null;
+    claimUntilMs: number | null;
+  }) {
+    const poolId = crypto.randomUUID();
+    const backendId = crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    const attemptId = crypto.randomUUID();
+    const workerId = "worker-placeholder";
+    const jobFencingToken = 13;
+    await db.insert(resourcePools).values({
+      id: poolId,
+      displayName: "placeholder-pool",
+      capacity: 1,
+      policyJson: {},
+      createdAtMs: NOW,
+      updatedAtMs: NOW,
+    });
+    await db.insert(executionBackends).values({
+      id: backendId,
+      displayName: "placeholder-backend",
+      adapterKind: "comfyui",
+      baseUrl: "http://127.0.0.1:8188",
+      topology: "same-host",
+      sharingMode: "dedicated",
+      authType: "none",
+      authConfigJson: {},
+      tlsConfigJson: {},
+      networkPolicyJson: {},
+      resourcePoolId: poolId,
+      capabilitiesJson: {},
+      createdAtMs: NOW,
+      updatedAtMs: NOW,
+    });
+    await db.insert(resourcePoolSlots).values({
+      resourcePoolId: poolId,
+      slotNo: 1,
+      ownerAttemptId: null,
+      leaseToken: null,
+      fencingToken: 0,
+      expiresAtMs: null,
+      updatedAtMs: NOW,
+    });
+    await db.insert(generationJobs).values({
+      id: jobId,
+      capability: "image",
+      status: "RUNNING",
+      executionSnapshotJson: {},
+      inputDigest: "placeholder-window",
+      claimOwner: workerId,
+      claimUntilMs: NOW + 60_000,
+      claimFencingToken: jobFencingToken,
+      createdAtMs: NOW,
+      updatedAtMs: NOW,
+    });
+    expect(stateTransitions.attachOwnedAttempt({
+      jobId,
+      workerId,
+      jobFencingToken,
+    }, {
+      clock: () => NOW,
+      attempt: {
+        id: attemptId,
+        jobId,
+        attemptNo: 1,
+        jobClaimFencingToken: jobFencingToken,
+        phase: "PREPARING",
+        backendId,
+        backendFeatureSnapshotJson: {},
+        environmentFingerprint: "env:placeholder",
+        submissionCorrelationId: `corr-${attemptId}`,
+        externalIdStrategy: "server-assigned",
+        systemOutputPrefix: `prefix-${attemptId}`,
+        resourcePoolId: poolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${attemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: NOW,
+        updatedAtMs: NOW,
+      },
+    }, workerDb)).toEqual({ status: "applied" });
+    const lease = await acquireResourceSlot(poolId, attemptId, workerId);
+    expect(lease).not.toBeNull();
+    await db.update(resourcePoolSlots).set({
+      expiresAtMs: NOW - 1,
+      updatedAtMs: NOW,
+    }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, poolId),
+      eq(resourcePoolSlots.slotNo, 1),
+    ));
+    await db.update(generationJobs).set({
+      claimOwner: input.claimOwner,
+      claimUntilMs: input.claimUntilMs,
+      updatedAtMs: NOW,
+    }).where(eq(generationJobs.id, jobId));
+    return {
+      poolId,
+      backendId,
+      jobId,
+      attemptId,
+      workerId,
+      jobFencingToken,
+      lease: lease!,
+    };
+  }
+
+  async function attachAndAcquireNextAttempt(input: {
+    poolId: string;
+    backendId: string;
+  }) {
+    const jobId = crypto.randomUUID();
+    const attemptId = crypto.randomUUID();
+    const workerId = "worker-next";
+    const jobFencingToken = 14;
+    await db.insert(generationJobs).values({
+      id: jobId,
+      capability: "image",
+      status: "RUNNING",
+      executionSnapshotJson: {},
+      inputDigest: "placeholder-next-owner",
+      claimOwner: workerId,
+      claimUntilMs: NOW + 60_000,
+      claimFencingToken: jobFencingToken,
+      createdAtMs: NOW,
+      updatedAtMs: NOW,
+    });
+    expect(stateTransitions.attachOwnedAttempt({ jobId, workerId, jobFencingToken }, {
+      clock: () => NOW,
+      attempt: {
+        id: attemptId,
+        jobId,
+        attemptNo: 1,
+        jobClaimFencingToken: jobFencingToken,
+        phase: "PREPARING",
+        backendId: input.backendId,
+        backendFeatureSnapshotJson: {},
+        environmentFingerprint: "env:placeholder-next",
+        submissionCorrelationId: `corr-${attemptId}`,
+        externalIdStrategy: "server-assigned",
+        systemOutputPrefix: `prefix-${attemptId}`,
+        resourcePoolId: input.poolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${attemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: NOW,
+        updatedAtMs: NOW,
+      },
+    }, workerDb)).toEqual({ status: "applied" });
+    const lease = await acquireResourceSlot(input.poolId, attemptId, workerId);
+    expect(lease).not.toBeNull();
+    return { jobId, attemptId, workerId, jobFencingToken, lease: lease! };
+  }
+
   function insertMatchingProof(
     seeded: Awaited<ReturnType<typeof seedExpiredSlot>>,
     proofKind: "history-completed" | "history-cancelled" | "history-failed" = "history-cancelled",
@@ -290,6 +443,128 @@ describe("resource slot reconciliation concurrency", () => {
       fencingToken: seeded.fencingToken,
       clock: () => NOW,
     }, workerDb)).toEqual({ status: "ownership-lost" });
+  });
+
+  it("releases the physical lease from an unbound production placeholder after claim expiry", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW - 1,
+    });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "reconciled", reason: "pre-submission-placeholder" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBeNull();
+    expect(scannerConnection.prepare("SELECT COUNT(*) AS count FROM resource_reconciliation_proofs").get())
+      .toEqual({ count: 0 });
+
+    const next = await attachAndAcquireNextAttempt(seeded);
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: seeded.lease.leaseToken,
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, scannerDb)).toEqual({ status: "ownership-lost" });
+    const currentSlot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(currentSlot?.ownerAttemptId).toBe(next.attemptId);
+  });
+
+  it("retains an unbound production placeholder while its claim is live", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+    });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+  });
+
+  it("retains an unbound production placeholder when claim expiry is unknown", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: null,
+    });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+  });
+
+  it("releases an unbound production placeholder after its claim owner is cleared", async () => {
+    const seeded = await seedProductionPlaceholder({ claimOwner: null, claimUntilMs: null });
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "reconciled", reason: "pre-submission-placeholder" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBeNull();
+  });
+
+  it("retains malformed placeholder-like identity instead of treating it as unbound", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW - 1,
+    });
+    await db.update(generationAttempts).set({
+      resourceLeaseToken: `pending-not-${seeded.attemptId}`,
+    }).where(eq(generationAttempts.id, seeded.attemptId));
+
+    const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
+    const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
+
+    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "slot-changed" }]);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
+      "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+  });
+
+  it("allows only one scanner to release an expired production placeholder", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW - 1,
+    });
+    const [leftCandidates, rightCandidates] = await Promise.all([
+      readExpiredSlotCandidates(NOW, scannerDb),
+      readExpiredSlotCandidates(NOW, workerDb),
+    ]);
+
+    const [left, right] = await Promise.all([
+      applyExpiredSlotCandidates(leftCandidates, scannerDb, () => NOW),
+      applyExpiredSlotCandidates(rightCandidates, workerDb, () => NOW),
+    ]);
+
+    expect([...left, ...right].filter((outcome) => outcome.disposition === "reconciled")).toHaveLength(1);
+    const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null; fencingToken: number }>(
+      "SELECT owner_attempt_id AS ownerAttemptId, fencing_token AS fencingToken FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
+    ).get(seeded.poolId);
+    expect(slot).toEqual({ ownerAttemptId: null, fencingToken: seeded.lease.fencingToken + 1 });
   });
 
   it("retains a current pre-submission attempt when a claim owner has no expiry evidence", async () => {
