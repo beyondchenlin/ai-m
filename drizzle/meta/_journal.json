@@ -435,6 +435,13 @@
       "when": 1784295600000,
       "tag": "0061_resource_slot_owner_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1784382000000,
+      "tag": "0062_artifact_recovery_leases",
+      "breakpoints": true
     }
   ]
 }

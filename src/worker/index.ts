@@ -66,6 +66,7 @@ function startRecoveryScanner() {
     if (recoveryScanRunning) return;
     recoveryScanRunning = true;
     try {
+      const artifactRecovery = await recoverStagingArtifacts({ recoveryOwner: WORKER_ID });
       const result = await scanExpiredClaims();
       const projections = await reconcileBusinessArtifactProjections();
       const cleanedSharedInputs = await cleanupTerminalSharedInputs();
@@ -73,6 +74,9 @@ function startRecoveryScanner() {
       const sourceCleanup = await cleanupSourceAssetStorage();
       if (projections.projected > 0 || projections.failed > 0) {
         console.log(`[${WORKER_ID}] Business projections: projected=${projections.projected}, pending=${projections.failed}`);
+      }
+      if (artifactRecovery.claimed > 0) {
+        console.log(`[${WORKER_ID}] Artifact recovery: claimed=${artifactRecovery.claimed}, committed=${artifactRecovery.committed}, quarantined=${artifactRecovery.quarantined}`);
       }
       if (result.requeuedJobs.length > 0) console.log(`[${WORKER_ID}] Recovery: requeued ${result.requeuedJobs.length} pre-submission jobs`);
       if (result.attentionJobs.length > 0) console.warn(`[${WORKER_ID}] Recovery: escalated ${result.attentionJobs.length} externally-uncertain jobs`);
@@ -175,13 +179,13 @@ async function mainLoop() {
   await waitForPlatformSchema();
   console.log(`[${WORKER_ID}] Platform schema ready, polling for jobs...`);
 
-  const artifactRecovery = await recoverStagingArtifacts();
+  const artifactRecovery = await recoverStagingArtifacts({ recoveryOwner: WORKER_ID });
   const cleanedSharedInputs = await cleanupTerminalSharedInputs();
   const sourceRecovery = await recoverSourceMediaAssets();
   const sourceCleanup = await cleanupSourceAssetStorage();
   if (artifactRecovery.committed || artifactRecovery.quarantined) {
     console.log(
-      `[${WORKER_ID}] Artifact recovery: committed=${artifactRecovery.committed}, quarantined=${artifactRecovery.quarantined}`,
+      `[${WORKER_ID}] Artifact recovery: claimed=${artifactRecovery.claimed}, committed=${artifactRecovery.committed}, quarantined=${artifactRecovery.quarantined}`,
     );
   }
 

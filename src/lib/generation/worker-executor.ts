@@ -366,6 +366,7 @@ export async function executeGenerationJob(
         const committed = await streamCommitArtifact({
           attemptId,
           expectedJobClaimFencingToken: jobFencingToken,
+          writerOwner: workerId,
           logicalName: `${output.nodeId}_${output.filename}`,
           kind: media.kind,
           mimeType: media.mimeType,

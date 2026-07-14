@@ -29,6 +29,7 @@ describe("migration journal startup ordering", () => {
   const repositoryBundle = loadValidatedMigrationBundle(path.resolve("drizzle"));
   const OLD_0060_HASH = "92abf3be9aac6c6591cd7c5ca7cc9527cf42baa04bd79b4aeb6790797dadef23";
   const OLD_0060_TIMESTAMP = 1784209200000;
+  const PUBLISHED_0061_HASH = "1616ca4c54d5af31ced5ca321a016f3124a0dc2b36a1941c4710e3ade010221f";
 
   it("preserves exact published 0060 bytes and binds the precondition to additive 0061", () => {
     expect(createHash("sha256").update(fs.readFileSync(
@@ -38,7 +39,10 @@ describe("migration journal startup ordering", () => {
       folderMillis: OLD_0060_TIMESTAMP,
       hash: OLD_0060_HASH,
     });
-    expect(repositoryBundle.migrations).toHaveLength(62);
+    expect(createHash("sha256").update(fs.readFileSync(
+      path.resolve("drizzle/0061_resource_slot_owner_unique.sql"),
+    )).digest("hex")).toBe(PUBLISHED_0061_HASH);
+    expect(repositoryBundle.migrations).toHaveLength(63);
     expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hash }) => ({ folderMillis, hash })))
       .toEqual([{
         folderMillis: repositoryBundle.migrations[61].folderMillis,
@@ -69,6 +73,17 @@ describe("migration journal startup ordering", () => {
       if (!statement.includes("resource_pool_slots_owner_attempt_unique")) sqlite.exec(statement);
     }
     insert.run(OLD_0060_HASH, OLD_0060_TIMESTAMP);
+    return sqlite;
+  }
+
+  function databaseRecordedThroughPublished0061(): Database.Database {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const insert = sqlite.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+    for (const migration of repositoryBundle.migrations.slice(0, 62)) {
+      for (const statement of migration.sql ?? []) sqlite.exec(statement);
+      insert.run(migration.hash, migration.folderMillis);
+    }
     return sqlite;
   }
 
@@ -510,13 +525,13 @@ describe("migration journal startup ordering", () => {
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it("upgrades a database recorded through published 0060 by applying only 0061", () => {
+  it("upgrades a database recorded through published 0060 by applying additive 0061 and 0062", () => {
     const sqlite = databaseRecordedThroughPublished0060();
     try {
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
       expect(sqlite.prepare<[], { count: number }>(
         'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
-      ).get()).toEqual({ count: 62 });
+      ).get()).toEqual({ count: 63 });
       expect(sqlite.prepare(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
       ).get()).toBeDefined();
@@ -562,13 +577,29 @@ describe("migration journal startup ordering", () => {
 
       sqlite.prepare("DELETE FROM resource_pool_slots WHERE resource_pool_id=? AND slot_no=?")
         .run("legacy-pool-b", 2);
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
       expect(sqlite.prepare(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
       ).get()).toBeDefined();
       expect(sqlite.prepare<[], { count: number }>(
         'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
-      ).get()).toEqual({ count: 62 });
+      ).get()).toEqual({ count: 63 });
+    } finally { sqlite.close(); }
+  });
+
+  it("upgrades a database recorded through published 0061 by applying only 0062", () => {
+    const sqlite = databaseRecordedThroughPublished0061();
+    try {
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      const columns = sqlite.prepare<[], { name: string }>("PRAGMA table_info('generation_artifacts')")
+        .all().map((column) => column.name);
+      expect(columns).toEqual(expect.arrayContaining([
+        "writer_lease_owner", "writer_lease_token", "writer_lease_expires_at_ms",
+        "recovery_lease_owner", "recovery_lease_token", "recovery_lease_expires_at_ms",
+      ]));
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='generation_artifacts_lease_validate_update'",
+      ).get()).toBeDefined();
     } finally { sqlite.close(); }
   });
 

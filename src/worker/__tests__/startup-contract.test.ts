@@ -153,6 +153,17 @@ function mutate(
 }
 
 describe("worker startup command contract", () => {
+  it("establishes worker identity before startup and periodic artifact recovery", () => {
+    const identity = workerSource.indexOf("const WORKER_ID =");
+    const schemaReady = workerSource.indexOf("await waitForPlatformSchema()");
+    const recoveryCall = "recoverStagingArtifacts({ recoveryOwner: WORKER_ID })";
+    const startupRecovery = workerSource.indexOf(recoveryCall, schemaReady);
+    expect(identity).toBeGreaterThanOrEqual(0);
+    expect(schemaReady).toBeGreaterThan(identity);
+    expect(startupRecovery).toBeGreaterThan(schemaReady);
+    expect(workerSource.split(recoveryCall)).toHaveLength(3);
+  });
+
   it.each([
     ['double-quoted operator', 'node "&&" tsx', [["node", "&&", "tsx"]]],
     ["single-quoted operator", "node '&&' tsx", [["node", "&&", "tsx"]]],

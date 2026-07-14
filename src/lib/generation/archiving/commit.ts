@@ -1,10 +1,10 @@
 /** Durable, streamed, two-phase media artifact commit. */
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
-import { db } from "@/lib/db";
+import { and, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
+import { db, type DB } from "@/lib/db";
 import { generationArtifacts, generationAttempts, generationJobs, projects } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
@@ -45,6 +45,8 @@ export interface ArtifactStreamInput {
   /** Maximum wait for each upstream chunk; prevents a stalled backend holding a worker forever. */
   readTimeoutMs?: number;
   metadata?: Record<string, unknown>;
+  /** Stable worker identity used to own and renew the pre-publication lease. */
+  writerOwner?: string;
 }
 
 export interface ArtifactCommitResult {
@@ -57,6 +59,25 @@ export interface ArtifactCommitResult {
   height?: number;
   durationMs?: number;
 }
+
+export interface ArtifactRecoveryOptions {
+  recoveryOwner: string;
+  database?: DB;
+  now?: () => number;
+  writerGraceMs?: number;
+  recoveryLeaseMs?: number;
+}
+
+export interface ArtifactRecoveryResult {
+  claimed: number;
+  committed: number;
+  quarantined: number;
+}
+
+const WRITER_LEASE_MS = 30_000;
+const WRITER_RENEW_INTERVAL_MS = 10_000;
+const RECOVERY_LEASE_MS = 30_000;
+const LEGACY_STAGING_GRACE_MS = 30_000;
 
 export function getArtifactRoot(): string {
   return path.resolve(process.env.UPLOAD_DIR || "./uploads", "generation-artifacts");
@@ -207,6 +228,24 @@ async function assertAttemptFence(attemptId: string, expectedToken: number | und
   }
 }
 
+async function renewWriterLease(
+  artifactId: string,
+  owner: string,
+  token: string,
+  now: number,
+): Promise<boolean> {
+  const changed = await db.update(generationArtifacts).set({
+    writerLeaseExpiresAtMs: now + WRITER_LEASE_MS,
+  }).where(and(
+    eq(generationArtifacts.id, artifactId),
+    eq(generationArtifacts.status, "STAGING"),
+    eq(generationArtifacts.writerLeaseOwner, owner),
+    eq(generationArtifacts.writerLeaseToken, token),
+    gt(generationArtifacts.writerLeaseExpiresAtMs, now),
+  )).returning({ id: generationArtifacts.id });
+  return Boolean(changed[0]);
+}
+
 export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<ArtifactCommitResult> {
   if (!isEnabled(FF.V2_MEDIA_ARCHIVING)) throw new Error("v2.0 media archiving is not enabled");
   if (!EXTENSIONS[input.mimeType]) throw new Error(`Unsupported artifact MIME type: ${input.mimeType}`);
@@ -224,6 +263,8 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
   const finalPath = resolveArtifactStoragePath(relativeFinal);
   const stagingKey = path.posix.join(".staging", safeSegment(input.attemptId), `${id}.part`);
   const stagingPath = resolveArtifactStoragePath(stagingKey);
+  const writerOwner = input.writerOwner?.trim() || `writer-${process.pid}`;
+  const writerToken = genId();
   await fs.mkdir(path.dirname(finalPath), { recursive: true });
   await fs.mkdir(path.dirname(stagingPath), { recursive: true });
 
@@ -238,24 +279,48 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
       maxSizeBytes: maxBytes,
     },
     parentArtifactId: input.parentArtifactId ?? null, committedAtMs: null,
+    writerLeaseOwner: writerOwner, writerLeaseToken: writerToken,
+    writerLeaseExpiresAtMs: now + WRITER_LEASE_MS,
+    recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
     createdAtMs: now, updatedAtMs: now,
   });
 
   let renamed = false;
+  let leaseLost = false;
+  let renewal = Promise.resolve();
+  const renewalTimer = setInterval(() => {
+    renewal = renewal.then(async () => {
+      if (!await renewWriterLease(id, writerOwner, writerToken, Date.now())) leaseLost = true;
+    }).catch(() => { leaseLost = true; });
+  }, WRITER_RENEW_INTERVAL_MS);
+  renewalTimer.unref?.();
   try {
     const readTimeoutMs = input.readTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1_000 || readTimeoutMs > 5 * 60 * 1000) throw new Error("Invalid artifact read timeout");
     const written = await writeWebStreamToFile(input.read(), stagingPath, maxBytes, readTimeoutMs);
+    await renewal;
+    if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
+      throw new Error("Artifact writer lease was lost");
+    }
     if (!validateMagicBytes(written.header, input.mimeType)) throw new Error(`Content signature does not match ${input.mimeType}`);
     await assertAttemptFence(input.attemptId, input.expectedJobClaimFencingToken);
     await syncFile(stagingPath);
+    await renewal;
+    if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, Date.now())) {
+      throw new Error("Artifact writer lease was lost before publish");
+    }
     await fs.rename(stagingPath, finalPath);
     await syncDirectory(path.dirname(finalPath));
     renamed = true;
     const durationMs = input.kind === "audio"
       ? await probeMediaDurationMs(finalPath, { maxDurationMs: 6 * 60 * 60 * 1000 })
       : null;
+    clearInterval(renewalTimer);
+    await renewal;
     const committedAtMs = Date.now();
+    if (leaseLost || !await renewWriterLease(id, writerOwner, writerToken, committedAtMs)) {
+      throw new Error("Artifact writer lease was lost before commit");
+    }
     const updated = db.transaction((tx) => {
       if (input.expectedJobClaimFencingToken !== undefined) {
         const [fence] = tx
@@ -276,7 +341,14 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
       return tx.update(generationArtifacts).set({
         status: "COMMITTED", sizeBytes: written.sizeBytes, sha256: written.sha256,
         durationMs, committedAtMs, updatedAtMs: committedAtMs, metadataJson: input.metadata ?? {},
-      }).where(and(eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"))).returning({ id: generationArtifacts.id }).all();
+        writerLeaseOwner: null, writerLeaseToken: null, writerLeaseExpiresAtMs: null,
+      }).where(and(
+        eq(generationArtifacts.id, id),
+        eq(generationArtifacts.status, "STAGING"),
+        eq(generationArtifacts.writerLeaseOwner, writerOwner),
+        eq(generationArtifacts.writerLeaseToken, writerToken),
+        gt(generationArtifacts.writerLeaseExpiresAtMs, committedAtMs),
+      )).returning({ id: generationArtifacts.id }).all();
     });
     if (!updated[0]) throw new Error("Artifact commit lost its STAGING state");
     await writeAuditEvent({
@@ -292,6 +364,8 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
       ...(durationMs !== null ? { durationMs } : {}),
     };
   } catch (error) {
+    clearInterval(renewalTimer);
+    await renewal.catch(() => undefined);
     if (renamed) {
       // Preserve STAGING: startup reconciliation can finish the rename/database
       // crash window without losing a valid immutable output.
@@ -299,14 +373,23 @@ export async function streamCommitArtifact(input: ArtifactStreamInput): Promise<
         metadataJson: {
           ...(input.metadata ?? {}), stagingPath: stagingKey, maxSizeBytes: maxBytes, recoveryRequired: true,
         }, updatedAtMs: Date.now(),
-      }).where(and(eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"))).catch(() => undefined);
+      }).where(and(
+        eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"),
+        eq(generationArtifacts.writerLeaseOwner, writerOwner), eq(generationArtifacts.writerLeaseToken, writerToken),
+      )).catch(() => undefined);
     } else {
-      await fs.rm(stagingPath, { force: true }).catch(() => undefined);
-      await db.update(generationArtifacts).set({
+      const failedAt = Date.now();
+      const changed = await db.update(generationArtifacts).set({
         status: "QUARANTINED",
         metadataJson: { ...(input.metadata ?? {}), failure: error instanceof Error ? error.message.slice(0, 300) : "artifact_commit_failed" },
-        updatedAtMs: Date.now(),
-      }).where(eq(generationArtifacts.id, id)).catch(() => undefined);
+        writerLeaseOwner: null, writerLeaseToken: null, writerLeaseExpiresAtMs: null,
+        updatedAtMs: failedAt,
+      }).where(and(
+        eq(generationArtifacts.id, id), eq(generationArtifacts.status, "STAGING"),
+        eq(generationArtifacts.writerLeaseOwner, writerOwner), eq(generationArtifacts.writerLeaseToken, writerToken),
+        gt(generationArtifacts.writerLeaseExpiresAtMs, failedAt),
+      )).returning({ id: generationArtifacts.id }).catch(() => []);
+      if (changed[0]) await fs.rm(stagingPath, { force: true }).catch(() => undefined);
     }
     throw error;
   }
@@ -319,12 +402,81 @@ export async function commitArtifactFromBuffer(buffer: Uint8Array, input: Omit<A
   });
 }
 
-/** Recover the rename/database crash window for STAGING artifacts. */
-export async function recoverStagingArtifacts(): Promise<{ committed: number; quarantined: number }> {
-  const rows = await db.select().from(generationArtifacts).where(eq(generationArtifacts.status, "STAGING"));
+async function renewRecoveryLease(
+  database: DB,
+  artifactId: string,
+  owner: string,
+  token: string,
+  now: number,
+  leaseMs: number,
+): Promise<boolean> {
+  const changed = await database.update(generationArtifacts).set({
+    recoveryLeaseExpiresAtMs: now + leaseMs,
+  }).where(and(
+    eq(generationArtifacts.id, artifactId),
+    eq(generationArtifacts.status, "RECOVERING"),
+    eq(generationArtifacts.recoveryLeaseOwner, owner),
+    eq(generationArtifacts.recoveryLeaseToken, token),
+    gt(generationArtifacts.recoveryLeaseExpiresAtMs, now),
+  )).returning({ id: generationArtifacts.id });
+  return Boolean(changed[0]);
+}
+
+/** Atomically claim and recover abandoned writer output. */
+export async function recoverStagingArtifacts(options: ArtifactRecoveryOptions): Promise<ArtifactRecoveryResult> {
+  const database = options.database ?? db;
+  const clock = options.now ?? Date.now;
+  const now = clock();
+  const graceMs = options.writerGraceMs ?? LEGACY_STAGING_GRACE_MS;
+  const leaseMs = options.recoveryLeaseMs ?? RECOVERY_LEASE_MS;
+  if (!options.recoveryOwner.trim()) throw new Error("Artifact recovery owner is required");
+  if (!Number.isSafeInteger(graceMs) || graceMs < 0) throw new Error("Invalid artifact recovery grace period");
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000) throw new Error("Invalid artifact recovery lease duration");
+  const rows = await database.select().from(generationArtifacts)
+    .where(inArray(generationArtifacts.status, ["STAGING", "RECOVERING"]));
+  let claimed = 0;
   let committed = 0;
   let quarantined = 0;
-  for (const artifact of rows) {
+  for (const candidateRow of rows) {
+    const recoveryToken = genId();
+    const eligibleWriter = or(
+      and(
+        isNull(generationArtifacts.writerLeaseOwner),
+        isNull(generationArtifacts.writerLeaseToken),
+        isNull(generationArtifacts.writerLeaseExpiresAtMs),
+        lte(generationArtifacts.updatedAtMs, now - graceMs),
+      ),
+      lte(generationArtifacts.writerLeaseExpiresAtMs, now),
+    );
+    const claimCondition = candidateRow.status === "RECOVERING"
+      ? and(
+        eq(generationArtifacts.status, "RECOVERING"),
+        lte(generationArtifacts.recoveryLeaseExpiresAtMs, now),
+      )
+      : and(eq(generationArtifacts.status, "STAGING"), eligibleWriter);
+    const [artifact] = await database.update(generationArtifacts).set({
+      status: "RECOVERING",
+      writerLeaseOwner: null,
+      writerLeaseToken: null,
+      writerLeaseExpiresAtMs: null,
+      recoveryLeaseOwner: options.recoveryOwner,
+      recoveryLeaseToken: recoveryToken,
+      recoveryLeaseExpiresAtMs: now + leaseMs,
+      updatedAtMs: now,
+    }).where(and(eq(generationArtifacts.id, candidateRow.id), claimCondition))
+      .returning();
+    if (!artifact) continue;
+    claimed++;
+    let recoveryLeaseLost = false;
+    let recoveryRenewal = Promise.resolve();
+    const recoveryRenewalTimer = setInterval(() => {
+      recoveryRenewal = recoveryRenewal.then(async () => {
+        if (!await renewRecoveryLease(
+          database, artifact.id, options.recoveryOwner, recoveryToken, clock(), leaseMs,
+        )) recoveryLeaseLost = true;
+      }).catch(() => { recoveryLeaseLost = true; });
+    }, Math.max(500, Math.floor(leaseMs / 3)));
+    recoveryRenewalTimer.unref?.();
     const finalPath = resolveArtifactStoragePath(artifact.storageKey);
     const metadata = artifact.metadataJson as Record<string, unknown>;
     const stagingKey = typeof metadata.stagingPath === "string" ? metadata.stagingPath : null;
@@ -333,14 +485,28 @@ export async function recoverStagingArtifacts(): Promise<{ committed: number; qu
       const info = await fs.lstat(filePath).catch(() => null);
       return info && !info.isSymbolicLink() && info.isFile() ? filePath : null;
     };
-    const candidate = await usableFile(finalPath) ?? (stagingPath ? await usableFile(stagingPath) : null);
-    if (!candidate) {
-      const changed = await db.update(generationArtifacts).set({ status: "QUARANTINED", updatedAtMs: Date.now(), metadataJson: { ...metadata, recovery: "file_missing" } }).where(and(eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "STAGING"))).returning({ id: generationArtifacts.id });
+    const sourceCandidate = await usableFile(finalPath) ?? (stagingPath ? await usableFile(stagingPath) : null);
+    if (!sourceCandidate) {
+      clearInterval(recoveryRenewalTimer);
+      await recoveryRenewal;
+      const terminalAt = clock();
+      const changed = await database.update(generationArtifacts).set({
+        status: "QUARANTINED", updatedAtMs: terminalAt,
+        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
+        metadataJson: { ...metadata, recovery: "file_missing" },
+      }).where(and(
+        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
+        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
+        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
+        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
+      )).returning({ id: generationArtifacts.id });
       if (changed[0]) quarantined++;
       continue;
     }
+    let recoveryTempPath: string | null = null;
     try {
-      const [ownership] = await db
+      if (recoveryLeaseLost) throw new Error("recovery_lease_lost");
+      const [ownership] = await database
         .select({
           currentAttemptId: generationJobs.currentAttemptId,
           attemptToken: generationAttempts.jobClaimFencingToken,
@@ -361,6 +527,21 @@ export async function recoverStagingArtifacts(): Promise<{ committed: number; qu
         && metadata.maxSizeBytes <= 10 * 1024 * 1024 * 1024
         ? metadata.maxSizeBytes
         : 1024 * 1024 * 1024;
+      let candidate = sourceCandidate;
+      if (sourceCandidate !== finalPath) {
+        const snapshotAt = clock();
+        if (!await renewRecoveryLease(database, artifact.id, options.recoveryOwner, recoveryToken, snapshotAt, leaseMs)) {
+          throw new Error("recovery_lease_lost");
+        }
+        const recoveryTempKey = path.posix.join(
+          ".recovery", safeSegment(artifact.attemptId), `${safeSegment(artifact.id)}.${safeSegment(recoveryToken)}.part`,
+        );
+        recoveryTempPath = resolveArtifactStoragePath(recoveryTempKey);
+        await fs.mkdir(path.dirname(recoveryTempPath), { recursive: true });
+        await fs.copyFile(sourceCandidate, recoveryTempPath, fsConstants.COPYFILE_EXCL);
+        await syncFile(recoveryTempPath);
+        candidate = recoveryTempPath;
+      }
       const inspected = await inspectFile(candidate, recoveryMaxBytes);
       if (!validateMagicBytes(inspected.header, artifact.mimeType)) throw new Error("content_mismatch");
       const expectedKind = artifact.mimeType.startsWith("image/") ? "image"
@@ -368,27 +549,62 @@ export async function recoverStagingArtifacts(): Promise<{ committed: number; qu
         : artifact.mimeType.startsWith("audio/") ? "audio" : null;
       if (!expectedKind || artifact.kind !== expectedKind) throw new Error("kind_mismatch");
       if (candidate !== finalPath) {
+        await recoveryRenewal;
+        if (recoveryLeaseLost) throw new Error("recovery_lease_lost");
+        const renewAt = clock();
+        if (!await renewRecoveryLease(database, artifact.id, options.recoveryOwner, recoveryToken, renewAt, leaseMs)) {
+          throw new Error("recovery_lease_lost");
+        }
         await fs.mkdir(path.dirname(finalPath), { recursive: true });
         await fs.rename(candidate, finalPath);
+        await syncDirectory(path.dirname(finalPath));
       }
       const durationMs = artifact.kind === "audio"
         ? await probeMediaDurationMs(finalPath, { maxDurationMs: 6 * 60 * 60 * 1000 })
         : artifact.durationMs;
-      const at = Date.now();
-      const changed = await db.update(generationArtifacts).set({
+      const at = clock();
+      await recoveryRenewal;
+      if (recoveryLeaseLost) throw new Error("recovery_lease_lost");
+      if (!await renewRecoveryLease(database, artifact.id, options.recoveryOwner, recoveryToken, at, leaseMs)) {
+        throw new Error("recovery_lease_lost");
+      }
+      const terminalAt = clock();
+      const changed = await database.update(generationArtifacts).set({
         status: "COMMITTED", sizeBytes: inspected.sizeBytes, sha256: inspected.sha256,
-        durationMs, committedAtMs: at, updatedAtMs: at, metadataJson: { ...metadata, recovery: "completed" },
-      }).where(and(eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "STAGING"))).returning({ id: generationArtifacts.id });
-      if (changed[0]) committed++;
+        durationMs, committedAtMs: terminalAt, updatedAtMs: terminalAt, metadataJson: { ...metadata, recovery: "completed" },
+        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
+      }).where(and(
+        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
+        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
+        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
+        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
+      )).returning({ id: generationArtifacts.id });
+      if (changed[0]) {
+        committed++;
+        if (stagingPath) await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+      }
     } catch (error) {
-      const changed = await db.update(generationArtifacts).set({
-        status: "QUARANTINED", updatedAtMs: Date.now(),
+      const terminalAt = clock();
+      const changed = await database.update(generationArtifacts).set({
+        status: "QUARANTINED", updatedAtMs: terminalAt,
+        recoveryLeaseOwner: null, recoveryLeaseToken: null, recoveryLeaseExpiresAtMs: null,
         metadataJson: { ...metadata, recovery: error instanceof Error ? error.message.slice(0, 120) : "recovery_failed" },
-      }).where(and(eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "STAGING"))).returning({ id: generationArtifacts.id });
-      if (changed[0]) quarantined++;
+      }).where(and(
+        eq(generationArtifacts.id, artifact.id), eq(generationArtifacts.status, "RECOVERING"),
+        eq(generationArtifacts.recoveryLeaseOwner, options.recoveryOwner),
+        eq(generationArtifacts.recoveryLeaseToken, recoveryToken),
+        gt(generationArtifacts.recoveryLeaseExpiresAtMs, terminalAt),
+      )).returning({ id: generationArtifacts.id });
+      if (changed[0]) {
+        quarantined++;
+      }
+    } finally {
+      clearInterval(recoveryRenewalTimer);
+      await recoveryRenewal.catch(() => undefined);
+      if (recoveryTempPath) await fs.rm(recoveryTempPath, { force: true }).catch(() => undefined);
     }
   }
-  return { committed, quarantined };
+  return { claimed, committed, quarantined };
 }
 
 export async function checkArtifactAccess(artifactId: string, userId: string, projectId: string): Promise<{ allowed: boolean; reason?: string }> {

@@ -68,6 +68,12 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         ("generation_jobs", "requested_by"),
         ("generation_attempts", "job_claim_fencing_token"),
         ("generation_artifacts", "updated_at_ms"),
+        ("generation_artifacts", "writer_lease_owner"),
+        ("generation_artifacts", "writer_lease_token"),
+        ("generation_artifacts", "writer_lease_expires_at_ms"),
+        ("generation_artifacts", "recovery_lease_owner"),
+        ("generation_artifacts", "recovery_lease_token"),
+        ("generation_artifacts", "recovery_lease_expires_at_ms"),
         ("voice_profiles", "consent_statement_version"),
     }
     missing_columns = sorted(
@@ -100,6 +106,8 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "generation_jobs_idempotency_digest_guard_insert",
         "generation_jobs_idempotency_digest_guard_update",
         "generation_jobs_idempotency_identity_guard",
+        "generation_artifacts_lease_validate_insert",
+        "generation_artifacts_lease_validate_update",
     }
     missing_triggers = sorted(required_triggers - triggers)
     if missing_triggers:
@@ -123,6 +131,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "resource_reconciliation_proofs_external_unique",
         "resource_reconciliation_proofs_disposition_observed_idx",
         "resource_pool_slots_owner_attempt_unique",
+        "generation_artifacts_recovery_scan_index",
     }
     missing_indexes = sorted(required_indexes - indexes)
     if missing_indexes:
@@ -297,6 +306,19 @@ def main() -> int:
         finally:
             conn.close()
     print(f"PASS legacy-0058-upgrade: {len(review2)} review2 migrations")
+
+    for boundary in (60, 61):
+        prefix = [p for p in MIGRATIONS if int(p.name[:4]) <= boundary]
+        suffix = [p for p in MIGRATIONS if int(p.name[:4]) > boundary]
+        with tempfile.TemporaryDirectory(prefix=f"ai-m-{boundary:04d}-upgrade-") as tmp:
+            conn = sqlite3.connect(Path(tmp) / "published.sqlite")
+            try:
+                apply(conn, prefix)
+                apply(conn, suffix)
+                assert_hardened(conn)
+            finally:
+                conn.close()
+        print(f"PASS published-{boundary:04d}-upgrade: {len(suffix)} additive migrations")
     return 0
 
 

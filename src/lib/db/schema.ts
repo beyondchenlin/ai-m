@@ -707,7 +707,7 @@ export const generationArtifacts = sqliteTable("generation_artifacts", {
     enum: ["image", "video", "audio", "text", "archive"],
   }).notNull(),
   status: text("status", {
-    enum: ["STAGING", "COMMITTED", "QUARANTINED", "DELETED"],
+    enum: ["STAGING", "RECOVERING", "COMMITTED", "QUARANTINED", "DELETED"],
   }).notNull(),
   storageKey: text("storage_key").notNull().unique(),
   visibility: text("visibility", {
@@ -722,6 +722,12 @@ export const generationArtifacts = sqliteTable("generation_artifacts", {
   metadataJson: text("metadata_json", { mode: "json" }).notNull(),
   parentArtifactId: text("parent_artifact_id"),
   committedAtMs: integer("committed_at_ms"),
+  writerLeaseOwner: text("writer_lease_owner"),
+  writerLeaseToken: text("writer_lease_token"),
+  writerLeaseExpiresAtMs: integer("writer_lease_expires_at_ms"),
+  recoveryLeaseOwner: text("recovery_lease_owner"),
+  recoveryLeaseToken: text("recovery_lease_token"),
+  recoveryLeaseExpiresAtMs: integer("recovery_lease_expires_at_ms"),
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 });

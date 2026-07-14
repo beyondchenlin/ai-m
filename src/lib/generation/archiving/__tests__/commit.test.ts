@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
 import { db } from "@/lib/db";
+import * as schema from "@/lib/db/schema";
 import {
   executionBackends,
   generationArtifacts,
@@ -20,6 +23,7 @@ import {
   commitArtifactFromBuffer,
   recoverStagingArtifacts,
   resolveArtifactStoragePath,
+  streamCommitArtifact,
   validateMagicBytes,
 } from "../commit";
 
@@ -166,9 +170,9 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       id: artifactId, attemptId: execution.attemptId, logicalName: "recover.png", kind: "image",
       status: "STAGING", storageKey, visibility: "project", mimeType: "image/png",
       sizeBytes: 0, sha256: "pending", metadataJson: { maxSizeBytes: 1024 },
-      createdAtMs: Date.now(), updatedAtMs: Date.now(),
+      createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
     });
-    expect(await recoverStagingArtifacts()).toEqual({ committed: 1, quarantined: 0 });
+    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test" })).toEqual({ claimed: 1, committed: 1, quarantined: 0 });
 
     const staleId = randomUUID();
     const staleKey = `${execution.attemptId}/${staleId}.png`;
@@ -177,10 +181,107 @@ describe("PR-12 fenced two-phase artifact commit", () => {
       id: staleId, attemptId: execution.attemptId, logicalName: "stale-recover.png", kind: "image",
       status: "STAGING", storageKey: staleKey, visibility: "project", mimeType: "image/png",
       sizeBytes: 0, sha256: "pending", metadataJson: { maxSizeBytes: 1024 },
-      createdAtMs: Date.now(), updatedAtMs: Date.now(),
+      createdAtMs: Date.now() - 60_000, updatedAtMs: Date.now() - 60_000,
     });
     await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));
-    expect(await recoverStagingArtifacts()).toEqual({ committed: 0, quarantined: 1 });
+    expect(await recoverStagingArtifacts({ recoveryOwner: "startup-test" })).toEqual({ claimed: 1, committed: 0, quarantined: 1 });
+  });
+
+  it("does not recover a live delayed writer with a renewable STAGING lease", async () => {
+    const execution = await createExecution();
+    let releaseStream!: () => void;
+    let started!: () => void;
+    const streamStarted = new Promise<void>((resolve) => { started = resolve; });
+    const streamRelease = new Promise<void>((resolve) => { releaseStream = resolve; });
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
+      writerOwner: "writer-live",
+      logicalName: "delayed.png",
+      kind: ArtifactKind.IMAGE,
+      mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+      readTimeoutMs: 5_000,
+      read: () => new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(pngBytes);
+          started();
+          await streamRelease;
+          controller.close();
+        },
+      }),
+    });
+    await streamStarted;
+
+    let staging: typeof generationArtifacts.$inferSelect | undefined;
+    for (let retry = 0; retry < 100; retry++) {
+      [staging] = await db.select().from(generationArtifacts);
+      const stagingKey = (staging?.metadataJson as { stagingPath?: string } | undefined)?.stagingPath;
+      const size = stagingKey
+        ? (await fs.stat(resolveArtifactStoragePath(stagingKey)).catch(() => null))?.size
+        : 0;
+      if (staging?.status === "STAGING" && size === pngBytes.byteLength) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(staging).toMatchObject({ status: "STAGING", writerLeaseOwner: "writer-live" });
+    expect(staging?.writerLeaseToken).toMatch(/\S/);
+    expect(staging?.writerLeaseExpiresAtMs).toBeGreaterThan(Date.now());
+
+    const scannerSqlite = new Database(ctx.dbPath);
+    const scannerDb = drizzle(scannerSqlite, { schema });
+    try {
+      await expect(recoverStagingArtifacts({ recoveryOwner: "startup-concurrent", database: scannerDb }))
+        .resolves.toEqual({ claimed: 0, committed: 0, quarantined: 0 });
+    } finally {
+      scannerSqlite.close();
+    }
+
+    releaseStream();
+    await expect(writing).resolves.toMatchObject({ mimeType: "image/png" });
+    const [committed] = await db.select().from(generationArtifacts);
+    expect(committed.status).toBe("COMMITTED");
+  });
+
+  it("fences a writer that loses its lease without letting later bytes mutate the recovered file", async () => {
+    const execution = await createExecution();
+    let releaseStream!: () => void;
+    let started!: () => void;
+    const streamStarted = new Promise<void>((resolve) => { started = resolve; });
+    const streamRelease = new Promise<void>((resolve) => { releaseStream = resolve; });
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId, expectedJobClaimFencingToken: 1, writerOwner: "writer-loser",
+      logicalName: "lost-writer.png", kind: ArtifactKind.IMAGE, mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT, readTimeoutMs: 5_000,
+      read: () => new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(pngBytes);
+          started();
+          await streamRelease;
+          controller.enqueue(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+          controller.close();
+        },
+      }),
+    });
+    await streamStarted;
+    let artifact: typeof generationArtifacts.$inferSelect | undefined;
+    for (let retry = 0; retry < 100; retry++) {
+      [artifact] = await db.select().from(generationArtifacts);
+      if (artifact) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(artifact).toBeDefined();
+    await db.update(generationArtifacts).set({
+      writerLeaseOwner: "new-owner", writerLeaseToken: "new-token",
+      writerLeaseExpiresAtMs: Date.now() - 1,
+    }).where(eq(generationArtifacts.id, artifact!.id));
+    await expect(recoverStagingArtifacts({ recoveryOwner: "writer-loss-recovery" }))
+      .resolves.toEqual({ claimed: 1, committed: 1, quarantined: 0 });
+    releaseStream();
+    await expect(writing).rejects.toThrow(/writer lease was lost/i);
+
+    const [fenced] = await db.select().from(generationArtifacts).where(eq(generationArtifacts.id, artifact!.id));
+    expect(fenced.status).toBe("COMMITTED");
+    await expect(fs.readFile(resolveArtifactStoragePath(fenced.storageKey))).resolves.toEqual(Buffer.from(pngBytes));
   });
 
   it("authorizes by project ownership without exposing files cross-user", async () => {
