@@ -28,7 +28,6 @@ describe("ComfyUI connection manager lifecycle", () => {
     const firstFactory = {
       canonicalEndpoint: "http://comfy.policy.test:8188",
       registryKey: "endpoint:credential-a:policy-1",
-      clientId: "client-a",
       open: () => socket(),
     };
     const sameFactory = { ...firstFactory, open: () => socket() };
@@ -124,7 +123,6 @@ describe("ComfyUI connection manager lifecycle", () => {
     const oldFactory = {
       canonicalEndpoint: "http://comfy.policy.test:8188",
       registryKey: "endpoint:credential-a:policy-1",
-      clientId: "client-a",
       open: () => socket(),
     };
     const rotatedFactory = {
@@ -151,6 +149,25 @@ describe("ComfyUI connection manager lifecycle", () => {
     expect(oldA.manager.getState()).toBe("disconnected");
     rotated.release();
     expect(connectionManagerRegistry.getAll()).toHaveLength(0);
+  });
+
+  it("shares one client ID within an entry and rotates it after the final lease releases", () => {
+    const factory = {
+      canonicalEndpoint: "http://comfy.policy.test:8188",
+      registryKey: "endpoint:credential-a:policy-1",
+      open: () => socket(),
+    };
+    const first = connectionManagerRegistry.acquire(factory) as { manager: ComfyUIConnectionManager; clientId?: string; release(): void };
+    const concurrent = connectionManagerRegistry.acquire(factory) as { manager: ComfyUIConnectionManager; clientId?: string; release(): void };
+
+    expect(first.clientId).toBeTruthy();
+    expect(concurrent.clientId).toBe(first.clientId);
+    first.release();
+    concurrent.release();
+
+    const replacement = connectionManagerRegistry.acquire(factory) as { manager: ComfyUIConnectionManager; clientId?: string; release(): void };
+    expect(replacement.clientId).not.toBe(first.clientId);
+    replacement.release();
   });
 
   it("ignores delayed events from a socket replaced by reconnect", async () => {

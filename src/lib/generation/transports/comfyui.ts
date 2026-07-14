@@ -26,13 +26,6 @@ import type { ComfyUIWebSocketFactory } from "./comfyui-connection-manager";
 
 const CREDENTIAL_IDENTITY_KEY = randomBytes(32);
 
-function clientIdForConnectionIdentity(identity: string): string {
-  return `ai-m-${createHmac("sha256", CREDENTIAL_IDENTITY_KEY)
-    .update(`client-id\0${identity}`)
-    .digest("hex")
-    .slice(0, 24)}`;
-}
-
 export function isApprovedRemoteAddress(
   remoteAddress: string | undefined,
   approvedAddresses: readonly string[],
@@ -59,11 +52,26 @@ function credentialIdentity(headers: Readonly<Record<string, string>>): string {
   return createHmac("sha256", CREDENTIAL_IDENTITY_KEY).update(JSON.stringify(canonical)).digest("hex");
 }
 
+function closeAgentSafely(agent: Agent): void {
+  try {
+    void agent.close().catch(() => undefined);
+  } catch {
+    // Cleanup is best effort and must not mask the original WebSocket outcome.
+  }
+}
+
 export interface ComfyUIEndpointPolicyOptions {
   policyRevision: string;
   resolver?: BackendAddressResolver;
   connectTimeoutMs?: number;
   socketFactory?: (options: ComfyUIEndpointDialOptions) => net.Socket | tls.TLSSocket;
+  /** @internal Test seam for synchronous constructor-failure coverage. */
+  webSocketAgentFactory?: (connector: ReturnType<typeof buildConnector>) => Agent;
+  /** @internal Test seam for synchronous constructor-failure coverage. */
+  webSocketConstructor?: (
+    url: string,
+    init: { dispatcher: Agent; headers: Record<string, string> },
+  ) => WebSocket;
 }
 
 export interface ComfyUIEndpointDialOptions {
@@ -227,7 +235,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
   private readonly controller: AbortController;
   private readonly headers: Readonly<Record<string, string>>;
   private readonly dispatcher: Agent | undefined;
-  private clientId: string;
   private readonly webSocketFactory: ComfyUIWebSocketFactory;
 
   constructor(
@@ -361,21 +368,27 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
       revision: options.policyRevision,
     })).digest("hex");
     const registryKey = `${this.baseUrl}#credential=${credentialIdentity(this.headers)}&policy=${policyDigest}`;
-    this.clientId = clientIdForConnectionIdentity(registryKey);
     this.webSocketFactory = Object.freeze({
       canonicalEndpoint: this.baseUrl,
       registryKey,
-      clientId: this.clientId,
-      open: () => {
-        const dispatcher = new Agent({ connect: connector });
-        const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(this.clientId)}`;
+      open: (clientId: string) => {
+        const dispatcher = options.webSocketAgentFactory?.(connector) ?? new Agent({ connect: connector });
+        const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(clientId)}`;
         const origin = new URL(this.baseUrl).origin;
-        const ws = new UndiciWebSocket(wsUrl, {
-          dispatcher,
-          headers: { ...this.headers, Origin: origin },
-        });
-        ws.addEventListener("close", () => { void dispatcher.close(); }, { once: true });
-        return ws as unknown as WebSocket;
+        try {
+          const ws = options.webSocketConstructor?.(wsUrl, {
+            dispatcher,
+            headers: { ...this.headers, Origin: origin },
+          }) ?? new UndiciWebSocket(wsUrl, {
+            dispatcher,
+            headers: { ...this.headers, Origin: origin },
+          }) as unknown as WebSocket;
+          ws.addEventListener("close", () => closeAgentSafely(dispatcher), { once: true });
+          return ws;
+        } catch (error) {
+          closeAgentSafely(dispatcher);
+          throw error;
+        }
       },
     });
   }
@@ -469,9 +482,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     void this.dispatcher?.close();
   }
 
-  getClientId(): string {
-    return this.clientId;
-  }
 }
 
 

@@ -11,6 +11,7 @@
  */
 
 import type { ComfyWSMessage } from "./comfyui";
+import { randomBytes } from "node:crypto";
 
 /** 连接状态 */
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "closing";
@@ -50,8 +51,7 @@ export interface ReconnectConfig {
 export interface ComfyUIWebSocketFactory {
   readonly canonicalEndpoint: string;
   readonly registryKey: string;
-  readonly clientId: string;
-  open(): WebSocket;
+  open(clientId: string): WebSocket;
 }
 
 const DEFAULT_RECONNECT_CONFIG: ReconnectConfig = {
@@ -396,12 +396,14 @@ export class ComfyUIConnectionManager {
  */
 export interface ComfyUIConnectionLease {
   readonly manager: ComfyUIConnectionManager;
+  readonly clientId: string;
   release(): void;
 }
 
 interface RegistryEntry {
   readonly registryKey: string;
   readonly manager: ComfyUIConnectionManager;
+  readonly clientId: string;
   leases: number;
 }
 
@@ -411,9 +413,11 @@ class ConnectionManagerRegistry {
   acquire(factory: ComfyUIWebSocketFactory): ComfyUIConnectionLease {
     let entry = this.entries.get(factory.registryKey);
     if (!entry) {
+      const clientId = `ai-m-${randomBytes(12).toString("hex")}`;
       entry = {
         registryKey: factory.registryKey,
-        manager: new ComfyUIConnectionManager(() => factory.open()),
+        manager: new ComfyUIConnectionManager(() => factory.open(clientId)),
+        clientId,
         leases: 0,
       };
       this.entries.set(factory.registryKey, entry);
@@ -422,6 +426,7 @@ class ConnectionManagerRegistry {
     let released = false;
     return {
       manager: entry.manager,
+      clientId: entry.clientId,
       release: () => {
         if (released) return;
         released = true;

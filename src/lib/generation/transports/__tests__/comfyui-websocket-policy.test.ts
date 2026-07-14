@@ -55,6 +55,36 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     }
   });
 
+  it("closes the dedicated WebSocket agent when construction throws synchronously", async () => {
+    const close = vi.fn(async () => { throw new Error("synthetic close rejection"); });
+    const syntheticError = new Error("synthetic websocket constructor failure");
+    const transport = new ComfyUIHttpTransport(
+      "http://comfy.policy.test:8188",
+      {},
+      ["127.0.0.1"],
+      {
+        policyRevision: "revision-ws-constructor-failure",
+        webSocketAgentFactory: () => ({ close }),
+        webSocketConstructor: () => { throw syntheticError; },
+      } as unknown as ConstructorParameters<typeof ComfyUIHttpTransport>[3],
+    );
+    let opened: WebSocket | undefined;
+    let thrown: unknown;
+
+    try {
+      try {
+        opened = transport.getWebSocketFactory().open("constructor-failure-test");
+      } catch (error) {
+        thrown = error;
+      }
+      opened?.close();
+      expect(thrown).toBe(syntheticError);
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    } finally {
+      transport.close();
+    }
+  });
+
   it("fails over from a refused approved address to a healthy approved address", async () => {
     const server = http.createServer((_request, response) => {
       response.setHeader("content-type", "application/json");
@@ -91,9 +121,13 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     const second = new FakeComfyUITransport({ promptId: "job-b", connectionIdentity: "shared" });
     const firstFactory = first.getWebSocketFactory();
     const secondFactory = second.getWebSocketFactory();
+    const firstLease = connectionManagerRegistry.acquire(firstFactory);
+    const secondLease = connectionManagerRegistry.acquire(secondFactory);
 
-    expect(firstFactory.clientId).toBe(secondFactory.clientId);
-    expect(firstFactory.open().url).toContain(`clientId=${encodeURIComponent(firstFactory.clientId)}`);
+    expect(firstLease.clientId).toBe(secondLease.clientId);
+    expect(firstFactory.open(firstLease.clientId).url).toContain(`clientId=${encodeURIComponent(firstLease.clientId)}`);
+    firstLease.release();
+    secondLease.release();
   });
 
   it("canonicalizes mapped IPv4 addresses when checking an approved DNS revision", async () => {
@@ -261,7 +295,6 @@ describe("ComfyUI WebSocket endpoint policy", () => {
     );
     try {
       const identity = first.getWebSocketFactory();
-      expect(first.getClientId()).toBe(equivalent.getClientId());
       expect(identity.registryKey).toBe(equivalent.getWebSocketFactory().registryKey);
       expect(identity.registryKey).not.toBe(rotatedCredential.getWebSocketFactory().registryKey);
       expect(identity.registryKey).not.toBe(revisedPolicy.getWebSocketFactory().registryKey);
@@ -319,7 +352,7 @@ describe("ComfyUI WebSocket endpoint policy", () => {
       const httpResponse = await transport.get("/queue");
       expect(httpResponse.status).toBe(302);
       expect(alternateHttpHits).toBe(0);
-      const ws = transport.getWebSocketFactory().open();
+      const ws = transport.getWebSocketFactory().open("redirect-test-client");
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("redirecting WebSocket did not terminate")), 1_000);
         const done = () => {

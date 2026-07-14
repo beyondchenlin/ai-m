@@ -211,10 +211,10 @@ export class ComfyUIExecutionOrchestrator {
     this.callbacks = callbacks;
     this.config = { ...DEFAULT_CONFIG, ...config };
     const socketFactory = transport.getWebSocketFactory();
-    this.clientId = socketFactory.clientId;
     this.correlationId = correlationId;
     const lease = connectionManagerRegistry.acquire(socketFactory);
     this.connectionMgr = lease.manager;
+    this.clientId = lease.clientId;
     this.releaseConnection = lease.release;
   }
 

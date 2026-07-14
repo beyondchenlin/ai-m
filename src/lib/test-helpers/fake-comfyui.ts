@@ -219,12 +219,10 @@ export class FakeComfyUITransport implements ComfyUITransport {
 
   getWebSocketFactory() {
     const identity = this.scenario.connectionIdentity ?? "default";
-    const clientId = `fake-comfyui-${identity}`;
     return Object.freeze({
       canonicalEndpoint: "http://fake-comfyui.test",
       registryKey: `fake-comfyui:${identity}`,
-      clientId,
-      open: () => new FakeWebSocket(`ws://fake-comfyui.test/ws?clientId=${encodeURIComponent(clientId)}`),
+      open: (clientId: string) => new FakeWebSocket(`ws://fake-comfyui.test/ws?clientId=${encodeURIComponent(clientId)}`),
     });
   }
 

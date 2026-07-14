@@ -59,7 +59,6 @@ describe("PR-05: 取消策略", () => {
     getWebSocketFactory: () => ({
       canonicalEndpoint: "http://localhost:8188",
       registryKey: "pr05-test",
-      clientId: "pr05-client",
       open: () => new WebSocket("ws://localhost"),
     }),
     cancel: async () => {},
