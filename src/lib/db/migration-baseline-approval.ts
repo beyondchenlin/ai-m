@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import type { MigrationMetadata } from "./migration-journal";
 import { assertExactSchemaBoundary } from "./migration-schema-evidence";
+import {
+  createBackupFileSecurityPolicy,
+  type BackupFileSecurityPolicy,
+} from "./backup-file-security";
 
 type SqliteDatabase = import("better-sqlite3").Database;
 export type BaselineApprovalManifest = {
@@ -19,6 +23,7 @@ export type BaselineApprovalManifest = {
 export type BaselineApprovalHooks = {
   afterBackup?: () => void;
   beforeBackupPublish?: () => void;
+  securityPolicy?: BackupFileSecurityPolicy;
 };
 
 function scalar(sqlite: SqliteDatabase, pragma: string): number {
@@ -133,11 +138,13 @@ export async function approveBaseline(
   let temporaryExists = false;
   let primaryError: unknown;
   try {
+    const securityPolicy = hooks.securityPolicy ?? createBackupFileSecurityPolicy();
     const reservation = fs.openSync(temporaryBackupPath, "wx", 0o600);
     temporaryExists = true;
     fs.closeSync(reservation);
+    securityPolicy.protect(temporaryBackupPath);
     await sqlite.backup(temporaryBackupPath);
-    fs.chmodSync(temporaryBackupPath, 0o600);
+    securityPolicy.verify(temporaryBackupPath);
     hooks.afterBackup?.();
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -157,6 +164,16 @@ export async function approveBaseline(
         throw new Error("Backup path already exists; refusing to overwrite", { cause: error });
       }
       throw error;
+    }
+    try { securityPolicy.verify(absoluteBackupPath); }
+    catch (verificationError) {
+      try { fs.unlinkSync(absoluteBackupPath); }
+      catch (cleanupError) {
+        throw new AggregateError([verificationError, cleanupError], "Published backup ACL verification and cleanup failed", {
+          cause: verificationError,
+        });
+      }
+      throw verificationError;
     }
     fs.unlinkSync(temporaryBackupPath);
     temporaryExists = false;

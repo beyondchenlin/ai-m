@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { approveBaseline, inspectBaselineApproval } from "../migration-baseline-approval";
 
 describe("audited manual baseline approval", () => {
@@ -83,15 +84,23 @@ describe("audited manual baseline approval", () => {
     const databasePath = path.join(directory, "legacy.sqlite");
     const backupPath = path.join(directory, "legacy.backup.sqlite");
     const marker = Buffer.from("do-not-overwrite");
+    let markerStat: fs.Stats | undefined;
     const sqlite = new Database(databasePath);
     for (const migration of migrations.slice(0, 54)) for (const statement of migration.sql) sqlite.exec(statement);
     sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
     try {
       const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
       await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, {
-        beforeBackupPublish: () => fs.writeFileSync(backupPath, marker, { flag: "wx" }),
+        beforeBackupPublish: () => {
+          fs.writeFileSync(backupPath, marker, { flag: "wx" });
+          markerStat = fs.statSync(backupPath);
+        },
       })).rejects.toThrow();
       expect(fs.readFileSync(backupPath)).toEqual(marker);
+      const after = fs.statSync(backupPath);
+      expect({ size: after.size, mode: after.mode, mtimeMs: after.mtimeMs, birthtimeMs: after.birthtimeMs })
+        .toEqual({ size: markerStat?.size, mode: markerStat?.mode,
+          mtimeMs: markerStat?.mtimeMs, birthtimeMs: markerStat?.birthtimeMs });
       expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 0 });
       expect(fs.readdirSync(directory).filter((name) => name.includes(".backup-tmp-"))).toEqual([]);
     } finally {
@@ -120,6 +129,83 @@ describe("audited manual baseline approval", () => {
       fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
+
+  it("fails closed and removes the empty temp before backup when file security cannot be applied", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-approval-security-fail-"));
+    const databasePath = path.join(directory, "legacy.sqlite");
+    const backupPath = path.join(directory, "legacy.backup.sqlite");
+    const sqlite = new Database(databasePath);
+    for (const migration of migrations.slice(0, 54)) for (const statement of migration.sql) sqlite.exec(statement);
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const backup = vi.spyOn(sqlite, "backup");
+    try {
+      const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
+      await expect(approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath, {
+        securityPolicy: {
+          protect: () => { throw new Error("ACL unavailable"); },
+          verify: () => { throw new Error("must not verify"); },
+        },
+      })).rejects.toThrow(/ACL unavailable/);
+      expect(backup).not.toHaveBeenCalled();
+      expect(fs.existsSync(backupPath)).toBe(false);
+      expect(fs.readdirSync(directory).filter((name) => name.includes(".backup-tmp-"))).toEqual([]);
+    } finally {
+      backup.mockRestore();
+      sqlite.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform === "win32")(
+    "creates a Windows backup with protected current-SID-only ACL before handling a metacharacter path",
+    async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m approval loose acl "));
+      const databasePath = path.join(directory, "legacy.sqlite");
+      const backupPath = path.join(directory, "backup ; Write-Output injected.sqlite");
+      const loosenDirectory = String.raw`
+        $payload = $input | ConvertFrom-Json
+        $acl = Get-Acl -LiteralPath $payload.path
+        $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+          $everyone, [System.Security.AccessControl.FileSystemRights]::FullControl,
+          [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+          [System.Security.AccessControl.PropagationFlags]::None,
+          [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $payload.path -AclObject $acl
+      `;
+      execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", loosenDirectory], {
+        input: JSON.stringify({ path: directory }), windowsHide: true,
+      });
+      const sqlite = new Database(databasePath);
+      for (const migration of migrations.slice(0, 54)) for (const statement of migration.sql) sqlite.exec(statement);
+      sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+      try {
+        const manifest = inspectBaselineApproval(sqlite, databasePath, migrations, 54);
+        await approveBaseline(sqlite, databasePath, migrations, 54, manifest.approvalToken, backupPath);
+        const script = String.raw`
+          $payload = $input | ConvertFrom-Json
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $acl = Get-Acl -LiteralPath $payload.path
+          $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
+            [pscustomobject]@{ sid=$_.IdentityReference.Value; inherited=$_.IsInherited; type=$_.AccessControlType.ToString() }
+          })
+          [pscustomobject]@{ sid=$sid; owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; protected=$acl.AreAccessRulesProtected; rules=$rules } | ConvertTo-Json -Compress -Depth 4
+        `;
+        const acl = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+          input: JSON.stringify({ path: backupPath }), encoding: "utf8", windowsHide: true,
+        })) as { sid: string; owner: string; protected: boolean; rules: Array<{ sid: string; inherited: boolean; type: string }> };
+        expect(acl.owner).toBe(acl.sid);
+        expect(acl.protected).toBe(true);
+        expect(acl.rules.length).toBeGreaterThan(0);
+        expect(acl.rules.every((rule) => rule.sid === acl.sid && !rule.inherited && rule.type === "Allow")).toBe(true);
+      } finally {
+        sqlite.close();
+        fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      }
+    },
+  );
 
   it("hashes no-PK duplicates and large typed data deterministically without row materialization", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-stream-digest-"));
