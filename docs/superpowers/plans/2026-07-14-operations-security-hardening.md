@@ -109,13 +109,17 @@ For every task, follow the same review loop after its task-specific checks:
 
 ### Task 3: Lease live artifact writers and recovery claims
 
+> Migration numbering note: `0061_resource_slot_owner_unique.sql` is reserved for the Task 2
+> follow-up that enforces one physical slot per attempt. Task 3 therefore starts at `0062`, and
+> later planned migrations are shifted forward; do not modify the published `0060` migration.
+
 **Invariant:** Recovery never quarantines a live writer, and at most one recovery owner may commit or quarantine a stale artifact. Losing writers/recoverers leave neither an untracked committed file nor conflicting database state.
 
 **Source architecture:** Give STAGING writers a renewable lease and make recovery claim stale rows by CAS into `RECOVERING` with a token. Finalization must present the writer or recovery token. Startup scanners can run concurrently.
 
 **Files:**
 
-- Create: `drizzle/0061_artifact_recovery_leases.sql`
+- Create: `drizzle/0062_artifact_recovery_leases.sql`
 - Modify: `drizzle/meta/_journal.json`
 - Modify: `src/lib/db/schema.ts`
 - Modify: `src/lib/generation/archiving/commit.ts`
@@ -202,7 +206,7 @@ For every task, follow the same review loop after its task-specific checks:
 
 **Files:**
 
-- Create: `drizzle/0062_trusted_proxy_nonces.sql`
+- Create: `drizzle/0063_trusted_proxy_nonces.sql`
 - Modify: `drizzle/meta/_journal.json`
 - Modify: `src/lib/db/schema.ts`
 - Create: `src/lib/security/trusted-proxy-auth.ts`

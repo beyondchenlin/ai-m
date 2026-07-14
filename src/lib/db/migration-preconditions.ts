@@ -46,8 +46,8 @@ function duplicateResourceSlotOwnerEvidence(sqlite: SqliteDatabase): string | nu
 
 export const MIGRATION_PRECONDITION_REGISTRY: readonly MigrationPreconditionRegistration[] = [
   {
-    folderMillis: 1784209200000,
-    hash: "f485a627f79fa40de7060254b757e8786428f9ac084c26a99f86914dbdf8c97e",
+    folderMillis: 1784295600000,
+    hash: "1616ca4c54d5af31ced5ca321a016f3124a0dc2b36a1941c4710e3ade010221f",
     verify: duplicateResourceSlotOwnerEvidence,
   },
 ] as const;

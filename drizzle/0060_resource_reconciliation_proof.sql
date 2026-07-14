@@ -35,7 +35,3 @@ CREATE UNIQUE INDEX `resource_reconciliation_proofs_external_unique` ON `resourc
 CREATE INDEX `resource_reconciliation_proofs_disposition_observed_idx` ON `resource_reconciliation_proofs` (`disposition`,`observed_at_ms`);
 --> statement-breakpoint
 CREATE INDEX `resource_reconciliation_proofs_attempt_idx` ON `resource_reconciliation_proofs` (`attempt_id`);
---> statement-breakpoint
-CREATE UNIQUE INDEX `resource_pool_slots_owner_attempt_unique`
-	ON `resource_pool_slots` (`owner_attempt_id`)
-	WHERE `owner_attempt_id` IS NOT NULL;

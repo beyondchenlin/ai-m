@@ -16,7 +16,7 @@ const migrations: MigrationMetadata[] = [
 ];
 
 describe("validateMigrationJournal", () => {
-  it("registers the resource reconciliation proof migration as the latest additive migration", () => {
+  it("keeps published 0060 and appends slot-owner uniqueness as 0061", () => {
     const journal = JSON.parse(readFileSync(
       resolve(process.cwd(), "drizzle/meta/_journal.json"),
       "utf8",
@@ -25,9 +25,10 @@ describe("validateMigrationJournal", () => {
     const previous = journal.entries.at(-2);
 
     expect(latest).toMatchObject({
-      idx: 60,
-      tag: "0060_resource_reconciliation_proof",
+      idx: 61,
+      tag: "0061_resource_slot_owner_unique",
     });
+    expect(previous).toMatchObject({ idx: 60, tag: "0060_resource_reconciliation_proof" });
     expect(latest!.when).toBeGreaterThan(previous!.when);
   });
 

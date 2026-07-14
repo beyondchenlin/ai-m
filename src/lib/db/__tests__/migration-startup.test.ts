@@ -5,6 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { buildSync } from "esbuild";
 import {
   LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
@@ -26,24 +27,50 @@ import {
 describe("migration journal startup ordering", () => {
   const repositoryMigrations = readMigrationFiles({ migrationsFolder: path.resolve("drizzle") });
   const repositoryBundle = loadValidatedMigrationBundle(path.resolve("drizzle"));
+  const OLD_0060_HASH = "92abf3be9aac6c6591cd7c5ca7cc9527cf42baa04bd79b4aeb6790797dadef23";
+  const OLD_0060_TIMESTAMP = 1784209200000;
 
-  it("binds the migration precondition registry one-to-one to exact 0060 identity", () => {
+  it("preserves exact published 0060 bytes and binds the precondition to additive 0061", () => {
+    expect(createHash("sha256").update(fs.readFileSync(
+      path.resolve("drizzle/0060_resource_reconciliation_proof.sql"),
+    )).digest("hex")).toBe(OLD_0060_HASH);
+    expect(repositoryBundle.migrations[60]).toMatchObject({
+      folderMillis: OLD_0060_TIMESTAMP,
+      hash: OLD_0060_HASH,
+    });
+    expect(repositoryBundle.migrations).toHaveLength(62);
     expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hash }) => ({ folderMillis, hash })))
       .toEqual([{
-        folderMillis: repositoryBundle.migrations[60].folderMillis,
-        hash: repositoryBundle.migrations[60].hash,
+        folderMillis: repositoryBundle.migrations[61].folderMillis,
+        hash: repositoryBundle.migrations[61].hash,
       }]);
     expect(() => validateMigrationPreconditionRegistry(
       repositoryBundle.migrations,
       MIGRATION_PRECONDITION_REGISTRY,
     )).not.toThrow();
     expect(() => validateMigrationPreconditionRegistry(
-      repositoryBundle.migrations.map((migration, index) => index === 60
-        ? { ...migration, hash: "changed-0060-hash" }
+      repositoryBundle.migrations.map((migration, index) => index === 61
+        ? { ...migration, hash: "changed-0061-hash" }
         : migration),
       MIGRATION_PRECONDITION_REGISTRY,
     )).toThrow(/precondition registry.*exact migration identity/i);
   });
+
+  function databaseRecordedThroughPublished0060(): Database.Database {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const insert = sqlite.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+    for (const migration of repositoryBundle.migrations.slice(0, 60)) {
+      for (const statement of migration.sql ?? []) sqlite.exec(statement);
+      insert.run(migration.hash, migration.folderMillis);
+    }
+    const candidate0060 = repositoryBundle.migrations[60];
+    for (const statement of candidate0060.sql ?? []) {
+      if (!statement.includes("resource_pool_slots_owner_attempt_unique")) sqlite.exec(statement);
+    }
+    insert.run(OLD_0060_HASH, OLD_0060_TIMESTAMP);
+    return sqlite;
+  }
 
   function legacyVisualDatabase(rows: Array<{ hash: string; createdAt: number }>): Database.Database {
     const sqlite = new Database(":memory:");
@@ -483,17 +510,25 @@ describe("migration journal startup ordering", () => {
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it("aborts 0060 with actionable evidence when legacy slots duplicate one attempt owner", () => {
-    const sqlite = new Database(":memory:");
-    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
-    const insertMigration = sqlite.prepare(
-      'INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)',
-    );
+  it("upgrades a database recorded through published 0060 by applying only 0061", () => {
+    const sqlite = databaseRecordedThroughPublished0060();
     try {
-      for (const migration of repositoryBundle.migrations.slice(0, 60)) {
-        for (const statement of migration.sql ?? []) sqlite.exec(statement);
-        insertMigration.run(migration.hash, migration.folderMillis);
-      }
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 62 });
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[number], { hash: string }>(
+        'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+    } finally { sqlite.close(); }
+  });
+
+  it("aborts 0061 before DDL or journal writes on duplicate owners and retries after repair", () => {
+    const sqlite = databaseRecordedThroughPublished0060();
+    try {
       sqlite.pragma("foreign_keys = OFF");
       sqlite.exec(`
         INSERT INTO resource_pool_slots
@@ -513,8 +548,27 @@ describe("migration journal startup ordering", () => {
         { resource_pool_id: "legacy-pool-b", slot_no: 2, lease_token: "legacy-token-b" },
       ]);
       expect(sqlite.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='resource_reconciliation_proofs'",
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
       ).get()).toBeUndefined();
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='resource_reconciliation_proofs'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 61 });
+      expect(sqlite.prepare<[number], { hash: string }>(
+        'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+
+      sqlite.prepare("DELETE FROM resource_pool_slots WHERE resource_pool_id=? AND slot_no=?")
+        .run("legacy-pool-b", 2);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 62 });
     } finally { sqlite.close(); }
   });
 
