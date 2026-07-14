@@ -21,13 +21,13 @@ import type { BackendFeatureSnapshot } from "@/lib/generation/transports/comfyui
 
 describe("PR-05: ComfyUI 连接管理器", () => {
   it("初始状态为 disconnected 且 generation 为 0", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     expect(mgr.getState()).toBe("disconnected");
     expect(mgr.getGeneration()).toBe(0);
   });
 
   it("registerTaskHandler 返回清理函数并创建进度快照", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     const unregister = mgr.registerTaskHandler("test-prompt-1", () => {});
     expect(typeof unregister).toBe("function");
 
@@ -41,7 +41,7 @@ describe("PR-05: ComfyUI 连接管理器", () => {
   });
 
   it("disconnect 后状态为 disconnected 且 generation 递增", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     mgr.disconnect();
     expect(mgr.getState()).toBe("disconnected");
     expect(mgr.getGeneration()).toBe(1);
@@ -57,6 +57,11 @@ describe("PR-05: 取消策略", () => {
     uploadImage: async (input: { filename: string }) => ({ name: input.filename, subfolder: "", type: "input" }),
     getFile: async () => new Response(),
     connectWebSocket: () => new WebSocket("ws://localhost"),
+    getWebSocketFactory: () => ({
+      canonicalEndpoint: "http://localhost:8188",
+      registryKey: "pr05-test",
+      open: () => new WebSocket("ws://localhost"),
+    }),
     cancel: async () => {},
     interrupt: async () => {},
     close: () => {},

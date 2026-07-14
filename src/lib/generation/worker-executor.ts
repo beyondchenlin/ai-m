@@ -26,6 +26,7 @@ import {
 import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
 import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
 import { bindWorkflow, loadActiveWorkflowPackage } from "@/lib/generation/workflows";
+import { sha256 } from "@/lib/generation/workflows/canonical";
 import { resolveBackendAuthHeaders } from "@/lib/security";
 import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
 import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
@@ -153,6 +154,7 @@ export async function executeGenerationJob(
       Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
         ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
         : [],
+      { policyRevision: sha256(backend.networkPolicyJson) },
     );
     const activeTransport = transport;
     const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
@@ -412,7 +414,7 @@ export async function executeGenerationJob(
       },
     });
 
-    orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, backend.baseUrl, callbacks, {
+    orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, callbacks, {
       totalExecutionTimeoutMs: workflowPackage.manifest.limits.maxJobMs,
       collectionTimeoutMs: Math.min(workflowPackage.manifest.limits.maxJobMs, 5 * 60 * 1000),
       isSharedBackend: backend.sharingMode === "shared",

@@ -6,9 +6,68 @@
  */
 
 import { isEnabled, FF } from "@/lib/feature-flags";
-import { validateBackendUrlResolved } from "@/lib/security/network-policy";
+import {
+  validateBackendUrlResolved,
+  type BackendAddressResolver,
+} from "@/lib/security/network-policy";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import net from "node:net";
-import { Agent, fetch as undiciFetch, FormData as UndiciFormData, WebSocket as UndiciWebSocket } from "undici";
+import tls from "node:tls";
+import {
+  Agent,
+  buildConnector,
+  fetch as undiciFetch,
+  FormData as UndiciFormData,
+  WebSocket as UndiciWebSocket,
+} from "undici";
+import type { ComfyUIWebSocketFactory } from "./comfyui-connection-manager";
+
+const CREDENTIAL_IDENTITY_KEY = randomBytes(32);
+
+function canonicalizeSocketAddress(address: string): string {
+  const value = address.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (net.isIP(value) === 4) return value;
+  if (net.isIP(value) !== 6) throw new Error(`Invalid approved backend address: ${address}`);
+  const canonical = new URL(`http://[${value}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (mapped) {
+    const high = Number.parseInt(mapped[1], 16);
+    const low = Number.parseInt(mapped[2], 16);
+    return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+  }
+  return canonical;
+}
+
+export function isApprovedRemoteAddress(
+  remoteAddress: string | undefined,
+  approvedAddresses: readonly string[],
+): boolean {
+  if (!remoteAddress) return false;
+  try {
+    const approved = new Set(approvedAddresses.map(canonicalizeSocketAddress));
+    return approved.has(canonicalizeSocketAddress(remoteAddress));
+  } catch {
+    return false;
+  }
+}
+
+function canonicalEndpoint(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.origin}${path}`;
+}
+
+function credentialIdentity(headers: Readonly<Record<string, string>>): string {
+  const canonical = Object.entries(headers)
+    .map(([name, value]) => [name.toLowerCase(), value] as const)
+    .sort(([left], [right]) => left.localeCompare(right));
+  return createHmac("sha256", CREDENTIAL_IDENTITY_KEY).update(JSON.stringify(canonical)).digest("hex");
+}
+
+export interface ComfyUIEndpointPolicyOptions {
+  policyRevision: string;
+  resolver?: BackendAddressResolver;
+}
 
 /** ComfyUI 提示词提交请求 */
 export interface ComfyPromptRequest {
@@ -132,6 +191,8 @@ export interface ComfyUITransport {
   getFile(params: { filename: string; subfolder: string; type: string }): Promise<Response>;
   /** 建立 WebSocket 连接 */
   connectWebSocket(): WebSocket;
+  /** Immutable identity and constructor for the shared realtime connection. */
+  getWebSocketFactory(): ComfyUIWebSocketFactory;
   /** 取消当前提示词 */
   cancel(): Promise<void>;
   /** 中断执行 */
@@ -161,23 +222,86 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
   private readonly controller: AbortController;
   private readonly headers: Readonly<Record<string, string>>;
   private readonly dispatcher: Agent | undefined;
-  private ws: WebSocket | null = null;
   private clientId: string;
+  private readonly webSocketFactory: ComfyUIWebSocketFactory;
 
-  constructor(baseUrl: string, headers: Record<string, string> = {}, approvedAddresses: readonly string[] = []) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+  constructor(
+    baseUrl: string,
+    headers: Record<string, string> = {},
+    approvedAddresses: readonly string[] = [],
+    options: ComfyUIEndpointPolicyOptions,
+  ) {
+    if (!/^sha256:[a-f0-9]{64}$/.test(options.policyRevision) && !/^revision-[A-Za-z0-9._-]+$/.test(options.policyRevision)) {
+      throw new Error("ComfyUI endpoint policy revision is invalid");
+    }
+    this.baseUrl = canonicalEndpoint(baseUrl);
     this.controller = new AbortController();
     this.headers = Object.freeze({ ...headers });
-    const addresses = [...new Set(approvedAddresses)].map((address) => ({
+    const canonicalAddresses = [...new Set(approvedAddresses.map(canonicalizeSocketAddress))].sort();
+    const addresses = canonicalAddresses.map((address) => ({
       address, family: net.isIP(address) as 4 | 6,
-    })).filter((item) => item.family === 4 || item.family === 6);
-    this.dispatcher = addresses.length ? new Agent({ connect: {
-      lookup: (_hostname, lookupOptions, callback) => {
-        if (typeof lookupOptions === "object" && lookupOptions.all) callback(null, addresses);
-        else callback(null, addresses[0].address, addresses[0].family);
-      },
-    } }) : undefined;
+    }));
+    if (addresses.length === 0) throw new Error("ComfyUI transport requires approved backend addresses");
+    let nextAddress = 0;
+    const connector: ReturnType<typeof buildConnector> = (connectOptions, callback) => {
+      const approved = addresses[nextAddress++ % addresses.length];
+      const port = Number(connectOptions.port) || (connectOptions.protocol === "https:" ? 443 : 80);
+      let callbackPending = true;
+      const finish = (error: Error | null, socket: net.Socket | tls.TLSSocket | null) => {
+        if (!callbackPending) return;
+        callbackPending = false;
+        if (error) callback(error, null);
+        else if (socket) callback(null, socket);
+        else callback(new Error("Backend connector returned no socket"), null);
+      };
+      const tlsOptions: tls.ConnectionOptions = {
+        servername: connectOptions.servername || new URL(this.baseUrl).hostname,
+      };
+      const socket = connectOptions.protocol === "https:"
+        ? tls.connect(port, approved.address, tlsOptions)
+        : net.connect({
+            host: approved.address,
+            port,
+            family: approved.family,
+            localAddress: connectOptions.localAddress ?? undefined,
+          });
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 60_000);
+      socket.once("error", (error) => finish(error, null));
+      socket.once(connectOptions.protocol === "https:" ? "secureConnect" : "connect", () => {
+        if (!isApprovedRemoteAddress(socket.remoteAddress, canonicalAddresses)) {
+          socket.destroy();
+          finish(new Error("Backend socket remote address is outside the approved endpoint policy"), null);
+          return;
+        }
+        finish(null, socket);
+      });
+    };
+    this.dispatcher = new Agent({
+      connect: connector,
+    });
     this.clientId = this.generateClientId();
+    const policyDigest = createHash("sha256").update(JSON.stringify({
+      endpoint: this.baseUrl,
+      addresses: canonicalAddresses,
+      revision: options.policyRevision,
+    })).digest("hex");
+    const registryKey = `${this.baseUrl}#credential=${credentialIdentity(this.headers)}&policy=${policyDigest}`;
+    this.webSocketFactory = Object.freeze({
+      canonicalEndpoint: this.baseUrl,
+      registryKey,
+      open: () => {
+        const dispatcher = new Agent({ connect: connector });
+        const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(this.clientId)}`;
+        const origin = new URL(this.baseUrl).origin;
+        const ws = new UndiciWebSocket(wsUrl, {
+          dispatcher,
+          headers: { ...this.headers, Origin: origin },
+        });
+        ws.addEventListener("close", () => { void dispatcher.close(); }, { once: true });
+        return ws as unknown as WebSocket;
+      },
+    });
   }
 
   private generateClientId(): string {
@@ -257,14 +381,11 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
   }
 
   connectWebSocket(): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${encodeURIComponent(this.clientId)}`;
-    // Browser WebSocket cannot attach arbitrary auth headers. Remote authenticated
-    // backends must use a same-origin gateway or a short-lived URL credential.
-    this.ws = new UndiciWebSocket(wsUrl, {
-      dispatcher: this.dispatcher,
-      headers: this.headers,
-    }) as unknown as WebSocket;
-    return this.ws;
+    return this.webSocketFactory.open();
+  }
+
+  getWebSocketFactory(): ComfyUIWebSocketFactory {
+    return this.webSocketFactory;
   }
 
   async cancel(): Promise<void> {
@@ -277,10 +398,6 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
 
   close(): void {
     this.cancel();
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
     void this.dispatcher?.close();
   }
 
@@ -493,13 +610,18 @@ export async function createComfyUITransport(
   topology: string,
   headers: Record<string, string> = {},
   expectedResolvedAddresses: readonly string[] = [],
+  options: ComfyUIEndpointPolicyOptions,
 ): Promise<ComfyUITransport> {
   if (!isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
     throw new Error("v2.0 ComfyUI transport is not enabled");
   }
 
   // SSRF 防护
-  const validation = await validateBackendUrlResolved(baseUrl, topology as import("@/lib/security/network-policy").BackendTopology);
+  const validation = await validateBackendUrlResolved(
+    baseUrl,
+    topology as import("@/lib/security/network-policy").BackendTopology,
+    options.resolver,
+  );
   if (!validation.valid) {
     throw new Error(`Invalid ComfyUI backend URL: ${validation.errors.join("; ")}`);
   }
@@ -511,5 +633,5 @@ export async function createComfyUITransport(
     }
   }
 
-  return new ComfyUIHttpTransport(baseUrl, headers, validation.resolvedAddresses);
+  return new ComfyUIHttpTransport(baseUrl, headers, validation.resolvedAddresses, options);
 }

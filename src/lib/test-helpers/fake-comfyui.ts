@@ -219,6 +219,14 @@ export class FakeComfyUITransport implements ComfyUITransport {
     return new FakeWebSocket();
   }
 
+  getWebSocketFactory() {
+    return Object.freeze({
+      canonicalEndpoint: "http://fake-comfyui.test",
+      registryKey: `fake-comfyui:${this.scenario.promptId ?? "default"}`,
+      open: () => this.connectWebSocket(),
+    });
+  }
+
   async cancel(): Promise<void> {}
 
   async interrupt(): Promise<void> {}

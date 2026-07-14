@@ -133,7 +133,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onOutputStream: async (output) => {
           outputs.push(await output.response.arrayBuffer());
@@ -156,7 +155,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: () => { throw new ExecutionCallbackPersistenceError(injected); },
       },
@@ -181,7 +179,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onReconciliation: (r) => { reconciliations.push(r.evidenceStrength); },
         onOutputStream: async (output) => { await output.response.arrayBuffer(); },
@@ -213,7 +210,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       { onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); } },
       {
         ...fastConfig(),
@@ -241,7 +237,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => { if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel(); },
         onOutputStream: async (output) => { await output.response.arrayBuffer(); },
@@ -265,7 +260,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => {
           if (phase === "EXTERNAL_RUNNING") {
@@ -291,7 +285,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       makeCorrelationTerminalTransport(promptId, correlationId),
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         isCancellationRequested: () => true,
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
@@ -317,7 +310,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       makeCorrelationTerminalTransport(promptId, correlationId),
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
         onReconciliation: (result) => { reconciliationOutcomes.push(result.historyOutcome); },
@@ -346,7 +338,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => {
           if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();
@@ -381,7 +372,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
         onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); },
@@ -409,7 +399,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => {
           if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   validateUrl,
   validateBackendUrl,
+  validateBackendUrlResolved,
   noRedirectFetchOptions,
   isRedirectResponse,
 } from "../network-policy";
@@ -51,6 +52,22 @@ describe("PR-12: SSRF URL 校验", () => {
 });
 
 describe("PR-12: 后端拓扑校验", () => {
+  it("validates every address returned by the dial-time resolver", async () => {
+    process.env.AI_M_CONTAINER_SERVICE_ALLOWLIST = "comfy.policy.test";
+    const resolver = async () => [{ address: "169.254.169.254", family: 4 as const }];
+    const result = await validateBackendUrlResolved(
+      "http://comfy.policy.test:8188",
+      "same-host-container",
+      resolver,
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.resolvedAddresses).toEqual(["169.254.169.254"]);
+    expect(result.errors).toEqual([
+      "Resolved address 169.254.169.254 is not allowed for topology same-host-container",
+    ]);
+  });
+
   it("same-host 只允许回环主机", () => {
     expect(validateBackendUrl("http://localhost:8188", "same-host").valid).toBe(true);
     expect(validateBackendUrl("http://127.0.0.1:8188", "same-host").valid).toBe(true);
@@ -84,6 +101,11 @@ describe("PR-12: 后端拓扑校验", () => {
     expect(validateBackendUrl("http://user:pass@localhost:8188", "same-host").valid).toBe(false);
     expect(validateBackendUrl("http://169.254.169.254:8188", "lan-remote").valid).toBe(false);
     expect(validateBackendUrl("http://localhost:9000", "same-host").valid).toBe(false);
+  });
+
+  it("allows a base path but rejects backend URL query semantics", () => {
+    expect(validateBackendUrl("http://localhost:8188/comfy", "same-host").valid).toBe(true);
+    expect(validateBackendUrl("http://localhost:8188/comfy?alternate=authority", "same-host").valid).toBe(false);
   });
 });
 

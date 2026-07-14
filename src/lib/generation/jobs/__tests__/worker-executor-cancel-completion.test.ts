@@ -14,6 +14,7 @@ import {
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
+import { sha256 } from "@/lib/generation/workflows/canonical";
 import {
   FakeComfyUITransport,
   defaultBackendFeatures,
@@ -374,6 +375,7 @@ describe("worker completion after cancellation intent", () => {
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
       status: "SUCCEEDED",
     });
+    expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toEqual({ policyRevision: sha256({}) });
   });
 
   it.each([undefined, "identity"])("binds a %s Content-Length to the artifact writer", async (contentEncoding) => {

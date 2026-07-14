@@ -179,7 +179,6 @@ export class ComfyUIExecutionOrchestrator {
   private readonly config: ExecutionConfig;
   private readonly callbacks: ExecutionCallbacks;
   private readonly connectionMgr: ComfyUIConnectionManager;
-  private readonly baseUrl: string;
   private readonly clientId: string;
   private readonly correlationId?: string;
 
@@ -202,21 +201,19 @@ export class ComfyUIExecutionOrchestrator {
   constructor(
     transport: ComfyUITransport & { getClientId?: () => string },
     features: BackendFeatureSnapshot,
-    baseUrl: string,
     callbacks: ExecutionCallbacks = {},
     config: Partial<ExecutionConfig> = {},
     correlationId?: string,
   ) {
     this.transport = transport;
     this.features = features;
-    this.baseUrl = baseUrl;
     this.callbacks = callbacks;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.clientId =
       (transport as { getClientId?: () => string }).getClientId?.() ??
       `orchestrator-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.correlationId = correlationId;
-    this.connectionMgr = connectionManagerRegistry.getOrCreate(baseUrl, this.clientId);
+    this.connectionMgr = connectionManagerRegistry.getOrCreate(transport.getWebSocketFactory());
   }
 
   /**

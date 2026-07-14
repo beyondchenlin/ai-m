@@ -24,6 +24,10 @@ export interface AddressValidationResult {
   errors: string[];
 }
 
+export type BackendAddressResolver = (
+  hostname: string,
+) => Promise<readonly { address: string; family: 4 | 6 }[]>;
+
 const METADATA_HOSTNAMES = new Set([
   "metadata.google.internal",
   "metadata.azure.internal",
@@ -127,6 +131,7 @@ function parseAndValidateUrl(baseUrl: string): { url?: URL; errors: string[] } {
   if (url.protocol !== "http:" && url.protocol !== "https:") errors.push("Only HTTP and HTTPS are allowed");
   if (url.username || url.password) errors.push("Credentials must not be embedded in the URL");
   if (url.hash) errors.push("URL fragments are not allowed");
+  if (url.search) errors.push("URL query parameters are not allowed");
   if (METADATA_HOSTNAMES.has(url.hostname.toLowerCase()) || METADATA_IPS.has(url.hostname)) {
     errors.push("Cloud metadata endpoints are forbidden");
   }
@@ -171,6 +176,8 @@ export function validateBackendUrl(
 export async function validateBackendUrlResolved(
   baseUrl: string,
   topology: BackendTopology,
+  resolver: BackendAddressResolver = async (hostname) => (await lookup(hostname, { all: true, verbatim: true }))
+    .filter((entry): entry is { address: string; family: 4 | 6 } => entry.family === 4 || entry.family === 6),
 ): Promise<AddressValidationResult> {
   const initial = validateBackendUrl(baseUrl, topology);
   if (!initial.valid) return { valid: false, resolvedAddresses: [], errors: [initial.error ?? "Invalid URL"] };
@@ -180,7 +187,7 @@ export async function validateBackendUrlResolved(
     addresses = [url.hostname];
   } else {
     try {
-      addresses = (await lookup(url.hostname, { all: true, verbatim: true })).map((entry) => entry.address);
+      addresses = (await resolver(url.hostname)).map((entry) => entry.address);
     } catch {
       return { valid: false, resolvedAddresses: [], errors: ["Backend hostname cannot be resolved"] };
     }
