@@ -63,7 +63,7 @@ export async function acquireResourceSlot(
     const job = tx.select().from(generationJobs).where(eq(generationJobs.id, attempt.jobId)).get();
     if (!job
       || job.currentAttemptId !== attempt.id
-      || (job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
+      || job.status !== "RUNNING"
       || job.claimOwner !== workerId
       || job.claimUntilMs === null
       || job.claimUntilMs <= now

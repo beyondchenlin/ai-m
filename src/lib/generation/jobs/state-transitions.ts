@@ -1,4 +1,4 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { db, type DB } from "@/lib/db";
 import { generationAttempts, generationEvents, generationJobs, resourcePoolSlots } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
@@ -59,6 +59,8 @@ export interface SubmissionResourceIdentity {
   clock?: () => number;
 }
 
+export type BeginSubmissionResult = TransitionResult | { status: "cancelled-before-submission" };
+
 const PRE_SUBMISSION_PHASES = new Set<AttemptPhase>(["CREATED", "LEASED", "PREPARING"]);
 
 export type PreSubmissionRecoveryDisposition = "requeued" | "cancelled" | "needs-attention";
@@ -110,7 +112,7 @@ export function planPreSubmissionRecovery(
       finishedAtMs: now,
       updatedAtMs: now,
     },
-    jobPatch: { status: "QUEUED", updatedAtMs: now },
+    jobPatch: { status: "QUEUED", currentAttemptId: null, updatedAtMs: now },
   };
 }
 
@@ -136,7 +138,10 @@ export function recoverExpiredJob(
   snapshot: ExpiredJobSnapshot,
   database: DB = db,
   clock: () => number = Date.now,
-): RecoveryTransitionResult<{ disposition: "requeued" | "cancelled" | "needs-attention" }> {
+): RecoveryTransitionResult<{
+  disposition: "requeued" | "cancelled" | "needs-attention";
+  reason?: "invalid-resource-lease-identity";
+}> {
   try {
     return database.transaction((tx) => {
       const now = clock();
@@ -177,10 +182,10 @@ export function recoverExpiredJob(
         if (currentAttempt) {
           const ownedSlots = tx.select().from(resourcePoolSlots)
             .where(eq(resourcePoolSlots.ownerAttemptId, currentAttempt.id)).all();
-          const ownsRecoverableSlot = ownedSlots.some((slot) => {
+          const occupiedSlots = ownedSlots.filter((slot) => slot.leaseToken !== null && slot.expiresAtMs !== null);
+          const ownsRecoverableSlot = occupiedSlots.some((slot) => {
             // Expired is still occupied: only the slot scanner may recover all
             // three records atomically after validating this physical identity.
-            const occupied = slot.leaseToken !== null && slot.expiresAtMs !== null;
             const placeholderIdentity = currentAttempt.phase === "PREPARING"
               && currentAttempt.resourcePoolId === slot.resourcePoolId
               && currentAttempt.resourceSlotNo === 0
@@ -190,9 +195,38 @@ export function recoverExpiredJob(
               && currentAttempt.resourceSlotNo === slot.slotNo
               && currentAttempt.resourceLeaseToken === slot.leaseToken
               && currentAttempt.resourceFencingToken === slot.fencingToken;
-            return occupied && (placeholderIdentity || boundIdentity);
+            return placeholderIdentity || boundIdentity;
           });
           if (ownsRecoverableSlot) return { status: "deferred-resource-slot" } as const;
+          if (occupiedSlots.length > 0) {
+            const attemptChanged = tx.update(generationAttempts).set({
+              phase: "ORPHANED",
+              errorClass: "invalid_resource_lease_identity",
+              errorCode: "invalid_resource_lease_identity",
+              errorMessageSafe: "The persisted attempt identity does not match its occupied resource slot",
+              finishedAtMs: now,
+              updatedAtMs: now,
+            }).where(and(
+              eq(generationAttempts.id, currentAttempt.id),
+              eq(generationAttempts.phase, currentAttempt.phase),
+              eq(generationAttempts.jobClaimFencingToken, snapshot.attempt!.jobClaimFencingToken),
+            )).run();
+            if (attemptChanged.changes !== 1) rollbackLostRace();
+            const jobChanged = tx.update(generationJobs).set({
+              status: "NEEDS_ATTENTION",
+              claimOwner: null,
+              claimUntilMs: null,
+              claimFencingToken: snapshot.claimFencingToken + 1,
+              needsAttentionReason: "invalid_resource_lease_identity",
+              updatedAtMs: now,
+            }).where(eq(generationJobs.id, snapshot.jobId)).run();
+            if (jobChanged.changes !== 1) rollbackLostRace();
+            return {
+              status: "applied",
+              disposition: "needs-attention",
+              reason: "invalid-resource-lease-identity",
+            } as const;
+          }
         }
         const plan = planPreSubmissionRecovery(
           currentJob.status,
@@ -298,6 +332,118 @@ export function attachOwnedAttempt(
   }
 }
 
+/** Cancel an owned request that was cancelled before an attempt could attach. */
+export function cancelOwnedJobBeforeAttempt(
+  identity: OwnedJobIdentity,
+  database: DB = db,
+  clock: () => number = Date.now,
+): TransitionResult {
+  return database.transaction((tx) => {
+    const now = clock();
+    const current = tx.select().from(generationJobs)
+      .where(eq(generationJobs.id, identity.jobId)).get();
+    if (!current
+      || current.currentAttemptId !== null
+      || current.claimOwner !== identity.workerId
+      || current.claimFencingToken !== identity.jobFencingToken
+      || current.claimUntilMs === null
+      || current.claimUntilMs < now) return { status: "ownership-lost" } as const;
+    if (current.status !== "CANCEL_REQUESTED") return { status: "invalid-transition" } as const;
+    const changed = tx.update(generationJobs).set({
+      status: "CANCELLED",
+      completedAtMs: now,
+      updatedAtMs: now,
+    }).where(and(
+      eq(generationJobs.id, identity.jobId),
+      eq(generationJobs.status, "CANCEL_REQUESTED"),
+      eq(generationJobs.claimOwner, identity.workerId),
+      eq(generationJobs.claimFencingToken, identity.jobFencingToken),
+      isNull(generationJobs.currentAttemptId),
+    )).returning({ id: generationJobs.id }).all();
+    if (!changed[0]) return { status: "lost-race" } as const;
+    tx.insert(generationEvents).values({
+      id: genId(),
+      jobId: identity.jobId,
+      attemptId: null,
+      eventType: "job_cancelled_before_submission",
+      severity: "info",
+      safePayloadJson: {},
+      createdAtMs: now,
+    }).run();
+    return { status: "applied" } as const;
+  }, { behavior: "immediate" });
+}
+
+/** Cancel an attached placeholder before it owns any physical resource slot. */
+export function cancelOwnedAttemptBeforeSubmission(
+  identity: OwnedAttemptIdentity,
+  database: DB = db,
+  clock: () => number = Date.now,
+): TransitionResult {
+  try {
+    return database.transaction((tx) => {
+      const now = clock();
+      const current = tx.select({ attempt: generationAttempts, job: generationJobs })
+        .from(generationAttempts)
+        .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
+        .where(eq(generationAttempts.id, identity.attemptId)).get();
+      if (!current
+        || current.attempt.jobId !== identity.jobId
+        || current.job.currentAttemptId !== identity.attemptId
+        || current.job.claimOwner !== identity.workerId
+        || current.job.claimFencingToken !== identity.jobFencingToken
+        || current.attempt.jobClaimFencingToken !== identity.jobFencingToken
+        || current.job.claimUntilMs === null
+        || current.job.claimUntilMs < now) return { status: "ownership-lost" } as const;
+      if (current.job.status !== "CANCEL_REQUESTED") return { status: "invalid-transition" } as const;
+      if (current.attempt.phase !== "PREPARING"
+        || current.attempt.externalJobId !== null
+        || current.attempt.resourceSlotNo !== 0
+        || current.attempt.resourceLeaseToken !== `pending-${current.attempt.id}`
+        || current.attempt.resourceFencingToken !== 0) return { status: "invalid-transition" } as const;
+      const occupied = tx.select({ slotNo: resourcePoolSlots.slotNo }).from(resourcePoolSlots)
+        .where(eq(resourcePoolSlots.ownerAttemptId, identity.attemptId)).get();
+      if (occupied) return { status: "invalid-transition" } as const;
+
+      const attemptChanged = tx.update(generationAttempts).set({
+        phase: "CANCELLED",
+        finishedAtMs: now,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationAttempts.id, identity.attemptId),
+        eq(generationAttempts.phase, "PREPARING"),
+        eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
+      )).run();
+      if (attemptChanged.changes !== 1) rollbackLostRace();
+      const jobChanged = tx.update(generationJobs).set({
+        status: "CANCELLED",
+        completedAtMs: now,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationJobs.id, identity.jobId),
+        eq(generationJobs.status, "CANCEL_REQUESTED"),
+        eq(generationJobs.currentAttemptId, identity.attemptId),
+        eq(generationJobs.claimOwner, identity.workerId),
+        eq(generationJobs.claimFencingToken, identity.jobFencingToken),
+      )).run();
+      if (jobChanged.changes !== 1) rollbackLostRace();
+      tx.insert(generationEvents).values({
+        id: genId(),
+        jobId: identity.jobId,
+        attemptId: identity.attemptId,
+        eventType: "job_cancelled_before_submission",
+        severity: "info",
+        safePayloadJson: {},
+        createdAtMs: now,
+      }).run();
+      return { status: "applied" } as const;
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (error instanceof TransitionRollback) return { status: error.transitionStatus };
+    throw error;
+  }
+}
+
 /**
  * Cross the external submission boundary only while both logical job ownership
  * and the exact physical resource lease are live in the same writer transaction.
@@ -306,14 +452,19 @@ export function beginOwnedAttemptSubmission(
   identity: OwnedAttemptIdentity,
   resource: SubmissionResourceIdentity,
   database: DB = db,
-): TransitionResult {
-  return database.transaction((tx) => {
+): BeginSubmissionResult {
+  try {
+    return database.transaction((tx) => {
     const now = resource.clock?.() ?? Date.now();
     const current = tx.select({
       attemptPhase: generationAttempts.phase,
       attemptToken: generationAttempts.jobClaimFencingToken,
       attemptJobId: generationAttempts.jobId,
       attemptResourcePoolId: generationAttempts.resourcePoolId,
+      attemptResourceSlotNo: generationAttempts.resourceSlotNo,
+      attemptResourceLeaseToken: generationAttempts.resourceLeaseToken,
+      attemptResourceFencingToken: generationAttempts.resourceFencingToken,
+      attemptExternalJobId: generationAttempts.externalJobId,
       jobStatus: generationJobs.status,
       currentAttemptId: generationJobs.currentAttemptId,
       claimOwner: generationJobs.claimOwner,
@@ -331,7 +482,7 @@ export function beginOwnedAttemptSubmission(
       || current.attemptToken !== identity.jobFencingToken
       || current.claimUntilMs === null
       || current.claimUntilMs < now
-      || current.jobStatus !== "RUNNING") {
+      || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
       return { status: "ownership-lost" } as const;
     }
     if (current.attemptPhase !== "PREPARING") return { status: "invalid-transition" } as const;
@@ -352,6 +503,61 @@ export function beginOwnedAttemptSubmission(
       return { status: "ownership-lost" } as const;
     }
 
+    if (current.jobStatus === "CANCEL_REQUESTED") {
+      if (current.attemptExternalJobId !== null
+        || current.attemptResourceSlotNo !== 0
+        || current.attemptResourceLeaseToken !== `pending-${identity.attemptId}`
+        || current.attemptResourceFencingToken !== 0) {
+        return { status: "invalid-transition" } as const;
+      }
+      const attemptChanged = tx.update(generationAttempts).set({
+        phase: "CANCELLED",
+        finishedAtMs: now,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationAttempts.id, identity.attemptId),
+        eq(generationAttempts.phase, "PREPARING"),
+        eq(generationAttempts.jobClaimFencingToken, identity.jobFencingToken),
+      )).run();
+      if (attemptChanged.changes !== 1) rollbackLostRace();
+      const jobChanged = tx.update(generationJobs).set({
+        status: "CANCELLED",
+        completedAtMs: now,
+        updatedAtMs: now,
+      }).where(and(
+        eq(generationJobs.id, identity.jobId),
+        eq(generationJobs.status, "CANCEL_REQUESTED"),
+        eq(generationJobs.currentAttemptId, identity.attemptId),
+        eq(generationJobs.claimOwner, identity.workerId),
+        eq(generationJobs.claimFencingToken, identity.jobFencingToken),
+      )).run();
+      if (jobChanged.changes !== 1) rollbackLostRace();
+      const slotChanged = tx.update(resourcePoolSlots).set({
+        ownerAttemptId: null,
+        leaseToken: null,
+        expiresAtMs: null,
+        fencingToken: sql`${resourcePoolSlots.fencingToken} + 1`,
+        updatedAtMs: now,
+      }).where(and(
+        eq(resourcePoolSlots.resourcePoolId, resource.resourcePoolId),
+        eq(resourcePoolSlots.slotNo, resource.slotNo),
+        eq(resourcePoolSlots.ownerAttemptId, identity.attemptId),
+        eq(resourcePoolSlots.leaseToken, resource.leaseToken),
+        eq(resourcePoolSlots.fencingToken, resource.fencingToken),
+      )).run();
+      if (slotChanged.changes !== 1) rollbackLostRace();
+      tx.insert(generationEvents).values({
+        id: genId(),
+        jobId: identity.jobId,
+        attemptId: identity.attemptId,
+        eventType: "job_cancelled_before_submission",
+        severity: "info",
+        safePayloadJson: {},
+        createdAtMs: now,
+      }).run();
+      return { status: "cancelled-before-submission" } as const;
+    }
+
     const changed = tx.update(generationAttempts).set({
       phase: "SUBMITTING",
       resourceSlotNo: resource.slotNo,
@@ -365,7 +571,11 @@ export function beginOwnedAttemptSubmission(
       eq(generationAttempts.resourcePoolId, resource.resourcePoolId),
     )).returning({ id: generationAttempts.id }).all();
     return changed.length === 1 ? { status: "applied" } as const : { status: "lost-race" } as const;
-  }, { behavior: "immediate" });
+    }, { behavior: "immediate" });
+  } catch (error) {
+    if (error instanceof TransitionRollback) return { status: error.transitionStatus };
+    throw error;
+  }
 }
 
 /** Update a worker-owned attempt only while it remains the live job attempt. */

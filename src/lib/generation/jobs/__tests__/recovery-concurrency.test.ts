@@ -15,11 +15,17 @@ import {
   resourcePoolSlots,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
-import { recoverExpiredJob, updateOwnedAttempt, type ExpiredJobSnapshot } from "../state-transitions";
+import {
+  attachOwnedAttempt,
+  recoverExpiredJob,
+  updateOwnedAttempt,
+  type ExpiredJobSnapshot,
+} from "../state-transitions";
 import { applyExpiredJobCandidates, readExpiredJobCandidates } from "../recovery-candidates";
 import {
   acquireResourceSlot,
   applyExpiredSlotCandidates,
+  claimJob,
   readExpiredSlotCandidates,
   renewJobClaim,
   renewResourceSlot,
@@ -267,6 +273,104 @@ describe("expired claim recovery concurrency", () => {
       eq(generationEvents.jobId, seeded.jobId),
       eq(generationEvents.eventType, "job_cancelled"),
     ))).toHaveLength(1);
+  });
+
+  it("quarantines malformed occupied identity in the full scanner while retaining its slot", async () => {
+    const now = Date.now();
+    const seeded = await seedExpiredPreparingJob("RUNNING");
+    await db.update(generationJobs).set({ claimUntilMs: now - 1 })
+      .where(eq(generationJobs.id, seeded.jobId));
+    await db.update(generationAttempts).set({
+      resourceLeaseToken: "malformed-persisted-token",
+    }).where(eq(generationAttempts.id, seeded.attemptId));
+    await db.insert(resourcePoolSlots).values({
+      resourcePoolId: seeded.poolId,
+      slotNo: 1,
+      ownerAttemptId: seeded.attemptId,
+      leaseToken: `physical-${seeded.attemptId}`,
+      fencingToken: 1,
+      expiresAtMs: now - 1,
+      updatedAtMs: now,
+    });
+
+    const result = await scanExpiredClaims();
+
+    expect(result.outcomes).toContainEqual({
+      jobId: seeded.jobId,
+      status: "applied",
+      disposition: "needs-attention",
+      reason: "invalid-resource-lease-identity",
+    });
+    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
+    const [attempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, seeded.attemptId));
+    const [slot] = await db.select().from(resourcePoolSlots).where(eq(resourcePoolSlots.resourcePoolId, seeded.poolId));
+    expect(job).toMatchObject({
+      status: "NEEDS_ATTENTION",
+      currentAttemptId: seeded.attemptId,
+      needsAttentionReason: "invalid_resource_lease_identity",
+    });
+    expect(attempt).toMatchObject({
+      phase: "ORPHANED",
+      errorCode: "invalid_resource_lease_identity",
+    });
+    expect(slot.ownerAttemptId).toBe(seeded.attemptId);
+    expect(await claimJob("worker-new", "image")).toBeNull();
+  });
+
+  it("allows a new attempt after dual scanners safely requeue while retaining the old attempt audit", async () => {
+    const observedAtMs = Date.now();
+    const seeded = await seedExpiredPreparingJob("RUNNING");
+    await db.update(generationJobs).set({ claimUntilMs: observedAtMs - 1 })
+      .where(eq(generationJobs.id, seeded.jobId));
+    const workerDb = drizzle(workerConnection, { schema }) as typeof db;
+    const [leftCandidates, rightCandidates] = await Promise.all([
+      readExpiredJobCandidates(observedAtMs, db),
+      readExpiredJobCandidates(observedAtMs, workerDb),
+    ]);
+
+    const [left, right] = await Promise.all([
+      applyExpiredJobCandidates(leftCandidates, db, () => observedAtMs),
+      applyExpiredJobCandidates(rightCandidates, workerDb, () => observedAtMs),
+    ]);
+
+    expect([...left.outcomes, ...right.outcomes]
+      .filter((outcome) => outcome.status === "applied" && outcome.disposition === "requeued"))
+      .toHaveLength(1);
+    const [requeued] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
+    expect(requeued).toMatchObject({ status: "QUEUED", currentAttemptId: null });
+    const [oldAttempt] = await db.select().from(generationAttempts).where(eq(generationAttempts.id, seeded.attemptId));
+    expect(oldAttempt.phase).toBe("ORPHANED");
+
+    const claimed = await claimJob("worker-new", "image");
+    expect(claimed?.id).toBe(seeded.jobId);
+    const newAttemptId = crypto.randomUUID();
+    expect(attachOwnedAttempt({
+      jobId: seeded.jobId,
+      workerId: "worker-new",
+      jobFencingToken: claimed!.claimFencingToken,
+    }, {
+      attempt: {
+        id: newAttemptId,
+        jobId: seeded.jobId,
+        attemptNo: 2,
+        jobClaimFencingToken: claimed!.claimFencingToken,
+        phase: "PREPARING",
+        backendId: seeded.backendId,
+        backendFeatureSnapshotJson: {},
+        environmentFingerprint: "env:new-attempt",
+        submissionCorrelationId: `corr-${newAttemptId}`,
+        externalIdStrategy: "server-assigned",
+        systemOutputPrefix: `prefix-${newAttemptId}`,
+        resourcePoolId: seeded.poolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${newAttemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: observedAtMs,
+        updatedAtMs: observedAtMs,
+      },
+    })).toEqual({ status: "applied" });
+    expect(await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, seeded.jobId)))
+      .toHaveLength(2);
   });
 
   it("defers job recovery after a read slot candidate is renewed, then converges after the renewed slot expires", async () => {

@@ -17,6 +17,7 @@ import * as stateTransitions from "@/lib/generation/jobs/state-transitions";
 import {
   acquireResourceSlot,
   applyExpiredSlotCandidates,
+  claimJob,
   recordResourceTerminationProof,
   readExpiredSlotCandidates,
   scanExpiredClaims,
@@ -34,11 +35,35 @@ type BeginSubmission = (
     clock?: () => number;
   },
   database: typeof db,
+) => stateTransitions.TransitionResult | { status: "cancelled-before-submission" };
+
+type CancelBeforeSlot = (
+  identity: { jobId: string; attemptId: string; workerId: string; jobFencingToken: number },
+  database: typeof db,
+  clock?: () => number,
 ) => stateTransitions.TransitionResult;
 
-function beginSubmission(...args: Parameters<BeginSubmission>): stateTransitions.TransitionResult {
+type CancelBeforeAttempt = (
+  identity: { jobId: string; workerId: string; jobFencingToken: number },
+  database: typeof db,
+  clock?: () => number,
+) => stateTransitions.TransitionResult;
+
+function beginSubmission(...args: Parameters<BeginSubmission>): ReturnType<BeginSubmission> {
   const transition = Reflect.get(stateTransitions, "beginOwnedAttemptSubmission") as BeginSubmission | undefined;
   expect(transition, "dedicated atomic begin-submission transition").toBeTypeOf("function");
+  return transition!(...args);
+}
+
+function cancelBeforeSlot(...args: Parameters<CancelBeforeSlot>): stateTransitions.TransitionResult {
+  const transition = Reflect.get(stateTransitions, "cancelOwnedAttemptBeforeSubmission") as CancelBeforeSlot | undefined;
+  expect(transition, "atomic pre-slot cancellation transition").toBeTypeOf("function");
+  return transition!(...args);
+}
+
+function cancelBeforeAttempt(...args: Parameters<CancelBeforeAttempt>): stateTransitions.TransitionResult {
+  const transition = Reflect.get(stateTransitions, "cancelOwnedJobBeforeAttempt") as CancelBeforeAttempt | undefined;
+  expect(transition, "atomic pre-attempt cancellation transition").toBeTypeOf("function");
   return transition!(...args);
 }
 
@@ -93,6 +118,8 @@ describe("resource slot reconciliation concurrency", () => {
   });
 
   beforeEach(async () => {
+    scannerConnection.exec("DROP TRIGGER IF EXISTS ignore_pre_submission_cancel_slot_update");
+    scannerConnection.exec("DROP TRIGGER IF EXISTS ignore_pre_submission_cancel_job_update");
     scannerConnection.exec("DELETE FROM resource_reconciliation_proofs");
     await db.delete(resourcePoolSlots);
     await db.delete(generationAttempts);
@@ -340,6 +367,47 @@ describe("resource slot reconciliation concurrency", () => {
     return { jobId, attemptId, workerId, jobFencingToken, lease: lease! };
   }
 
+  async function claimAttachAndAcquireRecoveredAttempt(input: {
+    jobId: string;
+    poolId: string;
+    backendId: string;
+  }) {
+    const workerId = "worker-recovered";
+    const claimed = await claimJob(workerId, "image");
+    expect(claimed?.id).toBe(input.jobId);
+    const attemptId = crypto.randomUUID();
+    const jobFencingToken = claimed!.claimFencingToken;
+    const previousAttempts = await db.select().from(generationAttempts)
+      .where(eq(generationAttempts.jobId, input.jobId));
+    expect(stateTransitions.attachOwnedAttempt({ jobId: input.jobId, workerId, jobFencingToken }, {
+      clock: () => NOW,
+      attempt: {
+        id: attemptId,
+        jobId: input.jobId,
+        attemptNo: 2,
+        jobClaimFencingToken: jobFencingToken,
+        phase: "PREPARING",
+        backendId: input.backendId,
+        backendFeatureSnapshotJson: {},
+        environmentFingerprint: "env:placeholder-recovered",
+        submissionCorrelationId: `corr-${attemptId}`,
+        externalIdStrategy: "server-assigned",
+        systemOutputPrefix: `prefix-${attemptId}`,
+        resourcePoolId: input.poolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${attemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: NOW,
+        updatedAtMs: NOW,
+      },
+    }, workerDb)).toEqual({ status: "applied" });
+    const lease = await acquireResourceSlot(input.poolId, attemptId, workerId, workerDb, () => NOW);
+    expect(lease).not.toBeNull();
+    expect(await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, input.jobId)))
+      .toHaveLength(previousAttempts.length + 1);
+    return { attemptId, lease: lease! };
+  }
+
   function insertMatchingProof(
     seeded: Awaited<ReturnType<typeof seedExpiredSlot>>,
     proofKind: "history-completed" | "history-cancelled" | "history-failed" = "history-cancelled",
@@ -465,7 +533,7 @@ describe("resource slot reconciliation concurrency", () => {
     expect(scannerConnection.prepare("SELECT COUNT(*) AS count FROM resource_reconciliation_proofs").get())
       .toEqual({ count: 0 });
 
-    const next = await attachAndAcquireNextAttempt(seeded);
+    const next = await claimAttachAndAcquireRecoveredAttempt(seeded);
     expect(beginSubmission({
       jobId: seeded.jobId,
       attemptId: seeded.attemptId,
@@ -482,6 +550,249 @@ describe("resource slot reconciliation concurrency", () => {
       "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
     ).get(seeded.poolId);
     expect(currentSlot?.ownerAttemptId).toBe(next.attemptId);
+  });
+
+  it("cancels an attached attempt before slot acquisition and leaves capacity immediately reusable", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    await db.update(resourcePoolSlots).set({
+      ownerAttemptId: null,
+      leaseToken: null,
+      expiresAtMs: null,
+    }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, 1),
+    ));
+
+    expect(await acquireResourceSlot(
+      seeded.poolId, seeded.attemptId, seeded.workerId, scannerDb, () => NOW,
+    )).toBeNull();
+    expect(cancelBeforeSlot({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, scannerDb, () => NOW)).toEqual({ status: "applied" });
+
+    const state = scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase
+      FROM generation_jobs j JOIN generation_attempts a ON a.id = j.current_attempt_id
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({ jobStatus: "CANCELLED", attemptPhase: "CANCELLED" });
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_events
+      WHERE job_id = ? AND event_type = 'job_cancelled_before_submission'
+    `).get(seeded.jobId)).toEqual({ count: 1 });
+    const next = await attachAndAcquireNextAttempt(seeded);
+    expect(next.lease.slotNo).toBe(1);
+  });
+
+  it("cancels after slot acquisition inside begin-submission and releases exact capacity", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    await db.update(resourcePoolSlots).set({ expiresAtMs: NOW + 60_000 }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, seeded.lease.slotNo),
+    ));
+
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: seeded.lease.leaseToken,
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, scannerDb)).toEqual({ status: "cancelled-before-submission" });
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: seeded.lease.leaseToken,
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, workerDb)).toEqual({ status: "ownership-lost" });
+
+    const state = scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string; ownerAttemptId: string | null; fencingToken: number }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase,
+        s.owner_attempt_id AS ownerAttemptId, s.fencing_token AS fencingToken
+      FROM generation_jobs j
+      JOIN generation_attempts a ON a.id = j.current_attempt_id
+      JOIN resource_pool_slots s ON s.resource_pool_id = a.resource_pool_id AND s.slot_no = 1
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({
+      jobStatus: "CANCELLED",
+      attemptPhase: "CANCELLED",
+      ownerAttemptId: null,
+      fencingToken: seeded.lease.fencingToken + 1,
+    });
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_events
+      WHERE job_id = ? AND event_type = 'job_cancelled_before_submission'
+    `).get(seeded.jobId)).toEqual({ count: 1 });
+    const next = await attachAndAcquireNextAttempt(seeded);
+    expect(next.lease.slotNo).toBe(1);
+  });
+
+  it("cancels an owned request before attempt attachment exactly once", async () => {
+    const jobId = crypto.randomUUID();
+    await db.insert(generationJobs).values({
+      id: jobId,
+      capability: "image",
+      status: "CANCEL_REQUESTED",
+      executionSnapshotJson: {},
+      inputDigest: "cancel-before-attach",
+      currentAttemptId: null,
+      claimOwner: "worker-before-attach",
+      claimUntilMs: NOW + 60_000,
+      claimFencingToken: 21,
+      cancelRequestedAtMs: NOW,
+      createdAtMs: NOW,
+      updatedAtMs: NOW,
+    });
+
+    expect(cancelBeforeAttempt({
+      jobId,
+      workerId: "worker-before-attach",
+      jobFencingToken: 21,
+    }, scannerDb, () => NOW)).toEqual({ status: "applied" });
+    expect(cancelBeforeAttempt({
+      jobId,
+      workerId: "worker-before-attach",
+      jobFencingToken: 21,
+    }, workerDb, () => NOW)).not.toEqual({ status: "applied" });
+    expect(scannerConnection.prepare<[string], { status: string }>(
+      "SELECT status FROM generation_jobs WHERE id = ?",
+    ).get(jobId)).toEqual({ status: "CANCELLED" });
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_events
+      WHERE job_id = ? AND event_type = 'job_cancelled_before_submission'
+    `).get(jobId)).toEqual({ count: 1 });
+  });
+
+  it("rolls back attempt and job cancellation when exact slot release loses its CAS", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    await db.update(resourcePoolSlots).set({ expiresAtMs: NOW + 60_000 }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, seeded.lease.slotNo),
+    ));
+    scannerConnection.exec(`
+      CREATE TRIGGER ignore_pre_submission_cancel_slot_update BEFORE UPDATE ON resource_pool_slots
+      WHEN OLD.resource_pool_id = '${seeded.poolId}' AND OLD.slot_no = 1
+      BEGIN SELECT RAISE(IGNORE); END
+    `);
+
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: seeded.lease.leaseToken,
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, scannerDb)).toEqual({ status: "lost-race" });
+
+    const state = scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string; ownerAttemptId: string | null }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase, s.owner_attempt_id AS ownerAttemptId
+      FROM generation_jobs j
+      JOIN generation_attempts a ON a.id = j.current_attempt_id
+      JOIN resource_pool_slots s ON s.resource_pool_id = a.resource_pool_id AND s.slot_no = 1
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({
+      jobStatus: "CANCEL_REQUESTED",
+      attemptPhase: "PREPARING",
+      ownerAttemptId: seeded.attemptId,
+    });
+    expect(scannerConnection.prepare<[string], { count: number }>(
+      "SELECT COUNT(*) AS count FROM generation_events WHERE job_id = ?",
+    ).get(seeded.jobId)).toEqual({ count: 0 });
+  });
+
+  it("rolls back attached-attempt cancellation when the job CAS affects zero rows", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    await db.update(resourcePoolSlots).set({
+      ownerAttemptId: null,
+      leaseToken: null,
+      expiresAtMs: null,
+    }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, 1),
+    ));
+    scannerConnection.exec(`
+      CREATE TRIGGER ignore_pre_submission_cancel_job_update BEFORE UPDATE ON generation_jobs
+      WHEN OLD.id = '${seeded.jobId}'
+      BEGIN SELECT RAISE(IGNORE); END
+    `);
+
+    expect(cancelBeforeSlot({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, scannerDb, () => NOW)).toEqual({ status: "lost-race" });
+    const state = scannerConnection.prepare<[string], { jobStatus: string; attemptPhase: string }>(`
+      SELECT j.status AS jobStatus, a.phase AS attemptPhase
+      FROM generation_jobs j JOIN generation_attempts a ON a.id = j.current_attempt_id
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({ jobStatus: "CANCEL_REQUESTED", attemptPhase: "PREPARING" });
+    expect(scannerConnection.prepare<[string], { count: number }>(
+      "SELECT COUNT(*) AS count FROM generation_events WHERE job_id = ?",
+    ).get(seeded.jobId)).toEqual({ count: 0 });
+  });
+
+  it("does not release another identity when cancellation begin loses ownership", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: NOW + 60_000,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    await db.update(resourcePoolSlots).set({ expiresAtMs: NOW + 60_000 }).where(and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, seeded.lease.slotNo),
+    ));
+
+    expect(beginSubmission({
+      jobId: seeded.jobId,
+      attemptId: seeded.attemptId,
+      workerId: seeded.workerId,
+      jobFencingToken: seeded.jobFencingToken,
+    }, {
+      resourcePoolId: seeded.poolId,
+      slotNo: seeded.lease.slotNo,
+      leaseToken: "someone-elses-token",
+      fencingToken: seeded.lease.fencingToken,
+      clock: () => NOW,
+    }, scannerDb)).toEqual({ status: "ownership-lost" });
+    const [slot] = await db.select().from(resourcePoolSlots).where(eq(resourcePoolSlots.resourcePoolId, seeded.poolId));
+    expect(slot.ownerAttemptId).toBe(seeded.attemptId);
   });
 
   it("retains an unbound production placeholder while its claim is live", async () => {
@@ -650,14 +961,21 @@ describe("resource slot reconciliation concurrency", () => {
     ).get(seeded.poolId);
     expect(slot).toEqual({ ownerAttemptId: null, fencingToken: seeded.lease.fencingToken + 1 });
     expect([...left, ...right].filter((outcome) => outcome.jobDisposition === "requeued")).toHaveLength(1);
-    const state = scannerConnection.prepare<[string], { status: string; claimFencingToken: number; phase: string }>(`
-      SELECT j.status, j.claim_fencing_token AS claimFencingToken, a.phase
-      FROM generation_jobs j JOIN generation_attempts a ON a.id = j.current_attempt_id
-      WHERE j.id = ?
-    `).get(seeded.jobId);
+    const state = scannerConnection.prepare<[string, string], {
+      status: string;
+      claimFencingToken: number;
+      currentAttemptId: string | null;
+      phase: string;
+    }>(`
+      SELECT j.status, j.claim_fencing_token AS claimFencingToken,
+        j.current_attempt_id AS currentAttemptId,
+        (SELECT phase FROM generation_attempts WHERE id = ?) AS phase
+      FROM generation_jobs j WHERE j.id = ?
+    `).get(seeded.attemptId, seeded.jobId);
     expect(state).toEqual({
       status: "QUEUED",
       claimFencingToken: seeded.jobFencingToken + 1,
+      currentAttemptId: null,
       phase: "ORPHANED",
     });
   });

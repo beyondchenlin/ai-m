@@ -11,6 +11,7 @@ export interface RecoveryScanOutcome {
   jobId: string;
   status: RecoveryTransitionResult["status"];
   disposition?: "requeued" | "cancelled" | "needs-attention";
+  reason?: "invalid-resource-lease-identity";
 }
 
 export interface JobRecoveryResult {
@@ -87,7 +88,12 @@ export async function applyExpiredJobCandidates(
   for (const snapshot of candidates) {
     const result = recoverExpiredJob(snapshot, database, clock);
     outcomes.push(result.status === "applied"
-      ? { jobId: snapshot.jobId, status: result.status, disposition: result.disposition }
+      ? {
+        jobId: snapshot.jobId,
+        status: result.status,
+        disposition: result.disposition,
+        ...(result.reason ? { reason: result.reason } : {}),
+      }
       : { jobId: snapshot.jobId, status: result.status });
     if (result.status !== "applied") continue;
     if (result.disposition === "requeued") requeuedJobs.push(snapshot.jobId);

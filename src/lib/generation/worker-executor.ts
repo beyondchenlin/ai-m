@@ -31,6 +31,8 @@ import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/ge
 import {
   attachOwnedAttempt,
   beginOwnedAttemptSubmission,
+  cancelOwnedAttemptBeforeSubmission,
+  cancelOwnedJobBeforeAttempt,
   finalizeOwnedExecution,
   finalizeOwnedJob,
   type AttemptPhase,
@@ -199,11 +201,22 @@ export async function executeGenerationJob(
         updatedAtMs: attemptCreatedAtMs,
       },
     });
-    requireApplied(attached, "job_claim_lost_before_attempt_attachment");
+    if (attached.status !== "applied") {
+      const cancelled = cancelOwnedJobBeforeAttempt({ jobId: job.id, workerId, jobFencingToken });
+      if (cancelled.status === "applied") return preSubmissionCancelledResult();
+      requireApplied(attached, "job_claim_lost_before_attempt_attachment");
+    }
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
-    if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
-    requireApplied(beginOwnedAttemptSubmission({
+    if (!resourceSlot) {
+      const cancelled = cancelOwnedAttemptBeforeSubmission({ jobId: job.id, attemptId, workerId, jobFencingToken });
+      if (cancelled.status === "applied") return preSubmissionCancelledResult();
+      if (cancelled.status !== "invalid-transition") {
+        requireApplied(cancelled, "job_claim_lost_cancelling_before_resource_acquisition");
+      }
+      return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
+    }
+    const begun = beginOwnedAttemptSubmission({
       jobId: job.id,
       attemptId,
       workerId,
@@ -213,7 +226,12 @@ export async function executeGenerationJob(
       slotNo: resourceSlot.slotNo,
       leaseToken: resourceSlot.leaseToken,
       fencingToken: resourceSlot.fencingToken,
-    }), "job_or_resource_lease_lost_before_submission_boundary");
+    });
+    if (begun.status === "cancelled-before-submission") {
+      resourceSlot = null;
+      return preSubmissionCancelledResult();
+    }
+    requireApplied(begun, "job_or_resource_lease_lost_before_submission_boundary");
 
     resourceTimer = setInterval(async () => {
       if (!resourceSlot || resourceRenewalInFlight) return;
@@ -491,6 +509,15 @@ async function failJob(
     errorClass,
     needsAttention,
   });
+}
+
+function preSubmissionCancelledResult(): JobExecutionResult {
+  return {
+    success: false,
+    finalPhase: "CANCELLED",
+    needsAttention: false,
+    claimDisposition: "release-terminal",
+  };
 }
 
 async function cancelJob(jobId: string, attemptId: string, workerId: string, fencingToken: number): Promise<void> {
