@@ -14,6 +14,68 @@ def require(path: str) -> str:
     return file.read_text(encoding="utf-8")
 
 
+def _require_at(root: Path, path: str) -> str:
+    file = root / path
+    if not file.is_file():
+        raise AssertionError(f"missing migration recovery architecture file: {path}")
+    return file.read_text(encoding="utf-8")
+
+
+def _function_body(source: str, signature: str) -> str:
+    start = source.find(signature)
+    if start < 0:
+        raise AssertionError(f"migration recovery export is missing: {signature}")
+    opening = source.find("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening:index + 1]
+    raise AssertionError(f"migration recovery export is incomplete: {signature}")
+
+
+def check_migration_recovery_invariants(root: Path = ROOT) -> None:
+    """Check durable architecture contracts; behavioral edge cases live in Vitest."""
+    index = _require_at(root, "src/lib/db/index.ts")
+    for signal in [
+        "export type ValidatedMigrationBundle", "validatedMigrationBundles",
+        "export function loadValidatedMigrationBundle", "validateMigrationExecutionStatements",
+        "validatedMigrationBundles.has(bundle)", "applyPendingMigrations(sqlite, bundle)",
+    ]:
+        if signal not in index:
+            raise AssertionError(f"validated/branded migration bundle invariant is missing: {signal}")
+    apply_body = _function_body(index, "export function applyPendingMigrations")
+    for signal in ["sqlite.transaction", "validateRecordedMigrationJournal", "insert.run", ").immediate()"]:
+        if signal not in apply_body:
+            raise AssertionError(f"atomic migration application invariant is missing: {signal}")
+
+    journal = _require_at(root, "src/lib/db/migration-journal.ts")
+    for signal in ["validateMigrationJournal", "contiguous repository prefix", "hash mismatch", "Duplicate recorded migration timestamp"]:
+        if signal not in journal:
+            raise AssertionError(f"exact contiguous migration journal evidence is missing: {signal}")
+
+    evidence = _require_at(root, "src/lib/db/migration-data-evidence.ts")
+    for signal in [
+        "migrationsRequiringDataEvidence", "validateDataPostconditionRegistry",
+        "0051 dropped legacy shot columns", "0058 dropped its copy source",
+        "unregistered data/destructive migration",
+    ]:
+        if signal not in evidence:
+            raise AssertionError(f"destructive migration operator evidence is missing: {signal}")
+
+    approval = _require_at(root, "src/lib/db/migration-baseline-approval.ts")
+    for signal in [
+        "securityPolicy.verifyParent", "inspectArtifact(absoluteBackupPath)",
+        "sameIdentity(publishedIdentity", "finalArtifact.manifest",
+        "Backup evidence does not match the locked live database state",
+    ]:
+        if signal not in approval:
+            raise AssertionError(f"final backup evidence invariant is missing: {signal}")
+
+
 def main() -> int:
     store = require("src/stores/model-store.ts")
     for token in ['"speech"', 'defaultSpeechModel', 'setDefaultSpeechModel', 'version: 4']:
@@ -92,9 +154,10 @@ def main() -> int:
         raise AssertionError("worker must select the business artifact from compiled output order")
 
     db_index = require("src/lib/db/index.ts")
-    for token in ["busy_timeout = 5000", "markers.indexOf(false)", "schema drift", "idempotency_request_digest", "consent_statement_version"]:
+    for token in ["busy_timeout = 5000"]:
         if token not in db_index:
             raise AssertionError(f"database compatibility baseline is missing {token}")
+    check_migration_recovery_invariants()
     if "transaction(async" in "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in (ROOT / "src").rglob("*.ts")):
         raise AssertionError("better-sqlite3 transactions must not use async callbacks")
 

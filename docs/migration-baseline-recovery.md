@@ -34,3 +34,15 @@ Set-Acl -LiteralPath $path -AclObject $acl
 ```
 
 Shared, inherited, group-writable, `Everyone`-writable, or `Authenticated Users`-writable parents are rejected even if an individual child file could be locked down.
+
+## Capacity and maintenance-window planning
+
+Inspection and final approval compute full schema and logical-data evidence for every application table. The locked approval pass runs under `BEGIN IMMEDIATE`, so it can hold the database write lock for the duration of a whole-database scan and deterministic SQLite sorts. Large tables may require substantial SQLite temporary-sort space in addition to normal WAL growth.
+
+Before approving a production database:
+
+1. Measure the database, WAL, and largest tables, and benchmark both inspection and approval against a recent copy on equivalent storage. Do not infer production duration from a small development database.
+2. Schedule a maintenance window long enough for the complete locked scan, final backup verification, and rollback margin. Keep every application writer stopped until post-approval journal verification finishes.
+3. Reserve space for the complete backup plus SQLite temporary sorting and WAL/checkpoint growth. As a conservative starting point, keep several times the database size free on both the database volume and backup destination, then replace that estimate with measurements from the rehearsal.
+4. Verify that the temporary directory used by SQLite has sufficient space and is on trusted local storage. A disk-full or permission error is expected to fail approval without journal writes, but it still consumes maintenance time.
+5. Rehearse restore and startup from the published backup before the live window. For a database too large to scan and sort within the allowed write-lock window, stop and design an operator-specific offline recovery rather than bypassing evidence checks.
