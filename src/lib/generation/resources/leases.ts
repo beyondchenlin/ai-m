@@ -11,14 +11,16 @@ import {
   resourceReconciliationProofs,
   generationJobs,
   generationAttempts,
+  generationEvents,
 } from "@/lib/db/schema";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, isNull, sql } from "drizzle-orm";
 import {
   applyExpiredJobCandidates,
   readExpiredJobCandidates,
   type RecoveryScanOutcome,
 } from "@/lib/generation/jobs/recovery-candidates";
 import { id as genId } from "@/lib/id";
+import { planPreSubmissionRecovery } from "@/lib/generation/jobs/state-transitions";
 
 /** 租约配置 */
 export const LEASE_CONFIG = {
@@ -340,7 +342,9 @@ export interface SlotReconciliationOutcome {
   slotNo: number;
   ownerAttemptId: string;
   disposition: "retained" | "reconciled";
-  reason: "pre-submission-safe" | "pre-submission-placeholder" | "termination-proven" | "termination-proof-missing" | "slot-changed" | "live-job-claim";
+  reason: "pre-submission-safe" | "pre-submission-placeholder" | "invalid-claim-placeholder" | "termination-proven" | "termination-proof-missing" | "slot-changed" | "live-job-claim";
+  jobId?: string;
+  jobDisposition?: "requeued" | "cancelled" | "needs-attention";
 }
 
 class SlotReconciliationRollback extends Error {}
@@ -446,7 +450,7 @@ export async function applyExpiredSlotCandidates(
           claimUntilMs: generationJobs.claimUntilMs,
           claimFencingToken: generationJobs.claimFencingToken,
         }).from(generationJobs).where(eq(generationJobs.id, currentAttempt.jobId)).get() : undefined;
-        if (isUnboundPlaceholder && (!currentJob
+        if (safeBeforeSubmission && (!currentJob
           || currentJob.currentAttemptId !== currentAttempt.id
           || (currentJob.status !== "RUNNING" && currentJob.status !== "CANCEL_REQUESTED")
           || currentJob.claimFencingToken !== currentAttempt.jobClaimFencingToken)) {
@@ -454,8 +458,90 @@ export async function applyExpiredSlotCandidates(
         }
         if (currentJob?.currentAttemptId === currentAttempt.id
           && currentJob.claimOwner !== null
-          && (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= scanNow)) {
+          && currentJob.claimUntilMs !== null
+          && currentJob.claimUntilMs >= scanNow) {
           return { disposition: "retained", reason: "live-job-claim" } as const;
+        }
+
+        if (safeBeforeSubmission && currentJob) {
+          const invalidClaimLease = currentJob.claimOwner !== null && currentJob.claimUntilMs === null;
+          const recoverableJobStatus = currentJob.status === "CANCEL_REQUESTED"
+            ? "CANCEL_REQUESTED" : "RUNNING";
+          const plan = planPreSubmissionRecovery(
+            recoverableJobStatus,
+            invalidClaimLease ? "invalid_claim_lease" : "expired_claim",
+            scanNow,
+          );
+          const jobDisposition = plan.disposition;
+          const attemptChanged = tx.update(generationAttempts).set(plan.attemptPatch).where(and(
+            eq(generationAttempts.id, currentAttempt.id),
+            eq(generationAttempts.jobId, currentAttempt.jobId),
+            eq(generationAttempts.phase, currentAttempt.phase),
+            eq(generationAttempts.jobClaimFencingToken, currentAttempt.jobClaimFencingToken),
+            isNull(generationAttempts.externalJobId),
+            eq(generationAttempts.resourcePoolId, currentAttempt.resourcePoolId!),
+            eq(generationAttempts.resourceSlotNo, currentAttempt.resourceSlotNo!),
+            eq(generationAttempts.resourceLeaseToken, currentAttempt.resourceLeaseToken!),
+            eq(generationAttempts.resourceFencingToken, currentAttempt.resourceFencingToken!),
+          )).run();
+          if (attemptChanged.changes !== 1) throw new SlotReconciliationRollback();
+
+          const claimOwnerPredicate = currentJob.claimOwner === null
+            ? isNull(generationJobs.claimOwner)
+            : eq(generationJobs.claimOwner, currentJob.claimOwner);
+          const claimUntilPredicate = currentJob.claimUntilMs === null
+            ? isNull(generationJobs.claimUntilMs)
+            : eq(generationJobs.claimUntilMs, currentJob.claimUntilMs);
+          const jobChanged = tx.update(generationJobs).set({
+            ...plan.jobPatch,
+            claimOwner: null,
+            claimUntilMs: null,
+            claimFencingToken: currentJob.claimFencingToken + 1,
+          }).where(and(
+            eq(generationJobs.id, currentAttempt.jobId),
+            eq(generationJobs.status, currentJob.status),
+            eq(generationJobs.currentAttemptId, currentAttempt.id),
+            eq(generationJobs.claimFencingToken, currentJob.claimFencingToken),
+            claimOwnerPredicate,
+            claimUntilPredicate,
+          )).run();
+          if (jobChanged.changes !== 1) throw new SlotReconciliationRollback();
+
+          const released = tx.update(resourcePoolSlots).set({
+            ownerAttemptId: null,
+            leaseToken: null,
+            expiresAtMs: null,
+            fencingToken: sql`${resourcePoolSlots.fencingToken} + 1`,
+            updatedAtMs: scanNow,
+          }).where(and(
+            eq(resourcePoolSlots.resourcePoolId, slot.resourcePoolId),
+            eq(resourcePoolSlots.slotNo, slot.slotNo),
+            eq(resourcePoolSlots.ownerAttemptId, slot.ownerAttemptId),
+            eq(resourcePoolSlots.leaseToken, slot.leaseToken),
+            eq(resourcePoolSlots.fencingToken, slot.fencingToken),
+            eq(resourcePoolSlots.expiresAtMs, slot.expiresAtMs),
+            sql`${resourcePoolSlots.expiresAtMs} < ${scanNow}`,
+          )).run();
+          if (released.changes !== 1) throw new SlotReconciliationRollback();
+
+          if (plan.terminalEventType) {
+            tx.insert(generationEvents).values({
+              id: genId(),
+              jobId: currentAttempt.jobId,
+              attemptId: currentAttempt.id,
+              eventType: plan.terminalEventType,
+              severity: "info",
+              safePayloadJson: {},
+              createdAtMs: scanNow,
+            }).run();
+          }
+          return {
+            disposition: "reconciled",
+            reason: invalidClaimLease ? "invalid-claim-placeholder"
+              : isUnboundPlaceholder ? "pre-submission-placeholder" : "pre-submission-safe",
+            jobId: currentAttempt.jobId,
+            jobDisposition,
+          } as const;
         }
         const proof = safeBeforeSubmission ? undefined : tx.select().from(resourceReconciliationProofs)
           .where(and(
@@ -533,7 +619,19 @@ export async function scanExpiredClaims(): Promise<RecoveryScanResult> {
   const expiredSlots = await readExpiredSlotCandidates(now);
   const candidates = await readExpiredJobCandidates(now);
   const slotOutcomes = await applyExpiredSlotCandidates(expiredSlots, db, () => now);
-  const jobRecovery = await applyExpiredJobCandidates(candidates);
+  const atomicSlotRecoveries = slotOutcomes.filter((outcome) => outcome.disposition === "reconciled"
+    && outcome.jobId !== undefined && outcome.jobDisposition !== undefined);
+  const handledJobIds = new Set(atomicSlotRecoveries.map((outcome) => outcome.jobId!));
+  const jobRecovery = await applyExpiredJobCandidates(
+    candidates.filter((candidate) => !handledJobIds.has(candidate.jobId)),
+  );
+  for (const outcome of atomicSlotRecoveries) {
+    const jobId = outcome.jobId!;
+    jobRecovery.outcomes.push({ jobId, status: "applied", disposition: outcome.jobDisposition });
+    if (outcome.jobDisposition === "requeued") jobRecovery.requeuedJobs.push(jobId);
+    else if (outcome.jobDisposition === "cancelled") jobRecovery.cancelledJobs.push(jobId);
+    else jobRecovery.attentionJobs.push(jobId);
+  }
   const releasedSlots = slotOutcomes
     .filter((outcome) => outcome.disposition === "reconciled")
     .map((outcome) => ({ poolId: outcome.resourcePoolId, slotNo: outcome.slotNo }));

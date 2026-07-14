@@ -7,6 +7,7 @@ import { db } from "@/lib/db";
 import {
   executionBackends,
   generationAttempts,
+  generationEvents,
   generationJobs,
   resourcePools,
   resourcePoolSlots,
@@ -187,6 +188,7 @@ describe("resource slot reconciliation concurrency", () => {
   async function seedProductionPlaceholder(input: {
     claimOwner: string | null;
     claimUntilMs: number | null;
+    jobStatus?: typeof generationJobs.$inferInsert.status;
   }) {
     const poolId = crypto.randomUUID();
     const backendId = crypto.randomUUID();
@@ -275,6 +277,7 @@ describe("resource slot reconciliation concurrency", () => {
       eq(resourcePoolSlots.slotNo, 1),
     ));
     await db.update(generationJobs).set({
+      status: input.jobStatus ?? "RUNNING",
       claimOwner: input.claimOwner,
       claimUntilMs: input.claimUntilMs,
       updatedAtMs: NOW,
@@ -497,7 +500,7 @@ describe("resource slot reconciliation concurrency", () => {
     expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
   });
 
-  it("retains an unbound production placeholder when claim expiry is unknown", async () => {
+  it("quarantines an unbound production placeholder when claim expiry is unknown", async () => {
     const seeded = await seedProductionPlaceholder({
       claimOwner: "worker-placeholder",
       claimUntilMs: null,
@@ -506,11 +509,15 @@ describe("resource slot reconciliation concurrency", () => {
     const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
     const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
 
-    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    expect(outcomes).toMatchObject([{
+      disposition: "reconciled",
+      reason: "invalid-claim-placeholder",
+      jobDisposition: "needs-attention",
+    }]);
     const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
       "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
     ).get(seeded.poolId);
-    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+    expect(slot?.ownerAttemptId).toBeNull();
   });
 
   it("releases an unbound production placeholder after its claim owner is cleared", async () => {
@@ -524,6 +531,83 @@ describe("resource slot reconciliation concurrency", () => {
       "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
     ).get(seeded.poolId);
     expect(slot?.ownerAttemptId).toBeNull();
+  });
+
+  it("atomically requeues an ownerless production placeholder through the full scanner", async () => {
+    const seeded = await seedProductionPlaceholder({ claimOwner: null, claimUntilMs: null });
+
+    const result = await scanExpiredClaims();
+
+    expect(result.requeuedJobs).toContain(seeded.jobId);
+    expect(result.releasedSlots).toContainEqual({ poolId: seeded.poolId, slotNo: 1 });
+    const job = await db.query.generationJobs.findFirst({ where: eq(generationJobs.id, seeded.jobId) });
+    const attempt = await db.query.generationAttempts.findFirst({ where: eq(generationAttempts.id, seeded.attemptId) });
+    const slot = await db.query.resourcePoolSlots.findFirst({ where: and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, 1),
+    ) });
+    expect(job).toMatchObject({
+      status: "QUEUED",
+      claimOwner: null,
+      claimUntilMs: null,
+      claimFencingToken: seeded.jobFencingToken + 1,
+    });
+    expect(attempt).toMatchObject({ phase: "ORPHANED", errorCode: "expired_pre_submission_claim" });
+    expect(slot).toMatchObject({ ownerAttemptId: null, fencingToken: seeded.lease.fencingToken + 1 });
+  });
+
+  it("atomically quarantines and releases a placeholder with an invalid null claim expiry", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: "worker-placeholder",
+      claimUntilMs: null,
+    });
+
+    const result = await scanExpiredClaims();
+
+    expect(result.attentionJobs).toContain(seeded.jobId);
+    expect(result.releasedSlots).toContainEqual({ poolId: seeded.poolId, slotNo: 1 });
+    const job = await db.query.generationJobs.findFirst({ where: eq(generationJobs.id, seeded.jobId) });
+    const attempt = await db.query.generationAttempts.findFirst({ where: eq(generationAttempts.id, seeded.attemptId) });
+    const slot = await db.query.resourcePoolSlots.findFirst({ where: and(
+      eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+      eq(resourcePoolSlots.slotNo, 1),
+    ) });
+    expect(job).toMatchObject({
+      status: "NEEDS_ATTENTION",
+      claimOwner: null,
+      claimUntilMs: null,
+      claimFencingToken: seeded.jobFencingToken + 1,
+      needsAttentionReason: "invalid_claim_lease",
+    });
+    expect(attempt).toMatchObject({ phase: "ORPHANED", errorCode: "invalid_claim_lease" });
+    expect(slot).toMatchObject({ ownerAttemptId: null, fencingToken: seeded.lease.fencingToken + 1 });
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_jobs
+      WHERE id = ? AND status IN ('RUNNING', 'CANCEL_REQUESTED')
+        AND (claim_owner IS NULL OR claim_until_ms IS NULL)
+    `).get(seeded.jobId)).toEqual({ count: 0 });
+  });
+
+  it("atomically cancels an ownerless cancellation placeholder and emits one terminal event", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: null,
+      claimUntilMs: null,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+
+    const result = await scanExpiredClaims();
+
+    expect(result.cancelledJobs).toContain(seeded.jobId);
+    expect(result.releasedSlots).toContainEqual({ poolId: seeded.poolId, slotNo: 1 });
+    const job = await db.query.generationJobs.findFirst({ where: eq(generationJobs.id, seeded.jobId) });
+    const attempt = await db.query.generationAttempts.findFirst({ where: eq(generationAttempts.id, seeded.attemptId) });
+    const events = await db.select().from(generationEvents).where(and(
+      eq(generationEvents.jobId, seeded.jobId),
+      eq(generationEvents.eventType, "job_cancelled"),
+    ));
+    expect(job).toMatchObject({ status: "CANCELLED", claimFencingToken: seeded.jobFencingToken + 1 });
+    expect(attempt).toMatchObject({ phase: "CANCELLED" });
+    expect(events).toHaveLength(1);
   });
 
   it("retains malformed placeholder-like identity instead of treating it as unbound", async () => {
@@ -565,9 +649,51 @@ describe("resource slot reconciliation concurrency", () => {
       "SELECT owner_attempt_id AS ownerAttemptId, fencing_token AS fencingToken FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
     ).get(seeded.poolId);
     expect(slot).toEqual({ ownerAttemptId: null, fencingToken: seeded.lease.fencingToken + 1 });
+    expect([...left, ...right].filter((outcome) => outcome.jobDisposition === "requeued")).toHaveLength(1);
+    const state = scannerConnection.prepare<[string], { status: string; claimFencingToken: number; phase: string }>(`
+      SELECT j.status, j.claim_fencing_token AS claimFencingToken, a.phase
+      FROM generation_jobs j JOIN generation_attempts a ON a.id = j.current_attempt_id
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({
+      status: "QUEUED",
+      claimFencingToken: seeded.jobFencingToken + 1,
+      phase: "ORPHANED",
+    });
   });
 
-  it("retains a current pre-submission attempt when a claim owner has no expiry evidence", async () => {
+  it("allows dual scanners to cancel a placeholder and emit its terminal event exactly once", async () => {
+    const seeded = await seedProductionPlaceholder({
+      claimOwner: null,
+      claimUntilMs: null,
+      jobStatus: "CANCEL_REQUESTED",
+    });
+    const [leftCandidates, rightCandidates] = await Promise.all([
+      readExpiredSlotCandidates(NOW, scannerDb),
+      readExpiredSlotCandidates(NOW, workerDb),
+    ]);
+
+    const [left, right] = await Promise.all([
+      applyExpiredSlotCandidates(leftCandidates, scannerDb, () => NOW),
+      applyExpiredSlotCandidates(rightCandidates, workerDb, () => NOW),
+    ]);
+
+    expect([...left, ...right].filter((outcome) => outcome.jobDisposition === "cancelled")).toHaveLength(1);
+    expect(scannerConnection.prepare<[string], { count: number }>(`
+      SELECT COUNT(*) AS count FROM generation_events
+      WHERE job_id = ? AND event_type = 'job_cancelled'
+    `).get(seeded.jobId)).toEqual({ count: 1 });
+    const state = scannerConnection.prepare<[string], { status: string; phase: string; ownerAttemptId: string | null }>(`
+      SELECT j.status, a.phase, s.owner_attempt_id AS ownerAttemptId
+      FROM generation_jobs j
+      JOIN generation_attempts a ON a.id = j.current_attempt_id
+      JOIN resource_pool_slots s ON s.resource_pool_id = a.resource_pool_id AND s.slot_no = 1
+      WHERE j.id = ?
+    `).get(seeded.jobId);
+    expect(state).toEqual({ status: "CANCELLED", phase: "CANCELLED", ownerAttemptId: null });
+  });
+
+  it("quarantines a current pre-submission attempt when a claim owner has no expiry evidence", async () => {
     const seeded = await seedExpiredSlot({
       phase: "PREPARING",
       jobStatus: "RUNNING",
@@ -579,11 +705,15 @@ describe("resource slot reconciliation concurrency", () => {
     const candidates = await readExpiredSlotCandidates(NOW, scannerDb);
     const outcomes = await applyExpiredSlotCandidates(candidates, scannerDb, () => NOW);
 
-    expect(outcomes).toMatchObject([{ disposition: "retained", reason: "live-job-claim" }]);
+    expect(outcomes).toMatchObject([{
+      disposition: "reconciled",
+      reason: "invalid-claim-placeholder",
+      jobDisposition: "needs-attention",
+    }]);
     const slot = scannerConnection.prepare<[string], { ownerAttemptId: string | null }>(
       "SELECT owner_attempt_id AS ownerAttemptId FROM resource_pool_slots WHERE resource_pool_id = ? AND slot_no = 1",
     ).get(seeded.poolId);
-    expect(slot?.ownerAttemptId).toBe(seeded.attemptId);
+    expect(slot?.ownerAttemptId).toBeNull();
   });
 
   it("prevents submission when the scanner releases the expired lease first", async () => {
@@ -615,7 +745,11 @@ describe("resource slot reconciliation concurrency", () => {
     const attempt = workerConnection.prepare<[string], { phase: string }>(
       "SELECT phase FROM generation_attempts WHERE id = ?",
     ).get(seeded.attemptId);
-    expect(attempt?.phase).toBe("PREPARING");
+    expect(attempt?.phase).toBe("ORPHANED");
+    const job = workerConnection.prepare<[string], { status: string; claimOwner: string | null; claimUntilMs: number | null }>(
+      "SELECT status, claim_owner AS claimOwner, claim_until_ms AS claimUntilMs FROM generation_jobs WHERE id = ?",
+    ).get(seeded.jobId);
+    expect(job).toEqual({ status: "QUEUED", claimOwner: null, claimUntilMs: null });
   });
 
   it("prevents the scanner from releasing after the worker renews and crosses submission atomically", async () => {

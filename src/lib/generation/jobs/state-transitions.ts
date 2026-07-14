@@ -53,6 +53,59 @@ export interface SubmissionResourceIdentity {
 
 const PRE_SUBMISSION_PHASES = new Set<AttemptPhase>(["CREATED", "LEASED", "PREPARING"]);
 
+export type PreSubmissionRecoveryDisposition = "requeued" | "cancelled" | "needs-attention";
+
+/** Shared recovery semantics for claims that are known to be pre-submission. */
+export function planPreSubmissionRecovery(
+  jobStatus: "RUNNING" | "CANCEL_REQUESTED",
+  cause: "expired_claim" | "invalid_claim_lease",
+  now: number,
+): {
+  disposition: PreSubmissionRecoveryDisposition;
+  attemptPatch: Partial<typeof generationAttempts.$inferInsert>;
+  jobPatch: Partial<typeof generationJobs.$inferInsert>;
+  terminalEventType?: "job_cancelled";
+} {
+  if (cause === "invalid_claim_lease") {
+    return {
+      disposition: "needs-attention",
+      attemptPatch: {
+        phase: "ORPHANED",
+        errorClass: "invalid_claim_lease",
+        errorCode: "invalid_claim_lease",
+        errorMessageSafe: "The worker claim has an owner but no expiry",
+        finishedAtMs: now,
+        updatedAtMs: now,
+      },
+      jobPatch: {
+        status: "NEEDS_ATTENTION",
+        needsAttentionReason: "invalid_claim_lease",
+        updatedAtMs: now,
+      },
+    };
+  }
+  if (jobStatus === "CANCEL_REQUESTED") {
+    return {
+      disposition: "cancelled",
+      attemptPatch: { phase: "CANCELLED", finishedAtMs: now, updatedAtMs: now },
+      jobPatch: { status: "CANCELLED", completedAtMs: now, updatedAtMs: now },
+      terminalEventType: "job_cancelled",
+    };
+  }
+  return {
+    disposition: "requeued",
+    attemptPatch: {
+      phase: "ORPHANED",
+      errorClass: "expired_pre_submission_claim",
+      errorCode: "expired_pre_submission_claim",
+      errorMessageSafe: "The previous worker lost ownership before external submission",
+      finishedAtMs: now,
+      updatedAtMs: now,
+    },
+    jobPatch: { status: "QUEUED", updatedAtMs: now },
+  };
+}
+
 class TransitionRollback extends Error {
   readonly transitionStatus: "lost-race";
 
@@ -111,13 +164,10 @@ export function recoverExpiredJob(
 
       const safeBeforeSubmission = !currentAttempt
         || (PRE_SUBMISSION_PHASES.has(currentAttempt.phase) && !currentAttempt.externalJobId);
-      if (currentJob.status === "CANCEL_REQUESTED" && safeBeforeSubmission) {
+      if (safeBeforeSubmission) {
+        const plan = planPreSubmissionRecovery(currentJob.status, "expired_claim", now);
         if (currentAttempt) {
-          const attemptChanged = tx.update(generationAttempts).set({
-            phase: "CANCELLED",
-            finishedAtMs: now,
-            updatedAtMs: now,
-          }).where(and(
+          const attemptChanged = tx.update(generationAttempts).set(plan.attemptPatch).where(and(
             eq(generationAttempts.id, currentAttempt.id),
             eq(generationAttempts.phase, currentAttempt.phase),
             eq(generationAttempts.jobClaimFencingToken, snapshot.attempt!.jobClaimFencingToken),
@@ -125,51 +175,24 @@ export function recoverExpiredJob(
           if (attemptChanged.changes !== 1) rollbackLostRace();
         }
         const jobChanged = tx.update(generationJobs).set({
-          status: "CANCELLED",
+          ...plan.jobPatch,
           claimOwner: null,
           claimUntilMs: null,
           claimFencingToken: snapshot.claimFencingToken + 1,
-          completedAtMs: now,
-          updatedAtMs: now,
         }).where(eq(generationJobs.id, snapshot.jobId)).run();
         if (jobChanged.changes !== 1) rollbackLostRace();
-        tx.insert(generationEvents).values({
-          id: genId(),
-          jobId: snapshot.jobId,
-          attemptId: currentAttempt?.id ?? null,
-          eventType: "job_cancelled",
-          severity: "info",
-          safePayloadJson: {},
-          createdAtMs: now,
-        }).run();
-        return { status: "applied", disposition: "cancelled" } as const;
-      }
-
-      if (currentJob.status === "RUNNING" && safeBeforeSubmission) {
-        if (currentAttempt) {
-          const attemptChanged = tx.update(generationAttempts).set({
-            phase: "ORPHANED",
-            errorClass: "expired_pre_submission_claim",
-            errorCode: "expired_pre_submission_claim",
-            errorMessageSafe: "The previous worker lost ownership before external submission",
-            finishedAtMs: now,
-            updatedAtMs: now,
-          }).where(and(
-            eq(generationAttempts.id, currentAttempt.id),
-            eq(generationAttempts.phase, currentAttempt.phase),
-            eq(generationAttempts.jobClaimFencingToken, snapshot.attempt!.jobClaimFencingToken),
-          )).run();
-          if (attemptChanged.changes !== 1) rollbackLostRace();
+        if (plan.terminalEventType) {
+          tx.insert(generationEvents).values({
+            id: genId(),
+            jobId: snapshot.jobId,
+            attemptId: currentAttempt?.id ?? null,
+            eventType: plan.terminalEventType,
+            severity: "info",
+            safePayloadJson: {},
+            createdAtMs: now,
+          }).run();
         }
-        const jobChanged = tx.update(generationJobs).set({
-          status: "QUEUED",
-          claimOwner: null,
-          claimUntilMs: null,
-          claimFencingToken: snapshot.claimFencingToken + 1,
-          updatedAtMs: now,
-        }).where(eq(generationJobs.id, snapshot.jobId)).run();
-        if (jobChanged.changes !== 1) rollbackLostRace();
-        return { status: "applied", disposition: "requeued" } as const;
+        return { status: "applied", disposition: plan.disposition } as const;
       }
 
       if (!currentAttempt) return { status: "invalid-transition" } as const;
