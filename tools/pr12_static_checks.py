@@ -29,10 +29,31 @@ def require(condition: bool, message: str) -> None:
         ERRORS.append(message)
 
 
+def expected_node_engine() -> str | None:
+    pinned_version = read(".node-version").strip()
+    match = re.fullmatch(
+        r"(?P<major>0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)",
+        pinned_version,
+    )
+    if not match:
+        ERRORS.append(
+            ".node-version must contain an exact semantic version with numeric major, minor, and patch components"
+        )
+        return None
+
+    next_major = int(match.group("major")) + 1
+    return f">={pinned_version} <{next_major}"
+
+
 package = json.loads(read("package.json") or "{}")
 scripts = package.get("scripts", {})
 require(package.get("packageManager") == "pnpm@10.12.1", "packageManager must be pinned to pnpm 10.12.1")
-require(package.get("engines", {}).get("node") == ">=22.12.0 <25", "Node engine range must stay pinned")
+node_engine = expected_node_engine()
+if node_engine is not None:
+    require(
+        package.get("engines", {}).get("node") == node_engine,
+        f"Node engine range must match .node-version: {node_engine}",
+    )
 for script in ["typecheck", "test", "test:migrations", "test:pr12-static", "worker:build", "quality", "workflow:import", "workflow:promote"]:
     require(script in scripts, f"missing package script: {script}")
 
