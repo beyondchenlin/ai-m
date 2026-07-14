@@ -156,12 +156,12 @@ For every task, follow the same review loop after its task-specific checks:
 - Create: `src/lib/generation/transports/__tests__/comfyui-websocket-policy.test.ts`
 - Create: `src/lib/generation/transports/__tests__/comfyui-connection-manager.test.ts`
 
-- [ ] Start a real local HTTP upgrade server behind a fake hostname and custom lookup. Assert the actual socket is the approved address and auth/origin headers arrive.
-- [ ] Test a disallowed address, redirect/alternate authority, credential rotation, policy revision, and reconnect exhaustion. Assert no fallback naked dial and no registry reuse across identities.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/transports/__tests__/comfyui-websocket-policy.test.ts src/lib/generation/transports/__tests__/comfyui-connection-manager.test.ts`.
-- [ ] Introduce one immutable endpoint-policy object and transport-owned WebSocket factory; inject that factory into the connection manager.
-- [ ] Expand the registry key with endpoint, credential identity, and policy digest/revision; never log or store the credential itself in the key.
-- [ ] Run focused gates: `corepack pnpm vitest run src/lib/generation/transports/__tests__/comfyui-websocket-policy.test.ts src/lib/generation/transports/__tests__/comfyui-connection-manager.test.ts src/lib/security/__tests__/network-policy.test.ts` and `corepack pnpm worker:build`.
+- [x] Start a real local HTTP upgrade server behind a fake hostname and custom lookup. Assert the actual socket is the approved address and auth/origin headers arrive.
+- [x] Test a disallowed address, redirect/alternate authority, credential rotation, policy revision, and reconnect exhaustion. Assert no fallback naked dial and no registry reuse across identities.
+- [x] Run RED: `corepack pnpm vitest run src/lib/generation/transports/__tests__/comfyui-websocket-policy.test.ts src/lib/generation/transports/__tests__/comfyui-connection-manager.test.ts`.
+- [x] Introduce one immutable endpoint-policy object and transport-owned WebSocket factory; inject that factory into the connection manager.
+- [x] Expand the registry key with endpoint, credential identity, and policy digest/revision; never log or store the credential itself in the key.
+- [x] Run focused gates: `corepack pnpm vitest run src/lib/generation/transports/__tests__/comfyui-websocket-policy.test.ts src/lib/generation/transports/__tests__/comfyui-connection-manager.test.ts src/lib/security/__tests__/network-policy.test.ts` and `corepack pnpm worker:build`.
 
 **Compatibility/rollback:** Preserve URL construction and supported auth headers. Existing managers drain naturally on policy revision; rollback restores the old factory but must not silently enable insecure fallback. No migration.
 
