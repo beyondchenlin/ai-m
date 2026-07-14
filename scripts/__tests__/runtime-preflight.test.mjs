@@ -126,6 +126,34 @@ test('rejects a relative launcher path without executing it', () => {
   assert.match(result.diagnostics.join('\n'), /invalid \(expected an absolute executable path\)/);
 });
 
+test('rejects an absolute launcher whose basename is not node or node.exe', () => {
+  let called = false;
+  const launcherExecutable = path.join(path.parse(process.execPath).root, 'runtime', 'deno');
+  const result = check({
+    launcherExecutable,
+    runLauncher: () => {
+      called = true;
+      return `v${expectedNodeVersion}`;
+    },
+  });
+
+  assert.equal(called, false);
+  assert.equal(result.ok, false);
+  assert.match(
+    result.diagnostics.join('\n'),
+    /invalid \(expected executable basename node or node\.exe\)/,
+  );
+});
+
+test('accepts an uppercase node.exe launcher basename', () => {
+  const launcherExecutable = path.join(path.parse(process.execPath).root, 'runtime', 'NODE.EXE');
+
+  assert.deepEqual(
+    check({ launcherExecutable }),
+    { ok: true, diagnostics: [] },
+  );
+});
+
 test('classifies a launcher timeout without exposing the raw error', () => {
   const timeoutError = new Error('secret\u001b[31m timeout detail');
   timeoutError.code = 'ETIMEDOUT';
@@ -151,6 +179,24 @@ test('classifies launcher output overflow', () => {
 
   assert.equal(result.ok, false);
   assert.match(result.diagnostics.join('\n'), /output exceeded 65536 bytes/);
+});
+
+test('classifies empty launcher output as malformed without printing a bare v', () => {
+  const result = check({ runLauncher: () => '' });
+  const output = result.diagnostics.join('\n');
+
+  assert.equal(result.ok, false);
+  assert.match(output, /malformed \(expected a Node semantic version\)/);
+  assert.doesNotMatch(output, /pnpm launcher Node version: v(?:\r?$)/m);
+});
+
+test('classifies malformed launcher output without echoing it', () => {
+  const result = check({ runLauncher: () => 'not-node\n' });
+  const output = result.diagnostics.join('\n');
+
+  assert.equal(result.ok, false);
+  assert.match(output, /malformed \(expected a Node semantic version\)/);
+  assert.doesNotMatch(output, /not-node|vnot-node/);
 });
 
 test('classifies an unreadable launcher without exposing the raw error', () => {

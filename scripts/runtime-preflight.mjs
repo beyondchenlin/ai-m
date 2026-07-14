@@ -11,6 +11,7 @@ const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PROJECT_ROOT = path.resolve(SCRIPT_DIRECTORY, '..');
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/g;
 const HAS_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
+const NODE_VERSION_OUTPUT = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 function sanitize(value, fallback = 'unknown') {
   const sanitized = String(value ?? '').replace(CONTROL_CHARACTERS, '?');
@@ -43,8 +44,12 @@ function formatProbeResult(probe) {
       return `v${probe.version}`;
     case 'missing':
       return 'not provided';
-    case 'invalid':
+    case 'invalid-path':
       return 'invalid (expected an absolute executable path)';
+    case 'invalid-basename':
+      return 'invalid (expected executable basename node or node.exe)';
+    case 'malformed':
+      return 'malformed (expected a Node semantic version)';
     case 'timeout':
       return `timed out after ${PROBE_TIMEOUT_MS}ms`;
     case 'overflow':
@@ -85,24 +90,26 @@ export function checkRuntime({
     || !path.isAbsolute(launcherExecutable)
     || HAS_CONTROL_CHARACTERS.test(launcherExecutable)
   ) {
-    launcherProbe = { kind: 'invalid' };
+    launcherProbe = { kind: 'invalid-path' };
+  } else if (!['node', 'node.exe'].includes(path.basename(launcherExecutable).toLowerCase())) {
+    launcherProbe = { kind: 'invalid-basename' };
   } else {
     try {
-      launcherProbe = {
-        kind: 'version',
-        version: cleanVersion(
-          runLauncher(
-            launcherExecutable,
-            ['-p', 'process.version'],
-            {
-              encoding: 'utf8',
-              maxBuffer: PROBE_MAX_BUFFER,
-              timeout: PROBE_TIMEOUT_MS,
-              windowsHide: true,
-            },
-          ),
+      const output = String(
+        runLauncher(
+          launcherExecutable,
+          ['-p', 'process.version'],
+          {
+            encoding: 'utf8',
+            maxBuffer: PROBE_MAX_BUFFER,
+            timeout: PROBE_TIMEOUT_MS,
+            windowsHide: true,
+          },
         ),
-      };
+      ).trim();
+      launcherProbe = NODE_VERSION_OUTPUT.test(output)
+        ? { kind: 'version', version: output.slice(1) }
+        : { kind: 'malformed' };
     } catch (error) {
       launcherProbe = classifyProbeError(error);
     }
@@ -129,7 +136,10 @@ export function checkRuntime({
 
   if (launcherProbe.kind === 'missing') {
     failures.push('The pnpm launcher executable was not provided.');
-  } else if (launcherProbe.kind === 'invalid') {
+  } else if (
+    launcherProbe.kind === 'invalid-path'
+    || launcherProbe.kind === 'invalid-basename'
+  ) {
     failures.push('The pnpm launcher executable path is invalid.');
   } else if (launcherProbe.kind !== 'version') {
     failures.push('The pnpm launcher Node executable could not be inspected.');
