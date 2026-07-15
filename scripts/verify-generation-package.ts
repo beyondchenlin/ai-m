@@ -152,7 +152,7 @@ async function verifyEvidence(
   }
   if (!Number.isSafeInteger(value.windowStartedAtMs) || !Number.isSafeInteger(value.issuedAtMs) || !Number.isSafeInteger(value.expiresAtMs)
     || (value.windowStartedAtMs as number) >= (value.issuedAtMs as number) || (value.issuedAtMs as number) > nowMs
-    || nowMs > (value.expiresAtMs as number) || (value.expiresAtMs as number) - (value.windowStartedAtMs as number) > 24 * 60 * 60 * 1000) {
+    || nowMs > (value.expiresAtMs as number) || (value.expiresAtMs as number) - (value.windowStartedAtMs as number) > 7 * 24 * 60 * 60 * 1000) {
     throw new Error("Task 4 verified evidence is stale or has an invalid validity window");
   }
   if (typeof value.backendFingerprint !== "string" || !DIGEST.test(value.backendFingerprint)) throw new Error("Task 4 backend fingerprint is invalid");

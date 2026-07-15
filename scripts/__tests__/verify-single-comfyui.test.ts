@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from "node:crypto";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,14 +9,14 @@ import { compileWorkflowBindings } from "../../src/lib/generation/workflows/comp
 import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
 import type { ComfyWorkflow, WorkflowManifest } from "../../src/lib/generation/workflows/types";
 import { verifyGenerationPackageForImport } from "../verify-generation-package";
-import { parseTask4Mode, verifySingleComfyUI, type Task4Session } from "../verify-single-comfyui";
+import { parseTask4Mode, verifySingleComfyUI, writeAllBytes, type Task4Session } from "../verify-single-comfyui";
 import { createHash } from "node:crypto";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))));
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-async function fixture(kind: "image" | "speech" = "image", requestedPackageNames?: string[]) {
+async function fixture(kind: "image" | "speech" | "video" = "image", requestedPackageNames?: string[], modelFilename = "model.safetensors") {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "task4-single-")); roots.push(root);
   const pixelleRoot = path.join(root, "Pixelle");
   await fs.mkdir(path.join(pixelleRoot, "scripts", "comfyui"), { recursive: true });
@@ -24,19 +25,22 @@ async function fixture(kind: "image" | "speech" = "image", requestedPackageNames
   const workflow: ComfyWorkflow = kind === "image" ? {
     "1": { class_type: "PrimitiveStringMultiline", _meta: { title: "$prompt.value!" }, inputs: { value: "sample" } },
     "2": { class_type: "SaveImage", _meta: { title: "Save Image" }, inputs: { images: ["1", 0], filename_prefix: "x" } },
-  } : {
+  } : kind === "speech" ? {
     "1": { class_type: "PrimitiveStringMultiline", _meta: { title: "$text.value!" }, inputs: { value: "sample" } },
     "2": { class_type: "VHS_LoadAudioUpload", _meta: { title: "$reference_audio.value!" }, inputs: { audio: "old.wav" } },
     "3": { class_type: "SaveAudio", _meta: { title: "Save Audio (FLAC)" }, inputs: { audio: ["2", 0], filename_prefix: "x" } },
+  } : {
+    "1": { class_type: "PrimitiveStringMultiline", _meta: { title: "$prompt.value!" }, inputs: { value: "sample" } },
+    "2": { class_type: "VHS_VideoCombine", _meta: { title: "Video Combine" }, inputs: { images: ["1", 0], filename_prefix: "x" } },
   };
   const manifest: WorkflowManifest = kind === "image" ? {
     schemaVersion: 1, workflowId: "pixelle.image.test", version: "1.0.0", displayName: "Task4 test", capability: "image",
     workflowFile: "workflow.api.json",
     bindings: [{ key: "prompt", inputName: "value", valueType: "string", source: "request", required: true, userOverride: true, selector: { classType: "PrimitiveStringMultiline", metaTitle: "$prompt.value!" } }],
     outputs: [{ key: "image", selector: { classType: "SaveImage", metaTitle: "Save Image" }, field: "images", mediaKind: "image", maxItems: 1 }],
-    requirements: { nodeClasses: ["PrimitiveStringMultiline", "SaveImage"], models: [{ folder: "checkpoints", filename: "model.safetensors" }], referenceModes: ["off"] },
+    requirements: { nodeClasses: ["PrimitiveStringMultiline", "SaveImage"], models: [{ folder: "checkpoints", filename: modelFilename }], referenceModes: ["off"] },
     limits: { maxPromptChars: 10_000, maxPixels: 4_000_000, maxBatch: 1, maxOutputs: 1, maxJobMs: 5_000, maxOutputBytes: 1024 },
-  } : {
+  } : kind === "speech" ? {
     schemaVersion: 1, workflowId: "pixelle.speech.test", version: "1.0.0", displayName: "Task4 speech test", capability: "speech",
     workflowFile: "workflow.api.json",
     bindings: [
@@ -46,6 +50,13 @@ async function fixture(kind: "image" | "speech" = "image", requestedPackageNames
     outputs: [{ key: "audio", selector: { classType: "SaveAudio", metaTitle: "Save Audio (FLAC)" }, field: "audio", mediaKind: "audio", maxItems: 1 }],
     requirements: { nodeClasses: ["PrimitiveStringMultiline", "VHS_LoadAudioUpload", "SaveAudio"], models: [], referenceModes: ["required"] },
     limits: { maxPromptChars: 10_000, maxPixels: 1, maxBatch: 1, maxOutputs: 1, maxJobMs: 5_000, maxOutputBytes: 1024 },
+  } : {
+    schemaVersion: 1, workflowId: "pixelle.video.test", version: "1.0.0", displayName: "Task4 video test", capability: "video",
+    workflowFile: "workflow.api.json",
+    bindings: [{ key: "prompt", inputName: "value", valueType: "string", source: "request", required: true, userOverride: true, selector: { classType: "PrimitiveStringMultiline", metaTitle: "$prompt.value!" } }],
+    outputs: [{ key: "video", selector: { classType: "VHS_VideoCombine", metaTitle: "Video Combine" }, field: "gifs", mediaKind: "video", maxItems: 1 }],
+    requirements: { nodeClasses: ["PrimitiveStringMultiline", "VHS_VideoCombine"], models: [], referenceModes: ["off"] },
+    limits: { maxPromptChars: 10_000, maxPixels: 4_000_000, maxBatch: 1, maxOutputs: 1, maxJobMs: 5_000, maxOutputBytes: 1024 },
   };
   const compiled = compileWorkflowBindings(workflow, manifest);
   const files = {
@@ -56,7 +67,7 @@ async function fixture(kind: "image" | "speech" = "image", requestedPackageNames
   };
   const fileDigests = Object.fromEntries(Object.entries(files).map(([name, bytes]) => [name, sha(bytes)]));
   const packageDigest = sha(Buffer.from(canonicalize(fileDigests)));
-  const packageName = kind === "image" ? "image-test" : "speech-test";
+  const packageName = kind === "image" ? "image-test" : kind === "speech" ? "speech-test" : "video-test";
   const packageNames = requestedPackageNames ?? [packageName];
   const packageDigests = Object.fromEntries(packageNames.map((name) => [name, packageDigest]));
   const generationDigest = sha(Buffer.from(canonicalize({ schemaVersion: 1, packageDigests })));
@@ -80,7 +91,7 @@ function fakeSession(events: string[], overrides: Partial<Task4Session> = {}): T
   return {
     connectionId: "connection-before",
     async systemStats() { events.push("/system_stats"); return { system: { comfyui_version: "1" }, devices: [{ name: "GPU", type: "cuda", index: 0, vram_total: 1 }] }; },
-    async objectInfo() { events.push("/object_info"); return { PrimitiveStringMultiline: { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], name: "PrimitiveStringMultiline", display_name: "Text", description: "" }, SaveImage: { input: { required: {} }, output: ["IMAGE"], output_is_list: [true], output_name: ["images"], name: "SaveImage", display_name: "Save", description: "" } }; },
+    async objectInfo() { events.push("/object_info"); return { PrimitiveStringMultiline: { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" }, SaveImage: { input: { required: { images: ["IMAGE", {}] } }, output: [], output_is_list: [], output_name: [], output_node: true, name: "SaveImage", display_name: "Save", description: "" } }; },
     async models() { return ["model.safetensors"]; },
     async uploadReferenceAudio() { events.push("upload"); return "ref.wav"; },
     async submit() { events.push("submit"); return "prompt-1"; },
@@ -136,12 +147,13 @@ describe("single-endpoint Task 4 verifier", () => {
 
   it("uploads a controlled speech reference and binds the returned ComfyUI name", async () => {
     const f = await fixture("speech"); const events: string[] = []; let connections = 0; let now = 2_000_000_100_000; let submitted: Record<string, unknown> | undefined;
+    const captured = JSON.parse(await fs.readFile(path.join(__dirname, "fixtures", "comfyui-object-info-captured.json"), "utf8"));
     const referenceAudioFile = path.join(f.root, "controlled.wav");
     await fs.writeFile(referenceAudioFile, "RIFF0000WAVE-controlled-audio");
     const speechObjects = {
-      PrimitiveStringMultiline: { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], name: "PrimitiveStringMultiline", display_name: "Text", description: "" },
-      VHS_LoadAudioUpload: { input: { required: { audio: ["STRING", {}] } }, output: ["AUDIO"], output_is_list: [false], output_name: ["audio"], name: "VHS_LoadAudioUpload", display_name: "Audio", description: "" },
-      SaveAudio: { input: { required: {} }, output: ["AUDIO"], output_is_list: [false], output_name: ["audio"], name: "SaveAudio", display_name: "Save", description: "" },
+      PrimitiveStringMultiline: { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" },
+      VHS_LoadAudioUpload: { input: { required: { audio: ["STRING", {}] } }, output: ["AUDIO"], output_is_list: [false], output_name: ["audio"], output_node: false, name: "VHS_LoadAudioUpload", display_name: "Audio", description: "" },
+      SaveAudio: captured.SaveAudio,
     };
     const result = await verifySingleComfyUI({
       baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot,
@@ -209,7 +221,7 @@ describe("single-endpoint Task 4 verifier", () => {
 
   it.each([
     ["missing node", { objectInfo: async () => ({ SaveImage: {} }) }, /node/i],
-    ["missing actual binding", { objectInfo: async () => ({ PrimitiveStringMultiline: { input: { required: {} }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], name: "PrimitiveStringMultiline", display_name: "Text", description: "" }, SaveImage: { input: { required: {} }, output: ["IMAGE"], output_is_list: [true], output_name: ["images"], name: "SaveImage", display_name: "Save", description: "" } }) }, /binding/i],
+    ["missing actual binding", { objectInfo: async () => ({ PrimitiveStringMultiline: { input: { required: {} }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" }, SaveImage: { input: { required: { images: ["IMAGE", {}] } }, output: [], output_is_list: [], output_name: [], output_node: true, name: "SaveImage", display_name: "Save", description: "" } }) }, /binding/i],
     ["missing model", { models: async () => [] }, /model/i],
     ["cancelled", { history: async () => ({ status: { status_str: "error", completed: false, messages: [["execution_interrupted", {}]] }, outputs: {} }) }, /cancel/i],
     ["malformed unknown", { history: async () => ({ status: { status_str: "mystery", completed: false }, outputs: {} }) }, /unknown|timeout/i],
@@ -340,5 +352,108 @@ describe("single-endpoint Task 4 verifier", () => {
     const f = await fixture(); const committedDir = path.join(f.root, "committed"); await fs.mkdir(committedDir); await fs.writeFile(path.join(committedDir, "owner.txt"), "existing");
     await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "unused"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey }, { expectedPackageNames: [f.packageName], connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }) })).rejects.toThrow(/committed set already exists/i);
     expect(await fs.readFile(path.join(committedDir, "owner.txt"), "utf8")).toBe("existing");
+  });
+
+  it("accepts locally captured SaveImage object_info with empty RETURN_TYPES", async () => {
+    const f = await fixture(); const captured = JSON.parse(await fs.readFile(path.join(__dirname, "fixtures", "comfyui-object-info-captured.json"), "utf8"));
+    const primitive = { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" };
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity",
+      connect: async () => fakeSession([], { objectInfo: async () => ({ PrimitiveStringMultiline: primitive, SaveImage: captured.SaveImage }) }), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).resolves.toMatchObject({ mode: "inventory-only" });
+  });
+
+  it("accepts locally captured VHS output_node with VHS_FILENAMES while keeping gifs history-only", async () => {
+    const f = await fixture("video"); const captured = JSON.parse(await fs.readFile(path.join(__dirname, "fixtures", "comfyui-object-info-captured.json"), "utf8"));
+    const primitive = { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" };
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => fakeSession([], { objectInfo: async () => ({ PrimitiveStringMultiline: primitive, VHS_VideoCombine: captured.VHS_VideoCombine }) }), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).resolves.toMatchObject({ mode: "inventory-only" });
+  });
+
+  it("normalizes both model inventory and manifest path separators", async () => {
+    const f = await fixture("image", undefined, "nested/model.safetensors");
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => fakeSession([], { models: async () => ["nested\\model.safetensors"] }), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).resolves.toMatchObject({ mode: "inventory-only" });
+  });
+
+  it("writes a durable restart-required marker before submit and refuses submit when marker publication fails", async () => {
+    const f = await fixture(); let submits = 0; let restarts = 0;
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "committed"), archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", writeRestartMarker: async () => { throw new Error("marker fsync failed"); },
+      connect: async () => fakeSession([], { submit: async () => { submits += 1; return "prompt"; } }), observeListener: async () => identityBefore, restart: async () => { restarts += 1; return { stoppedAtMs: 1, restartedAtMs: 2 }; },
+    })).rejects.toThrow(/marker fsync failed/i);
+    expect(submits).toBe(0); expect(restarts).toBe(0);
+  });
+
+  it("leaves the pre-submit marker behind when the process crashes after marker durability", async () => {
+    const f = await fixture(); const marker = path.join(f.root, "restart-required.json"); let submits = 0;
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "committed"), archiveDir: path.join(f.root, "a"), blockedMarkerFile: marker, parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", afterRestartMarker: async () => { throw new Error("simulated process crash"); },
+      connect: async () => fakeSession([], { submit: async () => { submits += 1; return "prompt"; } }), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).rejects.toThrow(/simulated process crash/i);
+    expect(submits).toBe(0); expect(JSON.parse(await fs.readFile(marker, "utf8"))).toMatchObject({ schemaVersion: 2, state: "restart-required", packageName: "image-test", connectionId: "connection-before" });
+  });
+
+  it("retries short file writes until every byte is written", async () => {
+    const written: number[] = [];
+    const handle = { async write(bytes: Uint8Array, offset: number, length: number) { const count = Math.min(2, length); written.push(...bytes.subarray(offset, offset + count)); return { bytesWritten: count, buffer: bytes }; } };
+    await writeAllBytes(handle as never, Uint8Array.from([1, 2, 3, 4, 5]));
+    expect(written).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("rejects a fresh task4.lock owned by another OS process", async () => {
+    const f = await fixture(); const lockFile = path.join(f.root, "task4.lock");
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { windowsHide: true, stdio: "ignore" });
+    try {
+      await fs.writeFile(lockFile, `${canonicalize({ schemaVersion: 2, pid: child.pid!, processIdentity: "external-process-identity", token: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", startedAtMs: Date.now() })}\n`);
+      await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
+        expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+      })).rejects.toThrow(/locked by an active task4.lock/i);
+    } finally { child.kill(); }
+  });
+
+  it("recovers a stale reused-PID lock only when the old identity is conclusively different", async () => {
+    const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_900_000;
+    const old = { schemaVersion: 2, pid: 424242, processIdentity: "old-boot:424242:1000", token: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", startedAtMs: now - 10_000 };
+    await fs.writeFile(lockFile, `${canonicalize(old)}\n`);
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
+      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "new-boot:424242:9000",
+      connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).resolves.toMatchObject({ mode: "inventory-only" });
+    await expect(fs.lstat(`${lockFile}.stale.${old.token}`)).resolves.toBeDefined();
+  });
+
+  it("keeps a stale lock blocked when the old process identity is uncertain", async () => {
+    const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_950_000;
+    await fs.writeFile(lockFile, `${canonicalize({ schemaVersion: 2, pid: 424242, processIdentity: "old-boot:424242:1000", token: "cccccccc-cccc-cccc-cccc-cccccccccccc", startedAtMs: now - 10_000 })}\n`);
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
+      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "unknown",
+      connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).rejects.toThrow(/identity is uncertain/i);
+  });
+
+  it("chains all six package restarts and publishes the last package after as final endpoint", async () => {
+    const names = ["tts-index2", "tts-index2-8g", "tts-omnivoice-longform-bf16", "tts-omnivoice-clone-duration-bf16", "image-z-image-turbo", "video-wan2.1-fusionx"];
+    const f = await fixture("image", names); let connections = 0; let now = 2_000_001_000_000; let restarts = 0;
+    const parameters = Object.fromEntries(names.map((name) => [name, { prompt: name }])); const committedDir = path.join(f.root, "committed");
+    const result = await verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters, privateKey: f.privateKey, publicKey: f.publicKey }, {
+      now: () => ++now, processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); },
+      observeListener: async () => ({ pid: 100 + connections, processCreatedAtMs: 1_000 + connections, bootId: "boot-1", processIdentity: `boot-1:${connections}` }), restart: async () => { restarts += 1; return { stoppedAtMs: ++now, restartedAtMs: ++now }; },
+    });
+    expect(restarts).toBe(6); expect(result.evidenceFiles).toHaveLength(6);
+    const evidence = await Promise.all(result.evidenceFiles.map(async (file) => JSON.parse(await fs.readFile(file, "utf8"))));
+    for (let index = 0; index < evidence.length - 1; index += 1) expect(evidence[index].restart.after).toEqual(evidence[index + 1].restart.before);
+    const commit = JSON.parse(await fs.readFile(path.join(committedDir, "commit.json"), "utf8"));
+    expect(commit.finalEndpoint).toEqual(evidence.at(-1).restart.after);
+  });
+
+  it("revalidates every evidence TTL at final commit time", async () => {
+    const f = await fixture(); let connections = 0; let now = 2_000_002_000_000; const committedDir = path.join(f.root, "committed");
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey, evidenceTtlMs: 1 }, {
+      now: () => (now += 2), expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); }, observeListener: async () => connections === 1 ? identityBefore : identityAfter, restart: async () => ({ stoppedAtMs: (now += 2), restartedAtMs: (now += 2) }),
+    })).rejects.toThrow(/stale/i);
+    await expect(fs.lstat(committedDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

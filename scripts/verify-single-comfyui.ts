@@ -63,6 +63,7 @@ export interface VerifySingleOptions {
   committedDir?: string;
   blockedMarkerFile?: string;
   recoveryConfirmation?: string;
+  lockFile?: string;
 }
 
 export interface Task4Dependencies {
@@ -73,6 +74,11 @@ export interface Task4Dependencies {
   sleep?: (milliseconds: number) => Promise<void>;
   /** Test seam only. Production always requires the fixed six-package set. */
   expectedPackageNames?: readonly string[];
+  writeRestartMarker?: (file: string, payload: Record<string, unknown>) => Promise<void>;
+  removeRestartMarker?: (file: string) => Promise<void>;
+  afterRestartMarker?: () => Promise<void>;
+  processIdentityForPid?: (pid: number) => Promise<string | "missing" | "unknown">;
+  lockStaleMs?: number;
 }
 
 const PIXELLE_PACKAGE_NAMES = ["tts-index2", "tts-index2-8g", "tts-omnivoice-longform-bf16", "tts-omnivoice-clone-duration-bf16", "image-z-image-turbo", "video-wan2.1-fusionx"] as const;
@@ -147,7 +153,8 @@ function assertRawNodeDescriptor(value: unknown, classType: string): Record<stri
     || !Array.isArray(descriptor.output_name) || !descriptor.output_name.every((item) => typeof item === "string")
     || !Array.isArray(descriptor.output_is_list) || !descriptor.output_is_list.every((item) => typeof item === "boolean")
     || descriptor.output.length !== descriptor.output_name.length || descriptor.output.length !== descriptor.output_is_list.length
-    || descriptor.name !== classType || typeof descriptor.display_name !== "string" || typeof descriptor.description !== "string") {
+    || descriptor.name !== classType || typeof descriptor.display_name !== "string" || typeof descriptor.description !== "string"
+    || typeof descriptor.output_node !== "boolean") {
     throw new Error(`${classType} raw object_info descriptor is malformed`);
   }
   return descriptor;
@@ -180,17 +187,19 @@ function assertInventory(pkg: PackageInventory, objects: Record<string, unknown>
   }
   for (const output of pkg.compiled.outputs) {
     const descriptor = assertRawNodeDescriptor(objects[output.classType], output.classType);
-    if (!Array.isArray(descriptor.output) || !descriptor.output.every((item) => typeof item === "string")
-      || !Array.isArray(descriptor.output_name) || !descriptor.output_name.every((item) => typeof item === "string")
-      || descriptor.output.length !== descriptor.output_name.length || !descriptor.output_name.includes(output.field)) {
-      throw new Error(`${pkg.packageName} output node schema is malformed`);
+    if (descriptor.output_node !== true) throw new Error(`${pkg.packageName} output node is not declared as output_node`);
+    if ((output.classType === "SaveImage" || output.classType === "SaveAudio") && (descriptor.output as unknown[]).length !== 0) throw new Error(`${pkg.packageName} save output node must have empty RETURN_TYPES`);
+    if (output.classType === "VHS_VideoCombine" && canonicalize(descriptor.output) !== canonicalize(["VHS_FILENAMES"])) throw new Error(`${pkg.packageName} video output node must return VHS_FILENAMES`);
+    const outputInputs = record(descriptor.input, `${output.classType} output input`);
+    const outputRequired = record(outputInputs.required, `${output.classType} required output input`);
+    const inputName = output.classType === "SaveAudio" ? "audio" : "images";
+    const tuple = outputRequired[inputName];
+    if (!Array.isArray(tuple) || tuple.length < 1 || (output.classType === "SaveAudio" ? tuple[0] !== "AUDIO" : typeof tuple[0] !== "string" || !String(tuple[0]).includes("IMAGE"))) {
+      throw new Error(`${pkg.packageName} output node input schema is incompatible`);
     }
-    const index = descriptor.output_name.indexOf(output.field);
-    const expected = output.mediaKind === "audio" ? "AUDIO" : "IMAGE";
-    if (descriptor.output[index] !== expected) throw new Error(`${pkg.packageName} output node type is incompatible`);
   }
   for (const model of pkg.manifest.requirements.models) {
-    if (!(models.get(model.folder) ?? []).includes(model.filename.replace(/\\/g, "/"))) throw new Error(`${pkg.packageName} is missing required model ${model.folder}/${model.filename}`);
+    if (!(models.get(model.folder) ?? []).map((candidate) => candidate.replace(/\\/g, "/")).includes(model.filename.replace(/\\/g, "/"))) throw new Error(`${pkg.packageName} is missing required model ${model.folder}/${model.filename}`);
   }
 }
 
@@ -264,6 +273,51 @@ function combinedError(primary: unknown, cleanup: unknown[], label: string): Err
   return new AggregateError(errors, `${label}: ${errors.map((error) => error.message).join("; ")}`);
 }
 
+interface Task4LockRecord { schemaVersion: 2; pid: number; processIdentity: string; token: string; startedAtMs: number }
+async function defaultProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
+  if (process.platform !== "win32") {
+    try { process.kill(pid, 0); return pid === process.pid ? `process-${pid}-${process.uptime()}` : "unknown"; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown"; }
+  }
+  const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction SilentlyContinue;if(-not $p){'missing';exit};$os=Get-CimInstance Win32_OperatingSystem;('windows-'+([DateTimeOffset]$os.LastBootUpTime).ToUnixTimeMilliseconds()+':'+$p.ProcessId+':'+([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds())`;
+  try { const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 }); return stdout.trim() || "unknown"; }
+  catch { return "unknown"; }
+}
+function parseTask4Lock(value: unknown): Task4LockRecord {
+  const lock = record(value, "task4.lock");
+  if (lock.schemaVersion !== 2 || !Number.isSafeInteger(lock.pid) || (lock.pid as number) <= 0 || typeof lock.processIdentity !== "string"
+    || !/^[A-Za-z0-9._:-]{3,300}$/.test(lock.processIdentity) || typeof lock.token !== "string" || !/^[a-f0-9-]{20,100}$/.test(lock.token)
+    || !Number.isSafeInteger(lock.startedAtMs) || (lock.startedAtMs as number) <= 0) throw new Error("task4.lock is invalid; ownership is uncertain");
+  return lock as unknown as Task4LockRecord;
+}
+async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): Promise<Task4LockRecord> {
+  const target = path.resolve(file); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 6 * 60 * 60_000;
+  if (!Number.isSafeInteger(staleMs) || staleMs < 1_000) throw new Error("Task 4 lock stale threshold is invalid");
+  const identityFor = dependencies.processIdentityForPid ?? defaultProcessIdentityForPid;
+  const processIdentity = await identityFor(process.pid); if (processIdentity === "missing" || processIdentity === "unknown") throw new Error("Current Task 4 process identity is uncertain");
+  const owned = { schemaVersion: 2 as const, pid: process.pid, processIdentity, token: randomUUID(), startedAtMs: now() };
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  for (;;) {
+    try { await archiveBytes(target, Buffer.from(`${canonicalize(owned)}\n`)); await syncDirectory(path.dirname(target)); return owned; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stat = await fs.lstat(target); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_096) throw new Error("task4.lock is unsafe");
+      const raw = await fs.readFile(target); const existing = parseTask4Lock(parseJson(raw, "task4.lock"));
+      if (now() - existing.startedAtMs <= staleMs) throw new Error("Task 4 is locked by an active task4.lock");
+      const observed = await identityFor(existing.pid);
+      if (observed === "unknown") throw new Error("Stale Task 4 lock owner identity is uncertain");
+      if (observed === existing.processIdentity) throw new Error("Task 4 is locked by the original live process");
+      if (!(await fs.readFile(target)).equals(raw)) throw new Error("task4.lock changed during stale recovery");
+      await fs.rename(target, `${target}.stale.${existing.token}`); await syncDirectory(path.dirname(target));
+    }
+  }
+}
+async function releaseTask4Lock(file: string, owned: Task4LockRecord): Promise<void> {
+  const target = path.resolve(file); const current = parseTask4Lock(parseJson(await fs.readFile(target), "task4.lock"));
+  if (canonicalize(current) !== canonicalize(owned)) throw new Error("task4.lock ownership was lost");
+  await fs.rm(target); await syncDirectory(path.dirname(target));
+}
+
 async function responseBytes(response: Response, maximumBytes: number, label: string): Promise<Buffer> {
   if (!response.ok) { await response.body?.cancel(); throw new Error(`${label} failed (${response.status})`); }
   const declared = response.headers.get("content-length");
@@ -289,6 +343,14 @@ async function responseBytes(response: Response, maximumBytes: number, label: st
 async function fetchJson(url: string, init: RequestInit, maximumBytes: number, label: string): Promise<unknown> {
   const signal = AbortSignal.timeout(30_000);
   return parseJson(await responseBytes(await fetch(url, { ...init, signal }), maximumBytes, label), label);
+}
+export async function writeAllBytes(handle: Pick<Awaited<ReturnType<typeof fs.open>>, "write">, bytes: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset);
+    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > bytes.byteLength - offset) throw new Error("Output file write made invalid progress");
+    offset += bytesWritten;
+  }
 }
 
 async function createHttpSession(): Promise<Task4Session> {
@@ -353,13 +415,17 @@ async function createHttpSession(): Promise<Task4Session> {
       const mediaKind = mime.startsWith("audio/") ? "audio" : mime.startsWith("image/") ? "image" : mime.startsWith("video/") ? "video" : undefined;
       if (!mediaKind) { await response.body?.cancel(); throw new Error("Output content type is unsupported"); }
       const reader = response.body?.getReader(); if (!reader) throw new Error("Output response body is missing");
-      const handle = await fs.open(targetFile, "wx"); const digest = createHash("sha256"); let byteLength = 0;
+      let handle: Awaited<ReturnType<typeof fs.open>>;
+      try { handle = await fs.open(targetFile, "wx"); }
+      catch (error) { await reader.cancel().catch(() => undefined); throw error; }
+      const digest = createHash("sha256"); let byteLength = 0;
       try {
         for (;;) {
           const part = await reader.read(); if (part.done) break;
           byteLength += part.value.byteLength;
           if (byteLength > maximumBytes) throw new Error("Output download response is oversized");
-          digest.update(part.value); await handle.write(part.value);
+          digest.update(part.value);
+          await writeAllBytes(handle, part.value);
         }
         if (!byteLength) throw new Error("Output download is empty");
         await handle.sync();
@@ -367,7 +433,16 @@ async function createHttpSession(): Promise<Task4Session> {
         await reader.cancel().catch(() => undefined); await handle.close().catch(() => undefined); await fs.rm(targetFile, { force: true }); throw error;
       }
       await handle.close();
-      return { sha256: digest.digest("hex"), byteLength, mediaKind };
+      const expectedSha256 = digest.digest("hex"); const stat = await fs.lstat(targetFile);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== byteLength) { await fs.rm(targetFile, { force: true }); throw new Error("Output temp file size changed after fsync"); }
+      const verifiedDigest = createHash("sha256"); let verifiedBytes = 0; const verifyHandle = await fs.open(targetFile, "r");
+      try {
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        for (;;) { const { bytesRead } = await verifyHandle.read(buffer, 0, buffer.length); if (!bytesRead) break; verifiedBytes += bytesRead; if (verifiedBytes > maximumBytes) throw new Error("Output temp file grew after fsync"); verifiedDigest.update(buffer.subarray(0, bytesRead)); }
+      } finally { await verifyHandle.close(); }
+      const sha256 = verifiedDigest.digest("hex");
+      if (verifiedBytes !== byteLength || sha256 !== expectedSha256) { await fs.rm(targetFile, { force: true }); throw new Error("Output temp file digest changed after fsync"); }
+      return { sha256, byteLength, mediaKind };
     },
     assertHealthy() {
       ensureOpen();
@@ -385,7 +460,7 @@ async function createHttpSession(): Promise<Task4Session> {
   };
 }
 
-export async function verifySingleComfyUI(options: VerifySingleOptions, dependencies: Task4Dependencies): Promise<{
+async function verifySingleComfyUILocked(options: VerifySingleOptions, dependencies: Task4Dependencies): Promise<{
   mode: VerifySingleOptions["mode"];
   packages: string[];
   archiveFiles: string[];
@@ -395,7 +470,7 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
   await assertFixedScripts(options.pixelleRoot);
   const completionTimeoutMs = safeInteger(options.completionTimeoutMs, 10 * 60_000, 30 * 60_000, "completion timeout");
   const pollIntervalMs = safeInteger(options.pollIntervalMs, 250, 10_000, "poll interval");
-  const evidenceTtlMs = safeInteger(options.evidenceTtlMs, 60 * 60_000, 24 * 60 * 60_000, "evidence TTL");
+  const evidenceTtlMs = safeInteger(options.evidenceTtlMs, 7 * 24 * 60 * 60_000, 7 * 24 * 60 * 60_000, "evidence TTL");
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const packages = await inventoryGeneration(options);
@@ -405,14 +480,21 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
   const packageNames = new Set(packages.map((pkg) => pkg.packageName));
   for (const packageName of Object.keys(options.parameters)) if (!packageNames.has(packageName)) throw new Error(`Parameters name unknown package ${packageName}`);
   const blockedMarkerFile = path.resolve(options.blockedMarkerFile ?? path.join(path.dirname(path.dirname(options.generationRoot)), "task4-restart-blocked.json"));
+  const writeRestartMarker = dependencies.writeRestartMarker ?? writeBlockedMarker;
+  const removeRestartMarker = dependencies.removeRestartMarker ?? removeBlockedMarker;
   try {
     const stat = await fs.lstat(blockedMarkerFile);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Task 4 restart blocked marker is unsafe");
     if (options.recoveryConfirmation !== `RECOVER-${options.expectedGenerationDigest}`) throw new Error("Task 4 restart is blocked pending explicit external recovery verification");
     const recoverySession = await dependencies.connect();
-    try { recoverySession.assertHealthy(); assertIdentity(await dependencies.observeListener(), "recovery"); assertProbeSchemas(await recoverySession.systemStats(), await recoverySession.objectInfo()); }
+    try {
+      recoverySession.assertHealthy(); const recoveryIdentity = await dependencies.observeListener(); assertIdentity(recoveryIdentity, "recovery");
+      assertProbeSchemas(await recoverySession.systemStats(), await recoverySession.objectInfo()); recoverySession.assertHealthy();
+      const recoveryAfterProbe = await dependencies.observeListener(); assertIdentity(recoveryAfterProbe, "recovery post-probe");
+      if (!sameListener(recoveryIdentity, recoveryAfterProbe)) throw new Error("Recovery listener changed during readiness probes");
+    }
     finally { await recoverySession.close(); }
-    await removeBlockedMarker(blockedMarkerFile);
+    await removeRestartMarker(blockedMarkerFile);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -435,15 +517,20 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
   try { await fs.lstat(committedDir); throw new Error("Task 4 committed set already exists"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") { await session.close().catch(() => undefined); throw error; } }
   await fs.mkdir(path.dirname(committedDir), { recursive: true });
-  const runDir = path.join(path.dirname(committedDir), `.${path.basename(committedDir)}.run-${randomUUID()}`);
+  const runToken = randomUUID();
+  const runDir = path.join(path.dirname(committedDir), `.${path.basename(committedDir)}.run-${runToken}`);
   await fs.mkdir(runDir, { recursive: false }); await fs.mkdir(path.join(runDir, "artifacts"), { recursive: false }); await fs.mkdir(path.join(runDir, "evidence"), { recursive: false });
   const windowStartedAtMs = now(); const archiveRelative: string[] = []; const evidenceRelative: string[] = [];
+  const stagedEvidence: Array<{ pkg: PackageInventory; relativePath: string }> = [];
+  let previousAfter: (Task4ListenerIdentity & { connectionId: string }) | undefined;
   let referenceAudioName: string | undefined; const privateKey = options.privateKey ?? await loadProductionTask4PrivateKey();
   try {
     for (const pkg of packages) {
       session.assertHealthy();
       const packageIdentity = await dependencies.observeListener(); assertIdentity(packageIdentity, `${pkg.packageName} pre-run`);
       const beforeConnectionId = session.connectionId;
+      const packageBefore = { ...packageIdentity, connectionId: beforeConnectionId };
+      if (previousAfter && canonicalize(previousAfter) !== canonicalize(packageBefore)) throw new Error(`${pkg.packageName} listener.before does not continue the previous package restart.after chain`);
       if (!sameListener(packageIdentity, currentIdentity)) throw new Error(`${pkg.packageName} listener changed spontaneously before submit`);
       const backendFingerprint = hash(canonicalize({ baseUrl: BASE_URL, system, objects, listener: packageIdentity }));
       const parameters = { ...(options.parameters[pkg.packageName] ?? {}) };
@@ -464,6 +551,9 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
       let artifact: { sha256: string; byteLength: number; mediaKind: "audio" | "image" | "video" } | undefined;
       let artifactRelative = ""; let completedAtMs = 0;
       try {
+        await writeRestartMarker(blockedMarkerFile, { schemaVersion: 2, state: "restart-required", generationDigest: options.expectedGenerationDigest,
+          packageName: pkg.packageName, runToken, listener: packageIdentity, connectionId: beforeConnectionId, token: randomUUID(), createdAtMs: now() });
+        await dependencies.afterRestartMarker?.();
         submitted = true;
         try { promptId = await session.submit(workflow, session.connectionId); }
         catch (error) { throw new Error(`ComfyUI submission outcome is uncertain for ${pkg.packageName}`, { cause: error }); }
@@ -499,7 +589,6 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
         } catch (error) { cleanupErrors.push(error); }
         try { await session.close(); } catch (error) { cleanupErrors.push(error); }
         try {
-          await writeBlockedMarker(blockedMarkerFile, { schemaVersion: 1, generationDigest: options.expectedGenerationDigest, packageName: pkg.packageName, createdAtMs: now() });
           restart = await dependencies.restart();
           session = await dependencies.connect(); session.assertHealthy();
           afterIdentity = await dependencies.observeListener(); assertIdentity(afterIdentity, `${pkg.packageName} post-restart`); reconnectedAtMs = now();
@@ -507,32 +596,61 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
           afterSystem = await session.systemStats(); afterObjects = await session.objectInfo(); assertProbeSchemas(afterSystem, afterObjects); readinessAtMs = now();
           const afterModels = new Map<string, string[]>();
           for (const folder of [...new Set(pkg.manifest.requirements.models.map((model) => model.folder))]) afterModels.set(folder, await session.models(folder));
-          assertInventory(pkg, afterObjects, afterModels);
+          assertInventory(pkg, afterObjects, afterModels); session.assertHealthy();
+          const postProbeIdentity = await dependencies.observeListener(); assertIdentity(postProbeIdentity, `${pkg.packageName} post-probe`);
+          if (!sameListener(afterIdentity, postProbeIdentity)) throw new Error(`${pkg.packageName} listener changed during readiness probes`);
           if (!(completedAtMs < restart.stoppedAtMs && restart.stoppedAtMs < restart.restartedAtMs && restart.restartedAtMs < reconnectedAtMs && reconnectedAtMs <= readinessAtMs)) throw new Error("Fresh restart/reconnection/readiness timeline is invalid");
-          await removeBlockedMarker(blockedMarkerFile); currentIdentity = afterIdentity; system = afterSystem; objects = afterObjects;
+          await removeRestartMarker(blockedMarkerFile); currentIdentity = afterIdentity; system = afterSystem; objects = afterObjects;
         } catch (error) { cleanupErrors.push(error); }
       }
       if (primaryError || cleanupErrors.length) throw combinedError(primaryError, cleanupErrors, `${pkg.packageName} failed and cleanup/restart was not fully verified`);
       if (!artifact || !restart || !afterIdentity || !afterSystem || !afterObjects) throw new Error(`${pkg.packageName} verification state is incomplete`);
       const issuedAtMs = now();
-      const beforeEvidence = { ...packageIdentity, connectionId: beforeConnectionId };
+      const beforeEvidence = packageBefore;
       const afterEvidence = { ...afterIdentity, connectionId: session.connectionId };
       const run = { runId: promptId, startedAtMs, completedAtMs, backendFingerprint, listener: { ...packageIdentity, connectionId: beforeEvidence.connectionId }, artifact };
-      const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs, issuedAtMs, expiresAtMs: issuedAtMs + evidenceTtlMs,
+      const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs, issuedAtMs, expiresAtMs: Math.min(issuedAtMs + evidenceTtlMs, windowStartedAtMs + 7 * 24 * 60 * 60_000),
         generationDigest: options.expectedGenerationDigest, packageName: pkg.packageName, packageDigest: pkg.packageDigest, backendFingerprint,
         listener: { baseUrl: BASE_URL, ...afterEvidence }, liveRuns: [run], restart: { before: beforeEvidence, after: afterEvidence, ...restart, readinessAtMs, reconnectedAtMs },
         readiness: { checkedAtMs: readinessAtMs, systemStats: { path: "/system_stats", statusCode: 200, responseSha256: hash(canonicalize(afterSystem)) }, objectInfo: { path: "/object_info", statusCode: 200, responseSha256: hash(canonicalize(afterObjects)) } } };
       const evidence = signTask4Evidence(payload, privateKey);
       await verifyGenerationPackageForImport({ generationRoot: options.generationRoot, packageName: pkg.packageName, expectedGenerationDigest: options.expectedGenerationDigest, expectedPackageDigest: pkg.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: options.publicKey, nowMs: issuedAtMs });
       const evidenceRelativePath = path.join("evidence", `${pkg.packageName}.json`); await archiveBytes(path.join(runDir, evidenceRelativePath), Buffer.from(`${canonicalize(evidence)}\n`));
-      archiveRelative.push(artifactRelative); evidenceRelative.push(evidenceRelativePath);
+      archiveRelative.push(artifactRelative); evidenceRelative.push(evidenceRelativePath); stagedEvidence.push({ pkg, relativePath: evidenceRelativePath }); previousAfter = afterEvidence;
     }
-    await session.close(); await syncDirectory(path.join(runDir, "artifacts")); await syncDirectory(path.join(runDir, "evidence")); await syncDirectory(runDir);
+    if (!previousAfter) throw new Error("Task 4 package chain is empty");
+    session.assertHealthy(); const finalIdentity = await dependencies.observeListener(); assertIdentity(finalIdentity, "final endpoint");
+    if (canonicalize({ ...finalIdentity, connectionId: session.connectionId }) !== canonicalize(previousAfter)) throw new Error("Final endpoint is not the last package restart.after identity");
+    await session.close();
+    const finalVerificationAtMs = now(); const evidenceDigests: Record<string, string> = {};
+    for (const { pkg, relativePath } of stagedEvidence) {
+      const bytes = await fs.readFile(path.join(runDir, relativePath)); const evidence = parseJson(bytes, `${pkg.packageName} final evidence`);
+      await verifyGenerationPackageForImport({ generationRoot: options.generationRoot, packageName: pkg.packageName, expectedGenerationDigest: options.expectedGenerationDigest, expectedPackageDigest: pkg.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: options.publicKey, nowMs: finalVerificationAtMs });
+      evidenceDigests[pkg.packageName] = hash(bytes);
+    }
+    await archiveBytes(path.join(runDir, "commit.json"), Buffer.from(`${canonicalize({ schemaVersion: 1, generationDigest: options.expectedGenerationDigest, packageOrder: packages.map((pkg) => pkg.packageName), finalEndpoint: previousAfter, finalVerificationAtMs, evidenceDigests })}\n`));
+    await syncDirectory(path.join(runDir, "artifacts")); await syncDirectory(path.join(runDir, "evidence")); await syncDirectory(runDir);
     await fs.rename(runDir, committedDir); await syncDirectory(path.dirname(committedDir));
     return { mode: options.mode, packages: packages.map((pkg) => pkg.packageName), archiveFiles: archiveRelative.map((file) => path.join(committedDir, file)), evidenceFiles: evidenceRelative.map((file) => path.join(committedDir, file)) };
   } catch (error) {
     await session.close().catch(() => undefined); await fs.rm(runDir, { recursive: true, force: true }); throw error;
   }
+}
+
+export async function verifySingleComfyUI(options: VerifySingleOptions, dependencies: Task4Dependencies): Promise<{
+  mode: VerifySingleOptions["mode"];
+  packages: string[];
+  archiveFiles: string[];
+  evidenceFiles: string[];
+}> {
+  const lockFile = path.resolve(options.lockFile ?? path.join(path.dirname(path.dirname(options.generationRoot)), "task4.lock"));
+  const owned = await acquireTask4Lock(lockFile, dependencies);
+  let result: Awaited<ReturnType<typeof verifySingleComfyUILocked>> | undefined; let primary: unknown;
+  try { result = await verifySingleComfyUILocked(options, dependencies); } catch (error) { primary = error; }
+  const cleanup: unknown[] = [];
+  try { await releaseTask4Lock(lockFile, owned); } catch (error) { cleanup.push(error); }
+  if (primary || cleanup.length) throw combinedError(primary, cleanup, "Task 4 failed and lock release was not fully verified");
+  return result!;
 }
 
 async function main(): Promise<void> {

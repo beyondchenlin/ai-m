@@ -1,0 +1,22 @@
+{
+  "_capture": {
+    "capturedFrom": "E:\\comfyui\\resources\\ComfyUI and E:\\ComfyUIData\\custom_nodes",
+    "endpoint": "http://127.0.0.1:8000/object_info",
+    "note": "Reduced to fields used by Task 4 contract tests; no backend was started during the test run."
+  },
+  "SaveImage": {
+    "input": { "required": { "images": ["IMAGE", { "tooltip": "The images to save." }], "filename_prefix": ["STRING", { "default": "ComfyUI" }] } },
+    "output": [], "output_is_list": [], "output_name": [], "output_node": true,
+    "name": "SaveImage", "display_name": "Save Image", "description": "Saves the input images to your ComfyUI output directory."
+  },
+  "SaveAudio": {
+    "input": { "required": { "audio": ["AUDIO", {}], "filename_prefix": ["STRING", { "default": "audio/ComfyUI" }] } },
+    "output": [], "output_is_list": [], "output_name": [], "output_node": true,
+    "name": "SaveAudio", "display_name": "Save Audio (FLAC)", "description": ""
+  },
+  "VHS_VideoCombine": {
+    "input": { "required": { "images": ["IMAGE,LATENT", {}], "frame_rate": ["FLOAT", { "default": 8, "min": 1 }], "filename_prefix": ["STRING", { "default": "AnimateDiff" }] } },
+    "output": ["VHS_FILENAMES"], "output_is_list": [false], "output_name": ["Filenames"], "output_node": true,
+    "name": "VHS_VideoCombine", "display_name": "Video Combine 🎥🅥🅗🅢", "description": ""
+  }
+}
