@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,46 +11,40 @@ import { parseWorkflowPackageLock, verifyLockedFiles } from "../src/lib/generati
 import { applyStaticPolicy, validateWorkflowStructure } from "../src/lib/generation/workflows/validator";
 import type { AuthorBinding, AuthorOutput, ComfyWorkflow, WorkflowManifest } from "../src/lib/generation/workflows/types";
 
-export interface ComfyUIInventory {
-  schemaVersion: 1;
-  source: "ai-m-live-comfyui-probe-v1";
-  baseUrl: "http://127.0.0.1:8000";
-  capturedAtMs: number;
-  maxAgeMs: number;
-  backendFingerprint: string;
-  nodeClasses: string[];
-  models: Record<string, string[]>;
-  objectInfoSha256: string;
-  inventoryDigest: string;
-}
-
 export interface PrepareOptions {
   pixelleRoot: string;
   stagingDir: string;
-  inventory?: unknown;
   nowMs?: number;
+  lockStaleMs?: number;
+  isProcessAlive?: (pid: number) => Promise<boolean | "unknown">;
+  afterLockAcquired?: () => Promise<void>;
+  afterSourceFileRead?: (sourceFile: string, index: number) => Promise<void>;
   writeBytes?: typeof fs.writeFile;
-  removeOwnedBackup?: (backupDir: string) => Promise<void>;
 }
 
 interface PreparedPackage {
   sourceFile: string;
-  packageDir: string;
+  packageName: string;
   workflowId: string;
-  inventoryStatus: "unverified" | "matched" | "blocked";
-  blockedReasons: string[];
+  packageDigest: string;
+  requirements: WorkflowManifest["requirements"];
 }
 
 export interface PrepareResult {
-  stagingDir: string;
   packages: PreparedPackage[];
-  state: "prepared-environment-unverified" | "prepared-inventory-matched" | "prepared-with-inventory-blockers";
-  cleanupWarnings: string[];
+  state: "prepared-environment-unverified";
+  generationDigest: string;
+  orphanTempCount: number;
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
 const STAGING_MARKER_PRODUCER = "ai-m/pixelle-single-backend";
-const STAGING_MARKER_SCHEMA_VERSION = 1;
+const STAGING_MARKER_SCHEMA_VERSION = 2;
+const TEMP_MARKER_FILENAME = ".ai-m-generation-temp.json";
+const MAX_WORKFLOW_BYTES = 5 * 1024 * 1024;
+const MAX_TOTAL_WORKFLOW_BYTES = 30 * 1024 * 1024;
+const MAX_JSON_DEPTH = 64;
+const DEFAULT_LOCK_STALE_MS = 15 * 60 * 1000;
 
 interface CandidateDefinition {
   sourceFile: string;
@@ -308,126 +302,6 @@ async function assertOwnedStaging(directory: string, canonicalStagingPath: strin
   }
 }
 
-export async function cleanupOwnedBackupDirectory(
-  backupDir: string,
-  canonicalStagingPath: string,
-  removeEntry: (target: string) => Promise<void> = async (target) => fs.rm(target, { recursive: true, force: false }),
-): Promise<void> {
-  await assertOwnedStaging(backupDir, canonicalStagingPath);
-  const entries = (await fs.readdir(backupDir)).filter((name) => name !== STAGING_MARKER_FILENAME).sort();
-  for (const name of entries) await removeEntry(path.join(backupDir, name));
-  const markerPath = path.join(backupDir, STAGING_MARKER_FILENAME);
-  await fs.unlink(markerPath);
-  try {
-    await fs.rmdir(backupDir);
-  } catch (error) {
-    try { await fs.writeFile(markerPath, jsonBytes(stagingMarker(canonicalStagingPath))); } catch { /* keep the original cleanup failure */ }
-    throw error;
-  }
-}
-
-function parseInventory(value: unknown, nowMs: number): ComfyUIInventory {
-  if (!isRecord(value) || value.schemaVersion !== 1) throw new Error("ComfyUI inventory schemaVersion must equal 1");
-  const allowed = [
-    "schemaVersion", "source", "baseUrl", "capturedAtMs", "maxAgeMs", "backendFingerprint",
-    "nodeClasses", "models", "objectInfoSha256", "inventoryDigest",
-  ];
-  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (unknown.length) throw new Error(`ComfyUI inventory has unknown field(s): ${unknown.join(", ")}`);
-  if (value.source !== "ai-m-live-comfyui-probe-v1") throw new Error("ComfyUI inventory source is invalid");
-  if (value.baseUrl !== "http://127.0.0.1:8000") throw new Error("ComfyUI inventory baseUrl must exactly equal http://127.0.0.1:8000");
-  if (!Number.isSafeInteger(value.capturedAtMs) || (value.capturedAtMs as number) <= 0) throw new Error("ComfyUI inventory capturedAtMs must be a positive integer");
-  if (!Number.isSafeInteger(value.maxAgeMs) || (value.maxAgeMs as number) < 1_000 || (value.maxAgeMs as number) > 86_400_000) {
-    throw new Error("ComfyUI inventory maxAgeMs must be an integer between 1000 and 86400000");
-  }
-  const ageMs = nowMs - (value.capturedAtMs as number);
-  if (ageMs < -300_000) throw new Error("ComfyUI inventory capture time is unreasonably far in the future");
-  if (ageMs > (value.maxAgeMs as number)) throw new Error("ComfyUI inventory is stale and must be refreshed by the live probe");
-  if (typeof value.backendFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.backendFingerprint)) {
-    throw new Error("ComfyUI inventory backendFingerprint must be 64 lowercase hex characters");
-  }
-  if (!Array.isArray(value.nodeClasses) || value.nodeClasses.length === 0) throw new Error("ComfyUI inventory nodeClasses must be non-empty");
-  const nodeClasses: string[] = [];
-  const seenClasses = new Set<string>();
-  for (const item of value.nodeClasses) {
-    if (typeof item !== "string" || item !== item.trim() || !/^[A-Za-z0-9_ .:+-]{1,200}$/.test(item)) {
-      throw new Error("ComfyUI inventory nodeClasses contains an unsafe class name");
-    }
-    if (seenClasses.has(item)) throw new Error(`ComfyUI inventory nodeClasses contains duplicate: ${item}`);
-    seenClasses.add(item);
-    nodeClasses.push(item);
-  }
-  nodeClasses.sort();
-  if (!isRecord(value.models)) throw new Error("ComfyUI inventory models must be an object");
-  const models: Record<string, string[]> = {};
-  for (const [folder, filenames] of Object.entries(value.models)) {
-    if (!/^[A-Za-z0-9._-]+$/.test(folder)) throw new Error(`ComfyUI inventory model folder is unsafe: ${folder}`);
-    if (!Array.isArray(filenames) || !filenames.every((item) => typeof item === "string" && item.length > 0)) {
-      throw new Error(`ComfyUI inventory models.${folder} must be string[]`);
-    }
-    const normalized = (filenames as string[]).map((item) => item.replace(/\\/g, "/"));
-    for (const filename of normalized) {
-      const parts = filename.split("/");
-      if (filename.length > 1_024 || path.isAbsolute(filename) || parts.some((part) => !part || part === "." || part === ".." || part.length > 255)) {
-        throw new Error(`ComfyUI inventory model filename is unsafe: ${folder}/${filename}`);
-      }
-    }
-    if (new Set(normalized).size !== normalized.length) throw new Error(`ComfyUI inventory models.${folder} contains duplicate filenames`);
-    models[folder] = normalized.sort();
-  }
-  if (typeof value.objectInfoSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.objectInfoSha256)) {
-    throw new Error("ComfyUI inventory objectInfoSha256 must be 64 lowercase hex characters");
-  }
-  if (typeof value.inventoryDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.inventoryDigest)) {
-    throw new Error("ComfyUI inventory inventoryDigest must be 64 lowercase hex characters");
-  }
-  const normalizedPayload = {
-    schemaVersion: 1 as const,
-    source: "ai-m-live-comfyui-probe-v1" as const,
-    baseUrl: "http://127.0.0.1:8000" as const,
-    capturedAtMs: value.capturedAtMs as number,
-    maxAgeMs: value.maxAgeMs as number,
-    backendFingerprint: value.backendFingerprint,
-    nodeClasses,
-    models,
-    objectInfoSha256: value.objectInfoSha256,
-  };
-  if (digestBytes(Buffer.from(canonicalize(normalizedPayload), "utf8")) !== value.inventoryDigest) {
-    throw new Error("ComfyUI inventory inventoryDigest does not match its canonical payload");
-  }
-  if (digestBytes(Buffer.from(canonicalize(nodeClasses), "utf8")) !== value.objectInfoSha256) {
-    throw new Error("ComfyUI inventory objectInfoSha256 does not match canonical nodeClasses evidence");
-  }
-  return { ...normalizedPayload, inventoryDigest: value.inventoryDigest };
-}
-
-function environmentAssessment(manifest: WorkflowManifest, inventory: ComfyUIInventory | undefined) {
-  if (!inventory) return { inventoryStatus: "unverified" as const, blockedReasons: [] as string[] };
-  const blockedReasons: string[] = [];
-  for (const classType of manifest.requirements.nodeClasses) {
-    if (!inventory.nodeClasses.includes(classType)) blockedReasons.push(`missing node class: ${classType}`);
-  }
-  for (const model of manifest.requirements.models) {
-    const filename = model.filename.replace(/\\/g, "/");
-    if (!inventory.models[model.folder]?.includes(filename)) {
-      blockedReasons.push(`missing model: ${model.folder}/${filename}`);
-    }
-  }
-  return blockedReasons.length
-    ? { inventoryStatus: "blocked" as const, blockedReasons }
-    : { inventoryStatus: "matched" as const, blockedReasons };
-}
-
-async function removeInvocationDirectory(directory: string, parent: string, prefix: string): Promise<void> {
-  if (path.dirname(directory) !== parent || !path.basename(directory).startsWith(prefix)) {
-    throw new Error("Refusing to remove a directory not owned by this invocation");
-  }
-  const stat = await lstatOrNull(directory);
-  if (!stat) return;
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing to remove a linked invocation directory");
-  await fs.rm(directory, { recursive: true, force: false });
-}
-
 async function assertNoSymlinkComponents(target: string, label: string): Promise<void> {
   const resolved = path.resolve(target);
   const parsed = path.parse(resolved);
@@ -436,7 +310,7 @@ async function assertNoSymlinkComponents(target: string, label: string): Promise
     current = path.join(current, part);
     try {
       const stat = await fs.lstat(current);
-      if (stat.isSymbolicLink()) throw new Error(`${label} must not contain a symbolic link or junction: ${current}`);
+      if (stat.isSymbolicLink()) throw new Error(`${label} must not contain a symbolic link or junction`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
@@ -444,14 +318,99 @@ async function assertNoSymlinkComponents(target: string, label: string): Promise
   }
 }
 
-async function readApiWorkflow(workflowDir: string, definition: CandidateDefinition): Promise<ComfyWorkflow> {
-  const source = path.resolve(workflowDir, definition.sourceFile);
-  if (path.dirname(source) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
-  const stat = await fs.lstat(source);
-  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Source workflow must be a regular file without symbolic links: ${definition.sourceFile}`);
-  const realSource = await fs.realpath(source);
-  if (path.dirname(realSource) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
-  const raw = JSON.parse(await fs.readFile(source, "utf8")) as unknown;
+interface SourceIdentity {
+  sourceFile: string;
+  sourcePath: string;
+  realPath: string;
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+}
+
+function sameIdentity(stat: { dev: number; ino: number; size: number; mtimeMs: number }, identity: SourceIdentity): boolean {
+  return stat.dev === identity.dev && stat.ino === identity.ino && stat.size === identity.size && stat.mtimeMs === identity.mtimeMs;
+}
+
+function assertJsonDepth(bytes: Buffer, sourceFile: string): void {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (const byte of bytes) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (byte === 0x5c) escaped = true;
+      else if (byte === 0x22) inString = false;
+      continue;
+    }
+    if (byte === 0x22) inString = true;
+    else if (byte === 0x7b || byte === 0x5b) {
+      depth += 1;
+      if (depth > MAX_JSON_DEPTH) throw new Error(`${sourceFile} exceeds the JSON depth limit of ${MAX_JSON_DEPTH}`);
+    } else if (byte === 0x7d || byte === 0x5d) depth -= 1;
+  }
+}
+
+async function snapshotSources(
+  workflowDir: string,
+  afterRead: PrepareOptions["afterSourceFileRead"],
+): Promise<Map<string, Buffer>> {
+  const identities: SourceIdentity[] = [];
+  let totalSize = 0;
+  for (const definition of candidates) {
+    const sourcePath = path.resolve(workflowDir, definition.sourceFile);
+    if (path.dirname(sourcePath) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
+    const stat = await fs.lstat(sourcePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Source workflow must be a regular file without links: ${definition.sourceFile}`);
+    const realPath = await fs.realpath(sourcePath);
+    if (path.dirname(realPath) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
+    if (stat.size > MAX_WORKFLOW_BYTES) throw new Error(`${definition.sourceFile} exceeds the 5 MiB size limit`);
+    totalSize += stat.size;
+    if (totalSize > MAX_TOTAL_WORKFLOW_BYTES) throw new Error("Workflow source snapshot exceeds the total size limit");
+    identities.push({ sourceFile: definition.sourceFile, sourcePath, realPath, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
+  }
+
+  const result = new Map<string, Buffer>();
+  for (let index = 0; index < identities.length; index += 1) {
+    const identity = identities[index];
+    const handle = await fs.open(identity.sourcePath, "r");
+    try {
+      const before = await handle.stat();
+      if (!sameIdentity(before, identity)) throw new Error(`Source snapshot changed: ${identity.sourceFile}`);
+      const buffer = Buffer.alloc(identity.size + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset !== identity.size) throw new Error(`Source snapshot changed: ${identity.sourceFile}`);
+      await afterRead?.(identity.sourceFile, index);
+      const after = await handle.stat();
+      if (!sameIdentity(after, identity)) throw new Error(`Source snapshot changed: ${identity.sourceFile}`);
+      result.set(identity.sourceFile, buffer.subarray(0, identity.size));
+    } finally {
+      await handle.close();
+    }
+  }
+  for (const identity of identities) {
+    const finalStat = await fs.lstat(identity.sourcePath);
+    const finalRealPath = await fs.realpath(identity.sourcePath);
+    if (finalStat.isSymbolicLink() || !sameIdentity(finalStat, identity) || finalRealPath !== identity.realPath) {
+      throw new Error(`Source snapshot changed: ${identity.sourceFile}`);
+    }
+  }
+  return result;
+}
+
+function readApiWorkflow(bytes: Buffer, definition: CandidateDefinition): ComfyWorkflow {
+  assertJsonDepth(bytes, definition.sourceFile);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch (error) {
+    throw new Error(`${definition.sourceFile} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || "nodes" in raw) {
     throw new Error(`${definition.sourceFile} must be a real ComfyUI API graph keyed by numeric node IDs`);
   }
@@ -494,6 +453,184 @@ function makeManifest(definition: CandidateDefinition, workflow: ComfyWorkflow):
   return parseWorkflowManifest(manifest);
 }
 
+function lockRecord(pid: number, token: string, startedAtMs: number) {
+  return { schemaVersion: 1, pid, token, startedAtMs };
+}
+
+function parseLock(value: unknown): ReturnType<typeof lockRecord> {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Number.isInteger(value.pid) || (value.pid as number) <= 0
+    || typeof value.token !== "string" || !/^[a-f0-9]{32}$/.test(value.token)
+    || !Number.isFinite(value.startedAtMs)) throw new Error("prepare.lock is invalid; lock ownership is uncertain");
+  return lockRecord(value.pid as number, value.token, value.startedAtMs as number);
+}
+
+async function defaultIsProcessAlive(pid: number): Promise<boolean | "unknown"> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    return "unknown";
+  }
+}
+
+async function acquireLock(stagingDir: string, options: PrepareOptions, token: string): Promise<void> {
+  const lockPath = path.join(stagingDir, "prepare.lock");
+  const nowMs = options.nowMs ?? Date.now();
+  const staleMs = options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS;
+  if (!Number.isFinite(staleMs) || staleMs < 1_000) throw new Error("lockStaleMs must be at least 1000");
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fs.open(lockPath, "wx");
+      try {
+        await handle.writeFile(jsonBytes(lockRecord(process.pid, token, nowMs)));
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let raw: Buffer;
+    let existing: ReturnType<typeof lockRecord>;
+    try {
+      raw = await fs.readFile(lockPath);
+      if (raw.length > 4_096) throw new Error("prepare.lock is too large");
+      existing = parseLock(JSON.parse(raw.toString("utf8")));
+    } catch (error) {
+      throw new Error(`Staging is locked and lock ownership is uncertain: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (nowMs - existing.startedAtMs <= staleMs) throw new Error("Staging is locked by an active prepare.lock");
+    const alive = await (options.isProcessAlive ?? defaultIsProcessAlive)(existing.pid);
+    if (alive === true) throw new Error("Staging is locked by a live process");
+    if (alive === "unknown") throw new Error("Staging is locked because process liveness is uncertain");
+    const currentRaw = await fs.readFile(lockPath);
+    const current = parseLock(JSON.parse(currentRaw.toString("utf8")));
+    if (current.token !== existing.token || !currentRaw.equals(raw)) throw new Error("Staging lock changed during stale-lock recovery");
+    await fs.rename(lockPath, path.join(stagingDir, `prepare.lock.stale.${existing.token}`));
+  }
+  throw new Error("Staging is locked");
+}
+
+async function releaseLock(stagingDir: string, token: string): Promise<void> {
+  const lockPath = path.join(stagingDir, "prepare.lock");
+  try {
+    const current = parseLock(JSON.parse(await fs.readFile(lockPath, "utf8")));
+    if (current.token === token) await fs.unlink(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+  }
+}
+
+async function assertLockOwned(stagingDir: string, token: string): Promise<void> {
+  let current: ReturnType<typeof lockRecord>;
+  try {
+    current = parseLock(JSON.parse(await fs.readFile(path.join(stagingDir, "prepare.lock"), "utf8")));
+  } catch {
+    throw new Error("prepare.lock ownership was lost");
+  }
+  if (current.token !== token) throw new Error("prepare.lock ownership was lost");
+}
+
+async function initializeStaging(stagingDir: string): Promise<void> {
+  const existing = await lstatOrNull(stagingDir);
+  if (existing) {
+    await assertOwnedStaging(stagingDir, stagingDir);
+    return;
+  }
+  const token = randomBytes(16).toString("hex");
+  const initDir = path.join(path.dirname(stagingDir), `.${path.basename(stagingDir)}.init-${token}`);
+  await fs.mkdir(initDir);
+  await fs.writeFile(path.join(initDir, STAGING_MARKER_FILENAME), jsonBytes(stagingMarker(stagingDir)), { flag: "wx" });
+  await fs.mkdir(path.join(initDir, "generations"));
+  try {
+    await fs.rename(initDir, stagingDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    await assertOwnedStaging(stagingDir, stagingDir);
+  }
+}
+
+async function assertGenerationsDirectory(stagingDir: string): Promise<void> {
+  const generationsDir = path.join(stagingDir, "generations");
+  const stat = await lstatOrNull(generationsDir);
+  if (!stat) {
+    await fs.mkdir(generationsDir);
+    return;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("generations must be a regular directory without links");
+}
+
+async function countMarkedTempOrphans(stagingDir: string): Promise<number> {
+  let count = 0;
+  for (const entry of await fs.readdir(stagingDir, { withFileTypes: true })) {
+    if (!entry.name.startsWith(".tmp-generation-")) continue;
+    if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Unsafe generation temp orphan: ${entry.name}`);
+    const token = entry.name.slice(".tmp-generation-".length);
+    let marker: unknown;
+    try {
+      marker = JSON.parse(await fs.readFile(path.join(stagingDir, entry.name, TEMP_MARKER_FILENAME), "utf8"));
+    } catch {
+      throw new Error(`Unrecognized generation temp orphan: ${entry.name}`);
+    }
+    if (!isRecord(marker) || marker.schemaVersion !== 1 || marker.producer !== STAGING_MARKER_PRODUCER || marker.token !== token) {
+      throw new Error(`Unrecognized generation temp orphan: ${entry.name}`);
+    }
+    count += 1;
+  }
+  return count;
+}
+
+type PackageFiles = Record<string, Buffer>;
+
+async function verifyGeneration(directory: string, expected: Map<string, PackageFiles>, generationBytes: Buffer): Promise<void> {
+  const stat = await fs.lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Existing generation is not a safe directory");
+  const expectedRoot = ["generation.json", ...expected.keys()].sort();
+  if ((await fs.readdir(directory)).sort().join("\0") !== expectedRoot.join("\0")) throw new Error("Existing generation content does not match its digest");
+  if (!(await fs.readFile(path.join(directory, "generation.json"))).equals(generationBytes)) throw new Error("Existing generation metadata does not match its digest");
+  for (const [packageName, files] of expected) {
+    const packageDir = path.join(directory, packageName);
+    const packageStat = await fs.lstat(packageDir);
+    if (!packageStat.isDirectory() || packageStat.isSymbolicLink()) throw new Error(`Existing generation package is unsafe: ${packageName}`);
+    if ((await fs.readdir(packageDir)).sort().join("\0") !== Object.keys(files).sort().join("\0")) throw new Error(`Existing package content does not match: ${packageName}`);
+    for (const [filename, bytes] of Object.entries(files)) {
+      if (!(await fs.readFile(path.join(packageDir, filename))).equals(bytes)) throw new Error(`Existing package bytes do not match: ${packageName}/${filename}`);
+    }
+  }
+}
+
+async function removeCurrentDuplicatePayload(payloadDir: string, expected: Map<string, PackageFiles>): Promise<void> {
+  for (const [packageName, files] of expected) {
+    const packageDir = path.join(payloadDir, packageName);
+    for (const filename of Object.keys(files)) await fs.unlink(path.join(packageDir, filename));
+    await fs.rmdir(packageDir);
+  }
+  await fs.unlink(path.join(payloadDir, "generation.json"));
+  await fs.rmdir(payloadDir);
+}
+
+async function removeCurrentTempWrapper(tempDir: string): Promise<void> {
+  await fs.unlink(path.join(tempDir, TEMP_MARKER_FILENAME));
+  await fs.rmdir(tempDir);
+}
+
+async function writeCurrentPointer(stagingDir: string, token: string, pointer: unknown): Promise<void> {
+  const tempPath = path.join(stagingDir, `current.${token}.tmp`);
+  const bytes = jsonBytes(pointer);
+  try {
+    await fs.writeFile(tempPath, bytes, { flag: "wx" });
+    if (!(await fs.readFile(tempPath)).equals(bytes)) throw new Error("current pointer write verification failed");
+    await assertLockOwned(stagingDir, token);
+    await fs.rename(tempPath, path.join(stagingDir, "current.json"));
+  } catch (error) {
+    try { await fs.unlink(tempPath); } catch { /* only this invocation's exact token path is eligible */ }
+    throw error;
+  }
+}
+
 export async function preparePixelleSingleBackendPackages(options: PrepareOptions): Promise<PrepareResult> {
   if (!options.pixelleRoot?.trim()) throw new Error("PIXELLE_ROOT is required");
   if (!options.stagingDir?.trim()) throw new Error("PIXELLE_WORKFLOW_STAGING_DIR is required");
@@ -520,47 +657,35 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   const workflowDir = path.resolve(pixelleRoot, "workflows", "selfhost");
   await assertNoSymlinkComponents(workflowDir, "Pixelle workflows/selfhost");
   if (await fs.realpath(workflowDir) !== workflowDir) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
-  const existingStaging = await lstatOrNull(stagingDir);
-  if (existingStaging) await assertOwnedStaging(stagingDir, stagingDir);
-  const basename = path.basename(stagingDir);
-  const backupPrefix = `${basename}.ai-m-backup-`;
-  const orphanBackups = (await fs.readdir(stagingParent, { withFileTypes: true }))
-    .filter((entry) => entry.name.startsWith(backupPrefix));
-  if (orphanBackups.length) {
-    for (const orphan of orphanBackups) {
-      if (!orphan.isDirectory() || orphan.isSymbolicLink()) throw new Error(`Unsafe orphan backup blocks staging: ${orphan.name}`);
-      await assertOwnedStaging(path.join(stagingParent, orphan.name), stagingDir);
-    }
-    throw new Error(`Owned orphan backup cleanup is required before another run: ${orphanBackups.map((item) => item.name).join(", ")}`);
-  }
-  const inventory = options.inventory === undefined ? undefined : parseInventory(options.inventory, options.nowMs ?? Date.now());
-
-  const prepared: Array<{
-    definition: CandidateDefinition;
-    workflow: ComfyWorkflow;
-    manifest: WorkflowManifest;
-    compiled: ReturnType<typeof compileWorkflowBindings>;
-  }> = [];
-  for (const definition of candidates) {
-    const workflow = await readApiWorkflow(workflowDir, definition);
-    const manifest = makeManifest(definition, workflow);
-    const compiled = compileWorkflowBindings(workflow, manifest);
-    prepared.push({ definition, workflow, manifest, compiled });
-  }
-
-  const tempPrefix = `${basename}.ai-m-tmp-`;
-  const tempDir = path.join(stagingParent, `${tempPrefix}${randomUUID()}`);
-  await fs.mkdir(tempDir);
-  const writeBytes = options.writeBytes ?? fs.writeFile;
-  const packages: PreparedPackage[] = [];
-  const cleanupWarnings: string[] = [];
+  await initializeStaging(stagingDir);
+  await assertGenerationsDirectory(stagingDir);
+  const token = randomBytes(16).toString("hex");
+  await acquireLock(stagingDir, options, token);
   try {
-    for (const item of prepared) {
-      const tempPackageDir = path.join(tempDir, item.definition.packageName);
+    await options.afterLockAcquired?.();
+    await assertLockOwned(stagingDir, token);
+    const orphanTempCount = await countMarkedTempOrphans(stagingDir);
+    const sourceBytes = await snapshotSources(workflowDir, options.afterSourceFileRead);
+    const tempDir = path.join(stagingDir, `.tmp-generation-${token}`);
+    await fs.mkdir(tempDir);
+    await fs.writeFile(path.join(tempDir, TEMP_MARKER_FILENAME), jsonBytes({
+      schemaVersion: 1, producer: STAGING_MARKER_PRODUCER, token, pid: process.pid, startedAtMs: options.nowMs ?? Date.now(),
+    }), { flag: "wx" });
+    const payloadDir = path.join(tempDir, "payload");
+    await fs.mkdir(payloadDir);
+    const writeBytes = options.writeBytes ?? fs.writeFile;
+    const packages: PreparedPackage[] = [];
+    const expected = new Map<string, PackageFiles>();
+    const packageDigests: Record<string, string> = {};
+    for (const definition of candidates) {
+      const workflow = readApiWorkflow(sourceBytes.get(definition.sourceFile)!, definition);
+      const manifest = makeManifest(definition, workflow);
+      const compiled = compileWorkflowBindings(workflow, manifest);
+      const tempPackageDir = path.join(payloadDir, definition.packageName);
       await fs.mkdir(tempPackageDir);
-      const workflowBytes = jsonBytes(item.workflow);
-      const manifestBytes = jsonBytes(item.manifest);
-      const compiledBytes = jsonBytes(item.compiled);
+      const workflowBytes = jsonBytes(workflow);
+      const manifestBytes = jsonBytes(manifest);
+      const compiledBytes = jsonBytes(compiled);
       const fileDigests = {
         "workflow.api.json": digestBytes(workflowBytes),
         "manifest.json": digestBytes(manifestBytes),
@@ -568,15 +693,15 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
       };
       const packageLock = {
         schemaVersion: 1,
-        workflowId: item.manifest.workflowId,
-        version: item.manifest.version,
+        workflowId: manifest.workflowId,
+        version: manifest.version,
         files: fileDigests,
         environmentLockDigest: sha256({
-          requirements: item.manifest.requirements,
-          outputContract: item.manifest.outputs,
+          requirements: manifest.requirements,
+          outputContract: manifest.outputs,
         }),
       };
-      const parsedLock = parseWorkflowPackageLock(packageLock, item.manifest);
+      const parsedLock = parseWorkflowPackageLock(packageLock, manifest);
       verifyLockedFiles(parsedLock, fileDigests);
       const files: Record<string, Buffer> = {
         "workflow.api.json": workflowBytes,
@@ -589,69 +714,55 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
         await writeBytes(destination, bytes);
         if (!(await fs.readFile(destination)).equals(bytes)) throw new Error(`Staging write verification failed: ${filename}`);
       }
-      const assessment = environmentAssessment(item.manifest, inventory);
+      const packageDigest = digestBytes(Buffer.from(canonicalize(Object.fromEntries(Object.entries(files).map(([name, bytes]) => [name, digestBytes(bytes)]))), "utf8"));
+      packageDigests[definition.packageName] = packageDigest;
+      expected.set(definition.packageName, files);
       packages.push({
-        sourceFile: item.definition.sourceFile,
-        packageDir: path.join(stagingDir, item.definition.packageName),
-        workflowId: item.manifest.workflowId,
-        ...assessment,
+        sourceFile: definition.sourceFile,
+        packageName: definition.packageName,
+        workflowId: manifest.workflowId,
+        packageDigest,
+        requirements: manifest.requirements,
       });
     }
-    const markerBytes = jsonBytes(stagingMarker(stagingDir));
-    await writeBytes(path.join(tempDir, STAGING_MARKER_FILENAME), markerBytes);
-    await assertOwnedStaging(tempDir, stagingDir);
-
-    if (!existingStaging) {
-      await fs.rename(tempDir, stagingDir);
-      await assertOwnedStaging(stagingDir, stagingDir);
+    const generationDigest = digestBytes(Buffer.from(canonicalize({ schemaVersion: 1, packageDigests }), "utf8"));
+    const generationBytes = jsonBytes({ schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified" });
+    await writeBytes(path.join(payloadDir, "generation.json"), generationBytes);
+    await assertLockOwned(stagingDir, token);
+    const generationDir = path.join(stagingDir, "generations", generationDigest);
+    if (await lstatOrNull(generationDir)) {
+      await verifyGeneration(generationDir, expected, generationBytes);
+      await removeCurrentDuplicatePayload(payloadDir, expected);
     } else {
-      const backupDir = path.join(stagingParent, `${backupPrefix}${randomUUID()}`);
-      await fs.rename(stagingDir, backupDir);
       try {
-        await fs.rename(tempDir, stagingDir);
-        await assertOwnedStaging(stagingDir, stagingDir);
+        await fs.rename(payloadDir, generationDir);
       } catch (error) {
-        const failedNewPrefix = `${basename}.ai-m-precommit-new-`;
-        const failedNewDir = path.join(stagingParent, `${failedNewPrefix}${randomUUID()}`);
-        if (await lstatOrNull(stagingDir)) await fs.rename(stagingDir, failedNewDir);
-        await fs.rename(backupDir, stagingDir);
-        await removeInvocationDirectory(failedNewDir, stagingParent, failedNewPrefix);
-        throw error;
-      }
-      await assertOwnedStaging(backupDir, stagingDir);
-      try {
-        if (options.removeOwnedBackup) await options.removeOwnedBackup(backupDir);
-        else await cleanupOwnedBackupDirectory(backupDir, stagingDir);
-      } catch (error) {
-        cleanupWarnings.push(`Committed new staging; owned backup cleanup failed at ${backupDir}: ${error instanceof Error ? error.message : String(error)}`);
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+        await verifyGeneration(generationDir, expected, generationBytes);
+        await removeCurrentDuplicatePayload(payloadDir, expected);
       }
     }
-  } catch (error) {
-    await removeInvocationDirectory(tempDir, stagingParent, tempPrefix);
-    throw error;
+    await verifyGeneration(generationDir, expected, generationBytes);
+    await writeCurrentPointer(stagingDir, token, {
+      schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified",
+    });
+    await removeCurrentTempWrapper(tempDir);
+    return { packages, state: "prepared-environment-unverified", generationDigest, orphanTempCount };
+  } finally {
+    await releaseLock(stagingDir, token);
   }
-  const state = !inventory
-    ? "prepared-environment-unverified" as const
-    : packages.some((item) => item.inventoryStatus === "blocked")
-      ? "prepared-with-inventory-blockers" as const
-      : "prepared-inventory-matched" as const;
-  return { stagingDir, packages, state, cleanupWarnings };
 }
 
 async function main(): Promise<void> {
-  const inventoryFile = process.env.COMFYUI_INVENTORY_FILE?.trim();
   const result = await preparePixelleSingleBackendPackages({
     pixelleRoot: process.env.PIXELLE_ROOT ?? "",
     stagingDir: process.env.PIXELLE_WORKFLOW_STAGING_DIR ?? "",
-    inventory: inventoryFile ? JSON.parse(await fs.readFile(path.resolve(inventoryFile), "utf8")) : undefined,
   });
   console.log(JSON.stringify({
-    stagingDir: result.stagingDir,
     state: result.state,
-    inventoryMatched: result.packages.filter((item) => item.inventoryStatus === "matched").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
-    unverified: result.packages.filter((item) => item.inventoryStatus === "unverified").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
-    blocked: result.packages.filter((item) => item.inventoryStatus === "blocked").map(({ sourceFile, workflowId, blockedReasons }) => ({ sourceFile, workflowId, blockedReasons })),
-    cleanupWarnings: result.cleanupWarnings,
+    generationDigest: result.generationDigest,
+    orphanTempCount: result.orphanTempCount,
+    packages: result.packages,
   }, null, 2));
 }
 

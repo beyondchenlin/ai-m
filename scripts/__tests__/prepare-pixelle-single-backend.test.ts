@@ -1,14 +1,14 @@
-import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { canonicalize } from "../../src/lib/generation/workflows/canonical";
-import { cleanupOwnedBackupDirectory, preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
+import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 
 const temporaryDirectories: string[] = [];
-const STAGING_MARKER = ".ai-m-pixelle-staging.json";
-const INVENTORY_NOW = 2_000_000_000_000;
+const ROOT_MARKER = ".ai-m-pixelle-staging.json";
+const TEMP_MARKER = ".ai-m-generation-temp.json";
 
 function node(classType: string, title: string, inputs: Record<string, unknown>) {
   return { class_type: classType, _meta: { title }, inputs };
@@ -17,9 +17,7 @@ function node(classType: string, title: string, inputs: Record<string, unknown>)
 function indexWorkflow(lowVram = false): Record<string, unknown> {
   return {
     "3": node("PrimitiveStringMultiline", "$text.value!", { value: "sample" }),
-    "5": node("IndexTTS2BaseNode", lowVram ? "Index TTS 2 - Base (8G VRAM)" : "Index TTS 2 - Base", {
-      text: ["3", 0], reference_audio: ["12", 0], cache_control: ["13", 0],
-    }),
+    "5": node("IndexTTS2BaseNode", lowVram ? "Index TTS 2 - Base (8G VRAM)" : "Index TTS 2 - Base", { text: ["3", 0], reference_audio: ["12", 0], cache_control: ["13", 0] }),
     "8": node("SaveAudio", "Save Audio (FLAC)", { filename_prefix: "audio/ComfyUI", audio: ["5", 0] }),
     "12": node("VHS_LoadAudioUpload", "$ref_audio.~audio!", { audio: "ref_audio.wav", start_time: 0, duration: 0 }),
     "13": node("IndexTTS2CacheControlNode", "Index TTS 2 Cache Control", { keep_models_cached: true }),
@@ -35,18 +33,16 @@ function omniWorkflow(clone: boolean): Record<string, unknown> {
       model: "OmniVoice-bf16", text: ["3", 0], ref_text: ["4", 0], ref_audio: ["5", 0], speed: 0.9,
       ...(clone ? { duration: ["8", 0] } : { duration: 0, whisper_model: ["9", 0] }),
     }),
-    "7": node("SaveAudio", "Save Audio (FLAC)", { filename_prefix: "audio/ComfyUI_omnivoice", audio: ["6", 0] }),
-    ...(clone
-      ? { "8": node("PixelleDurationInput", "$duration.value", { value: 8 }) }
-      : { "9": node("OmniVoiceWhisperLoader", "OmniVoice Whisper Loader", { model: "whisper-large-v3" }) }),
+    "7": node("SaveAudio", "Save Audio (FLAC)", { filename_prefix: "audio/ComfyUI", audio: ["6", 0] }),
+    ...(clone ? { "8": node("PixelleDurationInput", "$duration.value", { value: 8 }) } : { "9": node("OmniVoiceWhisperLoader", "OmniVoice Whisper Loader", { model: "whisper-large-v3" }) }),
   };
 }
 
 function imageWorkflow(): Record<string, unknown> {
   return {
-    "3": node("KSampler", "KSampler", { seed: 0, model: ["37", 0] }),
-    "37": node("UNETLoader", "Load Diffusion Model", { unet_name: "z_image_turbo_bf16.safetensors", weight_dtype: "default" }),
-    "38": node("CLIPLoader", "Load CLIP", { clip_name: "qwen_3_4b.safetensors", type: "lumina2" }),
+    "3": node("KSampler", "KSampler", { seed: 0 }),
+    "37": node("UNETLoader", "Load Diffusion Model", { unet_name: "z_image_turbo_bf16.safetensors" }),
+    "38": node("CLIPLoader", "Load CLIP", { clip_name: "qwen_3_4b.safetensors" }),
     "39": node("VAELoader", "Load VAE", { vae_name: "ae.safetensors" }),
     "46": node("PrimitiveStringMultiline", "$prompt.value!", { value: "a dog" }),
     "60": node("SaveImage", "Save Image", { filename_prefix: "ComfyUI", images: ["8", 0] }),
@@ -57,10 +53,10 @@ function imageWorkflow(): Record<string, unknown> {
 
 function videoWorkflow(): Record<string, unknown> {
   return {
-    "3": node("KSampler", "KSampler", { seed: 12, model: ["37", 0] }),
+    "3": node("KSampler", "KSampler", { seed: 12 }),
     "30": node("VHS_VideoCombine", "Video Combine \u{1F3A5}\u{1F165}\u{1F157}\u{1F162}", { filename_prefix: "Video", format: "video/h264-mp4", save_output: true }),
     "37": node("UNETLoader", "Load Diffusion Model", { unet_name: "wan-fusionx/WanT2V_MasterModel.safetensors" }),
-    "38": node("CLIPLoader", "Load CLIP", { clip_name: "umt5_xxl_fp8_e4m3fn_scaled.safetensors", type: "wan" }),
+    "38": node("CLIPLoader", "Load CLIP", { clip_name: "umt5_xxl_fp8_e4m3fn_scaled.safetensors" }),
     "39": node("VAELoader", "Load VAE", { vae_name: "wan_2.1_vae.safetensors" }),
     "49": node("PrimitiveStringMultiline", "$prompt.value!", { value: "a running dog" }),
     "50": node("easy int", "$width.value", { value: 512 }),
@@ -69,346 +65,215 @@ function videoWorkflow(): Record<string, unknown> {
 }
 
 const workflows: Record<string, Record<string, unknown>> = {
-  "tts_index2.json": indexWorkflow(),
-  "tts_index2_8g.json": indexWorkflow(true),
-  "tts_omnivoice_longform_bf16.json": omniWorkflow(false),
-  "tts_omnivoice_clone_duration_bf16.json": omniWorkflow(true),
-  "image_z_image_turbo.json": imageWorkflow(),
-  "video_wan2.1_fusionx.json": videoWorkflow(),
+  "tts_index2.json": indexWorkflow(), "tts_index2_8g.json": indexWorkflow(true),
+  "tts_omnivoice_longform_bf16.json": omniWorkflow(false), "tts_omnivoice_clone_duration_bf16.json": omniWorkflow(true),
+  "image_z_image_turbo.json": imageWorkflow(), "video_wan2.1_fusionx.json": videoWorkflow(),
 };
 
-async function makePixelleTree(overrides: Record<string, unknown> = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-pixelle-"));
+async function makeTree() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-pixelle-immutable-"));
   temporaryDirectories.push(root);
-  const workflowDir = path.join(root, "workflows", "selfhost");
-  await fs.mkdir(workflowDir, { recursive: true });
-  for (const [name, workflow] of Object.entries({ ...workflows, ...overrides })) {
-    await fs.writeFile(path.join(workflowDir, name), `${JSON.stringify(workflow, null, 2)}\n`, "utf8");
-  }
-  const stagingDir = path.join(root, "..", `${path.basename(root)}-staging`);
-  temporaryDirectories.push(stagingDir);
-  return { root, workflowDir, stagingDir };
-}
-
-function hashCanonical(value: unknown): string {
-  return createHash("sha256").update(canonicalize(value)).digest("hex");
-}
-
-function partialInventory(overrides: Record<string, unknown> = {}) {
-  const classes = new Set<string>();
-  for (const workflow of Object.values(workflows)) {
-    for (const item of Object.values(workflow) as Array<{ class_type: string }>) classes.add(item.class_type);
-  }
-  classes.delete("PixelleDurationInput");
-  const nodeClasses = [...classes].sort();
-  const payload = {
-    schemaVersion: 1,
-    source: "ai-m-live-comfyui-probe-v1",
-    baseUrl: "http://127.0.0.1:8000",
-    capturedAtMs: INVENTORY_NOW - 1_000,
-    maxAgeMs: 300_000,
-    backendFingerprint: "a".repeat(64),
-    nodeClasses,
-    models: {
-      diffusion_models: ["z_image_turbo_bf16.safetensors"],
-      text_encoders: ["qwen_3_4b.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"],
-      vae: ["ae.safetensors"],
-    },
-    objectInfoSha256: hashCanonical(nodeClasses),
-    ...overrides,
-  };
-  return { ...payload, inventoryDigest: hashCanonical(payload) };
+  const sourceDir = path.join(root, "pixelle", "workflows", "selfhost");
+  await fs.mkdir(sourceDir, { recursive: true });
+  for (const [name, workflow] of Object.entries(workflows)) await fs.writeFile(path.join(sourceDir, name), JSON.stringify(workflow), "utf8");
+  const stagingDir = path.join(root, "staging");
+  return { root, pixelleRoot: path.join(root, "pixelle"), sourceDir, stagingDir };
 }
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
 });
 
-describe("preparePixelleSingleBackendPackages", () => {
-  it("exposes the prepare-only command and documents the single endpoint review gate", async () => {
-    const packageJson = JSON.parse(await fs.readFile(path.resolve("package.json"), "utf8"));
-    expect(packageJson.scripts["workflow:prepare:pixelle-single"]).toBe("tsx scripts/prepare-pixelle-single-backend.ts");
+describe("immutable Pixelle workflow preparation", () => {
+  it("documents offline-only preparation and a safe post-Task4 import reference", async () => {
     const readme = await fs.readFile(path.resolve("docs/comfyui-single-endpoint/README.md"), "utf8");
-    expect(readme).toContain("D:\\demo1\\Pixelle\\Pixelle");
-    expect(readme).toContain("http://127.0.0.1:8000");
-    expect(readme).toMatch(/prepare[\s\S]+review[\s\S]+import[\s\S]+promote/i);
+    expect(readme).not.toContain("COMFYUI_INVENTORY_FILE");
     expect(readme).toContain("prepared-environment-unverified");
-    for (const name of [
-      "COMFYUI_INVENTORY_FILE", "WORKFLOW_PACKAGE_DIR", "WORKFLOW_IMPORTER_ID", "PROFILE_KEY",
-      "PROFILE_DISPLAY_NAME", "EXECUTION_BACKEND_ID", "PROFILE_CONFIG_FILE", "WORKFLOW_DIGEST",
-      "PROFILE_REVISION_ID", "CONFIRM_WORKFLOW_DIGEST", "CONFIRM_ENVIRONMENT_LOCK_DIGEST",
-      "WORKFLOW_REVIEWER_ID", "ENABLE_BACKEND",
-    ]) expect(readme).toContain(name);
-    expect(readme).toContain("PixelleDurationInput");
-    expect(readme).toContain("WanT2V_MasterModel.safetensors");
-    expect(readme).toContain("wan_2.1_vae.safetensors");
-    expect(readme).not.toMatch(/workflow:import\s+</);
-    const importBlock = readme.match(/```powershell\n([\s\S]*?corepack pnpm workflow:import[\s\S]*?)```/)?.[1] ?? "";
-    expect(importBlock).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
-    expect(importBlock).not.toMatch(/\$env:PROFILE_CONFIG_FILE\s*=/);
-    expect(readme).toMatch(/无配置文件[\s\S]*disabled profile/i);
+    expect(readme).toMatch(/Task 4[\s\S]*verified evidence[\s\S]*import\/promote/i);
+    expect(readme).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
+    expect(readme).toContain("$env:PIXELLE_WORKFLOW_STAGING_DIR\\logs");
+    expect(readme).toMatch(/New-Item[\s\S]*logs[\s\S]*Tee-Object/i);
+    expect(readme).toMatch(/日志[\s\S]*(保留|敏感)/);
   });
 
-  it("prepares all six real API workflow package types with truthful bindings, outputs, and models", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    const result = await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
-
-    expect(result.packages.map((item) => item.sourceFile)).toEqual(Object.keys(workflows));
-    expect(result.packages.every((item) => item.inventoryStatus === "unverified")).toBe(true);
+  it("publishes one immutable content-addressed generation and a small current pointer", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const result = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     expect(result.state).toBe("prepared-environment-unverified");
-    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8"))).toEqual({
-      schemaVersion: 1,
-      producer: "ai-m/pixelle-single-backend",
-      canonicalStagingPath: path.resolve(stagingDir),
-    });
-    const packages = await Promise.all(result.packages.map(async (item) => ({
-      item,
-      manifest: JSON.parse(await fs.readFile(path.join(item.packageDir, "manifest.json"), "utf8")),
-      compiled: JSON.parse(await fs.readFile(path.join(item.packageDir, "compiled-bindings.json"), "utf8")),
-      lock: JSON.parse(await fs.readFile(path.join(item.packageDir, "package.lock.json"), "utf8")),
-    })));
-
-    const index = packages.find(({ item }) => item.sourceFile === "tts_index2.json")!;
-    expect(index.manifest.bindings.map((binding: { key: string }) => binding.key)).toEqual(["text", "voiceReference"]);
-    expect(index.manifest.requirements.models).toEqual([]);
-    expect(index.compiled.outputs[0]).toMatchObject({ classType: "SaveAudio", field: "audio", mediaKind: "audio" });
-
-    const omni = packages.find(({ item }) => item.sourceFile === "tts_omnivoice_longform_bf16.json")!;
-    expect(omni.manifest.bindings.map((binding: { key: string }) => binding.key)).toEqual(["text", "voiceReference", "referenceText", "speed"]);
-    expect(omni.manifest.bindings.find((binding: { key: string }) => binding.key === "speed").default).toBe(0.9);
-    expect(omni.manifest.requirements.models).toEqual([]);
-
-    const clone = packages.find(({ item }) => item.sourceFile === "tts_omnivoice_clone_duration_bf16.json")!;
-    expect(clone.manifest.bindings.map((binding: { key: string }) => binding.key)).toEqual(["text", "voiceReference", "referenceText", "speed", "duration"]);
-
-    const image = packages.find(({ item }) => item.sourceFile === "image_z_image_turbo.json")!;
-    expect(image.manifest.bindings.map((binding: { key: string }) => binding.key)).toEqual(["prompt", "width", "height", "seed"]);
-    expect(image.manifest.requirements.models).toEqual([
-      { folder: "diffusion_models", filename: "z_image_turbo_bf16.safetensors" },
-      { folder: "text_encoders", filename: "qwen_3_4b.safetensors" },
-      { folder: "vae", filename: "ae.safetensors" },
-    ]);
-    expect(image.compiled.outputs[0]).toMatchObject({ classType: "SaveImage", field: "images", mediaKind: "image" });
-
-    const video = packages.find(({ item }) => item.sourceFile === "video_wan2.1_fusionx.json")!;
-    expect(video.manifest.bindings.find((binding: { key: string }) => binding.key === "seed").default).toBe(12);
-    expect(video.manifest.requirements.models).toEqual([
-      { folder: "diffusion_models", filename: "wan-fusionx/WanT2V_MasterModel.safetensors" },
-      { folder: "text_encoders", filename: "umt5_xxl_fp8_e4m3fn_scaled.safetensors" },
-      { folder: "vae", filename: "wan_2.1_vae.safetensors" },
-    ]);
-    expect(video.compiled.outputs[0]).toMatchObject({ classType: "VHS_VideoCombine", field: "gifs", mediaKind: "video" });
-    for (const entry of packages) {
-      expect(entry.lock.files).toHaveProperty("workflow.api.json");
-      expect(entry.lock.files).toHaveProperty("manifest.json");
-      expect(entry.lock.files).toHaveProperty("compiled-bindings.json");
+    expect(result.packages).toHaveLength(6);
+    expect(result.generationDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect("stagingDir" in result).toBe(false);
+    const generationDir = path.join(stagingDir, "generations", result.generationDigest);
+    expect((await fs.stat(generationDir)).isDirectory()).toBe(true);
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, ROOT_MARKER), "utf8"))).toMatchObject({ schemaVersion: 2, producer: "ai-m/pixelle-single-backend" });
+    const current = JSON.parse(await fs.readFile(path.join(stagingDir, "current.json"), "utf8"));
+    expect(current).toMatchObject({ schemaVersion: 1, generationDigest: result.generationDigest, state: "prepared-environment-unverified" });
+    expect(JSON.stringify(current)).not.toContain(stagingDir);
+    for (const item of result.packages) {
+      expect(item.packageName).toBeTruthy();
+      expect(await fs.stat(path.join(generationDir, item.packageName, "package.lock.json"))).toBeTruthy();
+      await expect(fs.stat(path.join(generationDir, item.packageName, ROOT_MARKER))).rejects.toThrow();
     }
   });
 
-  it("marks only inventory-complete candidates validated and reports exact blockers", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    const result = await preparePixelleSingleBackendPackages({
-      pixelleRoot: root,
-      stagingDir,
-      inventory: partialInventory(),
-      nowMs: INVENTORY_NOW,
-    });
-    const bySource = Object.fromEntries(result.packages.map((item) => [item.sourceFile, item]));
-    expect(bySource["tts_index2.json"].inventoryStatus).toBe("matched");
-    expect(bySource["tts_index2_8g.json"].inventoryStatus).toBe("matched");
-    expect(bySource["tts_omnivoice_longform_bf16.json"].inventoryStatus).toBe("matched");
-    expect(bySource["image_z_image_turbo.json"].inventoryStatus).toBe("matched");
-    expect(bySource["tts_omnivoice_clone_duration_bf16.json"]).toMatchObject({
-      inventoryStatus: "blocked",
-      blockedReasons: ["missing node class: PixelleDurationInput"],
-    });
-    expect(bySource["video_wan2.1_fusionx.json"]).toMatchObject({
-      inventoryStatus: "blocked",
-      blockedReasons: [
-        "missing model: diffusion_models/wan-fusionx/WanT2V_MasterModel.safetensors",
-        "missing model: vae/wan_2.1_vae.safetensors",
-      ],
-    });
-    expect(result.state).toBe("prepared-with-inventory-blockers");
+  it("reuses identical generation bytes and digest without deleting immutable content", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const bytes = await fs.readFile(path.join(stagingDir, "generations", first.generationDigest, "tts-index2", "workflow.api.json"));
+    const second = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    expect(second.generationDigest).toBe(first.generationDigest);
+    expect(await fs.readFile(path.join(stagingDir, "generations", first.generationDigest, "tts-index2", "workflow.api.json"))).toEqual(bytes);
+    expect(await fs.readdir(path.join(stagingDir, "generations"))).toEqual([first.generationDigest]);
   });
 
-  it.each([
-    ["wrong 8001 endpoint", { baseUrl: "http://127.0.0.1:8001" }, /baseUrl|8000/i],
-    ["wrong 8002 endpoint", { baseUrl: "http://127.0.0.1:8002" }, /baseUrl|8000/i],
-    ["bad source", { source: "fixture" }, /source/i],
-    ["bad schema", { schemaVersion: 2 }, /schemaVersion/i],
-    ["fixture fingerprint", { backendFingerprint: "fixture" }, /backendFingerprint/i],
-    ["stale capture", { capturedAtMs: INVENTORY_NOW - 300_001 }, /stale|fresh/i],
-    ["unsafe node class", { nodeClasses: ["../bad"] }, /unsafe class/i],
-  ])("rejects inventory with %s", async (_label, override, expected) => {
-    const { root, stagingDir } = await makePixelleTree();
-    await expect(preparePixelleSingleBackendPackages({
-      pixelleRoot: root,
-      stagingDir,
-      inventory: partialInventory(override),
-      nowMs: INVENTORY_NOW,
-    })).rejects.toThrow(expected);
-  });
-
-  it("rejects inventory node/model tampering and mismatched object-info evidence", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    const nodeTampered = partialInventory();
-    nodeTampered.nodeClasses = nodeTampered.nodeClasses.slice(1);
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: nodeTampered, nowMs: INVENTORY_NOW })).rejects.toThrow(/inventoryDigest/i);
-
-    const modelTampered = partialInventory();
-    modelTampered.models.vae.push("tampered.safetensors");
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: modelTampered, nowMs: INVENTORY_NOW })).rejects.toThrow(/inventoryDigest/i);
-
-    const evidenceMismatch = partialInventory({ objectInfoSha256: "b".repeat(64) });
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: evidenceMismatch, nowMs: INVENTORY_NOW })).rejects.toThrow(/objectInfoSha256/i);
-  });
-
-  it("is byte-for-byte deterministic and never leaks the absolute Pixelle path", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
-    const firstBytes = await Promise.all(first.packages.flatMap(({ packageDir }) =>
-      ["workflow.api.json", "manifest.json", "compiled-bindings.json", "package.lock.json"].map((file) => fs.readFile(path.join(packageDir, file))),
-    ));
-    const second = await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
-    const secondBytes = await Promise.all(second.packages.flatMap(({ packageDir }) =>
-      ["workflow.api.json", "manifest.json", "compiled-bindings.json", "package.lock.json"].map((file) => fs.readFile(path.join(packageDir, file))),
-    ));
-    expect(secondBytes.map(String)).toEqual(firstBytes.map(String));
-    expect(secondBytes.map(String).join("\n")).not.toContain(path.resolve(root));
-  });
-
-  it.each([
-    ["UI graph", { nodes: [] }, /API graph|numeric node IDs/i],
-    ["missing required node", { ...indexWorkflow(), "5": undefined }, /required node|IndexTTS2BaseNode/i],
-    ["missing save output", { ...indexWorkflow(), "8": undefined }, /save output|SaveAudio/i],
-  ])("rejects %s", async (_label, invalidWorkflow, expected) => {
-    const sanitized = Object.fromEntries(Object.entries(invalidWorkflow as Record<string, unknown>).filter(([, value]) => value !== undefined));
-    const { root, stagingDir } = await makePixelleTree({ "tts_index2.json": sanitized });
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(expected);
-  });
-
-  it("rejects missing and duplicate title/class selectors", async () => {
-    const missing = indexWorkflow();
-    (missing["3"] as { _meta: { title: string } })._meta.title = "$wrong.value!";
-    let tree = await makePixelleTree({ "tts_index2.json": missing });
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.root, stagingDir: tree.stagingDir })).rejects.toThrow(/selector.*found 0|exactly one/i);
-
-    const duplicate = indexWorkflow();
-    duplicate["14"] = node("PrimitiveStringMultiline", "$text.value!", { value: "duplicate" });
-    tree = await makePixelleTree({ "tts_index2.json": duplicate });
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.root, stagingDir: tree.stagingDir })).rejects.toThrow(/selector.*found 2|exactly one/i);
-  });
-
-  it("refuses a source workflow directory junction that escapes PIXELLE_ROOT", async () => {
-    const outer = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-pixelle-outer-"));
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-pixelle-root-"));
-    const stagingDir = `${root}-staging`;
-    temporaryDirectories.push(outer, root, stagingDir);
-    await fs.mkdir(path.join(root, "workflows"), { recursive: true });
-    await fs.symlink(outer, path.join(root, "workflows", "selfhost"), "junction");
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/escape|symbolic|junction/i);
-  });
-
-  it("requires explicit, distinct roots before cleaning output", async () => {
-    const { root } = await makePixelleTree();
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: root })).rejects.toThrow(/staging|distinct|Pixelle/i);
-    expect(await fs.stat(path.join(root, "workflows", "selfhost", "tts_index2.json"))).toBeTruthy();
-  });
-
-  it("refuses unmanaged existing staging directories, including empty ones", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    await fs.mkdir(stagingDir);
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/ownership marker|unmanaged/i);
-    await fs.writeFile(path.join(stagingDir, "sentinel.txt"), "keep", "utf8");
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/ownership marker|unmanaged/i);
-    expect(await fs.readFile(path.join(stagingDir, "sentinel.txt"), "utf8")).toBe("keep");
-  });
-
-  it("rejects forged or path-mismatched ownership markers without deleting staging", async () => {
-    const { root, stagingDir } = await makePixelleTree();
-    await fs.mkdir(stagingDir);
-    await fs.writeFile(path.join(stagingDir, "sentinel.txt"), "keep", "utf8");
-    await fs.writeFile(path.join(stagingDir, STAGING_MARKER), JSON.stringify({
-      schemaVersion: 1,
-      producer: "ai-m/pixelle-single-backend",
-      canonicalStagingPath: `${path.resolve(stagingDir)}-forged`,
-    }), "utf8");
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/marker|path|ownership/i);
-    expect(await fs.readFile(path.join(stagingDir, "sentinel.txt"), "utf8")).toBe("keep");
-  });
-
-  it("keeps the previous owned staging intact when writing the replacement fails", async () => {
-    const { root, workflowDir, stagingDir } = await makePixelleTree();
-    await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
-    const oldWorkflow = await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"));
+  it("keeps old generations after source content changes", async () => {
+    const { pixelleRoot, sourceDir, stagingDir } = await makeTree();
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     const changed = indexWorkflow();
     (changed["3"] as { inputs: { value: string } }).inputs.value = "changed";
-    await fs.writeFile(path.join(workflowDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+    await fs.writeFile(path.join(sourceDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+    const second = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    expect(second.generationDigest).not.toBe(first.generationDigest);
+    expect((await fs.readdir(path.join(stagingDir, "generations"))).sort()).toEqual([first.generationDigest, second.generationDigest].sort());
+  });
+
+  it("rejects unmanaged existing staging without touching it", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await fs.mkdir(stagingDir);
+    await fs.writeFile(path.join(stagingDir, "sentinel"), "keep", "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir })).rejects.toThrow(/unmanaged|marker/i);
+    expect(await fs.readFile(path.join(stagingDir, "sentinel"), "utf8")).toBe("keep");
+  });
+
+  it("takes a coherent six-file snapshot and rejects same-file or cross-file changes", async () => {
+    let tree = await makeTree();
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir,
+      afterSourceFileRead: async (name) => {
+        if (name === "tts_index2.json") await fs.writeFile(path.join(tree.sourceDir, name), JSON.stringify(indexWorkflow(true)), "utf8");
+      },
+    })).rejects.toThrow(/source snapshot changed/i);
+
+    tree = await makeTree();
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir,
+      afterSourceFileRead: async (_name, index) => {
+        if (index === 3) await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(indexWorkflow(true)), "utf8");
+      },
+    })).rejects.toThrow(/source snapshot changed/i);
+  });
+
+  it("enforces per-file, total and JSON-depth bounds before workflow validation", async () => {
+    let tree = await makeTree();
+    const oversized = { ...indexWorkflow(), "99": node("PrimitiveStringMultiline", "Padding", { value: "x".repeat(5 * 1024 * 1024) }) };
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(oversized), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir })).rejects.toThrow(/5 MiB|size limit/i);
+
+    tree = await makeTree();
+    let nested: unknown = "x";
+    for (let index = 0; index < 70; index += 1) nested = [nested];
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(nested), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir })).rejects.toThrow(/depth/i);
+  });
+
+  it("holds an exclusive prepare.lock so a concurrent prepare fails locked", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const first = preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, afterLockAcquired: async () => { entered(); await releasePromise; } });
+    await enteredPromise;
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir })).rejects.toThrow(/locked|prepare\.lock/i);
+    release();
+    await expect(first).resolves.toMatchObject({ state: "prepared-environment-unverified" });
+  });
+
+  it("enforces prepare.lock across two operating-system processes", async () => {
+    const { root, pixelleRoot, stagingDir } = await makeTree();
+    const helperPath = path.join(root, "prepare-child.mts");
+    const moduleUrl = pathToFileURL(path.resolve("scripts/prepare-pixelle-single-backend.ts")).href;
+    await fs.writeFile(helperPath, `
+      import { preparePixelleSingleBackendPackages } from ${JSON.stringify(moduleUrl)};
+      try {
+        await preparePixelleSingleBackendPackages({
+          pixelleRoot: process.env.PIXELLE_ROOT!,
+          stagingDir: process.env.STAGING_DIR!,
+          afterLockAcquired: async () => new Promise((resolve) => setTimeout(resolve, Number(process.env.HOLD_MS ?? 0))),
+        });
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+    `, "utf8");
+    const runChild = (holdMs: number) => {
+      const child = spawn(process.execPath, ["--import", "tsx", helperPath], {
+        cwd: process.cwd(),
+        env: { ...process.env, PIXELLE_ROOT: pixelleRoot, STAGING_DIR: stagingDir, HOLD_MS: String(holdMs) },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      return { child, done: new Promise<{ code: number | null; stderr: string }>((resolve) => child.once("close", (code) => resolve({ code, stderr }))) };
+    };
+    const first = runChild(1_000);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (await fs.stat(path.join(stagingDir, "prepare.lock")).then(() => true, () => false)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(await fs.stat(path.join(stagingDir, "prepare.lock"))).toBeTruthy();
+    const second = runChild(0);
+    const secondResult = await second.done;
+    const firstResult = await first.done;
+    expect(firstResult.code).toBe(0);
+    expect(secondResult.code).toBe(1);
+    expect(secondResult.stderr).toMatch(/locked|prepare\.lock/i);
+  }, 10_000);
+
+  it("recovers a stale dead-pid lock by token-preserving rename but refuses live or uncertain locks", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const lockPath = path.join(stagingDir, "prepare.lock");
+    const stale = { schemaVersion: 1, pid: 999999, token: "a".repeat(32), startedAtMs: 1_000 };
+    await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => false })).resolves.toBeTruthy();
+    expect((await fs.readdir(stagingDir)).some((name) => name.startsWith("prepare.lock.stale."))).toBe(true);
+
+    await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => true })).rejects.toThrow(/locked|alive/i);
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => "unknown" })).rejects.toThrow(/locked|uncertain/i);
+  });
+
+  it("stops publishing and releases a lock only when its token still matches", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot, stagingDir,
+      afterLockAcquired: async () => {
+        await fs.writeFile(path.join(stagingDir, "prepare.lock"), JSON.stringify({ schemaVersion: 1, pid: process.pid, token: "f".repeat(32), startedAtMs: Date.now() }), "utf8");
+      },
+    })).rejects.toThrow(/ownership was lost/i);
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, "prepare.lock"), "utf8")).token).toBe("f".repeat(32));
+    await expect(fs.stat(path.join(stagingDir, "current.json"))).rejects.toThrow();
+  });
+
+  it("leaves a marked current-token temp orphan on write failure and reports it later", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     let writes = 0;
     await expect(preparePixelleSingleBackendPackages({
-      pixelleRoot: root,
-      stagingDir,
+      pixelleRoot, stagingDir,
       writeBytes: async (...args: Parameters<typeof fs.writeFile>) => {
         writes += 1;
-        if (writes === 3) throw new Error("injected write failure");
+        if (writes === 2) throw new Error("injected generation write failure");
         return fs.writeFile(...args);
       },
-    })).rejects.toThrow(/injected write failure/);
-    expect(await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"))).toEqual(oldWorkflow);
-    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8")).canonicalStagingPath).toBe(path.resolve(stagingDir));
-  });
-
-  it("rejects the repository root and user profile before touching their contents", async () => {
-    const { root } = await makePixelleTree();
-    const packageBefore = await fs.readFile(path.resolve("package.json"));
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: path.resolve(".") })).rejects.toThrow(/repository|dangerous|staging/i);
-    expect(await fs.readFile(path.resolve("package.json"))).toEqual(packageBefore);
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: os.homedir() })).rejects.toThrow(/user profile|dangerous|staging/i);
-  });
-
-  it("keeps committed new staging when owned backup cleanup partially fails", async () => {
-    const { root, workflowDir, stagingDir } = await makePixelleTree();
-    await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
-    const changed = indexWorkflow();
-    (changed["3"] as { inputs: { value: string } }).inputs.value = "committed-new";
-    await fs.writeFile(path.join(workflowDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
-
-    const result = await preparePixelleSingleBackendPackages({
-      pixelleRoot: root,
-      stagingDir,
-      removeOwnedBackup: async (backupDir: string) => {
-        await fs.rm(path.join(backupDir, "tts-index2"), { recursive: true });
-        throw new Error("injected partial backup cleanup failure");
-      },
-    });
-    expect(result.cleanupWarnings).toEqual([expect.stringMatching(/partial backup cleanup failure/i)]);
-    expect(await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"), "utf8")).toContain("committed-new");
-    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8")).canonicalStagingPath).toBe(path.resolve(stagingDir));
-    const orphans = (await fs.readdir(path.dirname(stagingDir))).filter((name) => name.startsWith(`${path.basename(stagingDir)}.ai-m-backup-`));
-    expect(orphans).toHaveLength(1);
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/orphan backup|cleanup/i);
-    await fs.rm(path.join(path.dirname(stagingDir), orphans[0]), { recursive: true });
-  });
-
-  it("deletes owned backup contents before its ownership marker", async () => {
-    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-owned-backup-"));
-    temporaryDirectories.push(parent);
-    const canonicalStagingPath = path.join(parent, "staging");
-    const backupDir = path.join(parent, "staging.ai-m-backup-test");
-    await fs.mkdir(path.join(backupDir, "a"), { recursive: true });
-    await fs.mkdir(path.join(backupDir, "b"), { recursive: true });
-    await fs.writeFile(path.join(backupDir, STAGING_MARKER), JSON.stringify({
-      schemaVersion: 1,
-      producer: "ai-m/pixelle-single-backend",
-      canonicalStagingPath,
-    }), "utf8");
-    let removals = 0;
-    await expect(cleanupOwnedBackupDirectory(backupDir, canonicalStagingPath, async (target) => {
-      removals += 1;
-      if (removals === 2) throw new Error("injected child cleanup failure");
-      await fs.rm(target, { recursive: true });
-    })).rejects.toThrow(/injected child cleanup failure/);
-    expect(await fs.stat(path.join(backupDir, STAGING_MARKER))).toBeTruthy();
+    })).rejects.toThrow(/injected generation write failure/);
+    const temps = (await fs.readdir(stagingDir)).filter((name) => name.startsWith(".tmp-generation-"));
+    expect(temps).toHaveLength(1);
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, temps[0], TEMP_MARKER), "utf8")).token).toBeTruthy();
+    const next = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    expect(next.orphanTempCount).toBe(1);
+    expect((await fs.readdir(stagingDir)).filter((name) => name.startsWith(".tmp-generation-"))).toEqual(temps);
   });
 });
