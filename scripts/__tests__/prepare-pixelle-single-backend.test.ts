@@ -682,4 +682,73 @@ describe("immutable Pixelle workflow preparation", () => {
     sqlite.close();
   });
 
+  it.each([
+    { phase: "intent" as const, event: "entry-fsync" as const },
+    { phase: "intent" as const, event: "head-temp-fsync" as const },
+    { phase: "committed" as const, event: "head-rename" as const },
+  ])("rolls the signed audit journal forward after $phase/$event crashes and repeats recovery idempotently", async ({ phase, event }) => {
+    const tree = await makeTree();
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
+    const auditKey = Buffer.alloc(32, 9);
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = `${phase}-${event}`;
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    let injected = false;
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      afterAuditDurabilityEvent: async (actualPhase, actualEvent) => {
+        if (!injected && actualPhase === phase && actualEvent === event) {
+          injected = true;
+          throw new Error(`injected ${phase}/${event} crash`);
+        }
+      },
+    })).rejects.toThrow(/injected/);
+    expect(injected).toBe(true);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).resolves.toMatchObject({ quarantined: true, recovered: true });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).resolves.toMatchObject({ quarantined: true, recovered: true });
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey, auditAnchor })).resolves.toMatchObject({ valid: true, entries: 2 });
+    expect((await fs.readdir(path.join(tree.stagingDir, "audit"))).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    sqlite.close();
+  });
+
+  it("isolates an inconsistent pending audit tail instead of rolling it forward", async () => {
+    const tree = await makeTree();
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
+    const auditKey = Buffer.alloc(32, 10);
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "tampered-tail";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      afterAuditDurabilityEvent: async (phase, event) => {
+        if (phase === "intent" && event === "entry-fsync") throw new Error("injected tail crash");
+      },
+    })).rejects.toThrow(/injected tail crash/);
+    const auditDir = path.join(tree.stagingDir, "audit");
+    const tail = (await fs.readdir(auditDir)).find((name) => name.startsWith("gc-"))!;
+    await fs.appendFile(path.join(auditDir, tail), " ");
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).rejects.toThrow(/isolat|recovery.*blocked/i);
+    expect((await fs.readdir(path.join(tree.stagingDir, "audit-recovery-quarantine"))).length).toBeGreaterThan(0);
+    sqlite.close();
+  });
+
 });

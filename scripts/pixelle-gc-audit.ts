@@ -121,6 +121,7 @@ export async function productionPixelleGcAuditAnchor(): Promise<SqlitePixelleGcA
 
 export interface AuditOptions { stagingDir: string; auditKey?: Buffer; auditAnchor?: SqlitePixelleGcAuditAnchor }
 type FileEntry = GcAuditPayload & { schemaVersion: 2; sequence: number; previousDigest: string | null; phase: Phase; transactionId: string; producer: string; entryDigest: string; signature: string };
+export type AuditDurabilityEvent = "entry-fsync" | "head-temp-fsync" | "head-rename";
 
 function jsonBytes(value: unknown): Buffer { return Buffer.from(`${canonicalize(value)}\n`, "utf8"); }
 function digest(value: unknown): string { return createHash("sha256").update(canonicalize(value)).digest("hex"); }
@@ -147,6 +148,115 @@ async function readCanonical(file: string): Promise<Record<string, unknown>> {
 }
 async function syncFile(file: string): Promise<void> { const handle = await fs.open(file, "r+"); try { await handle.sync(); } finally { await handle.close(); } }
 
+function validateFileEntry(value: Record<string, unknown>, index: number, previousDigest: string | null, key: Buffer): FileEntry {
+  const { signature: actualSignature, entryDigest, ...payload } = value;
+  if (payload.schemaVersion !== 2 || payload.sequence !== index + 1 || payload.previousDigest !== previousDigest
+    || !["intent", "committed"].includes(String(payload.phase)) || typeof payload.transactionId !== "string") throw new Error("GC audit hash chain is broken");
+  const expectedDigest = digest(payload);
+  if (entryDigest !== expectedDigest) throw new Error("GC audit entry digest is invalid");
+  verifyHmac(actualSignature, { ...payload, entryDigest }, key);
+  return value as unknown as FileEntry;
+}
+
+function validateHead(value: Record<string, unknown>, count: number, lastDigest: string | null, key: Buffer): void {
+  const { signature: headSignature, ...headPayload } = value;
+  if (headPayload.schemaVersion !== 2 || headPayload.count !== count || headPayload.lastDigest !== lastDigest) throw new Error("GC audit head detects truncation or reordering");
+  verifyHmac(headSignature, headPayload, key);
+}
+
+async function isolateAuditRecoveryTail(
+  stagingDir: string,
+  auditDir: string,
+  entryNames: string[],
+  tempNames: string[],
+  pending: GcAnchorEvent,
+  cause: unknown,
+): Promise<never> {
+  const expectedSequences = new Set([pending.sequence * 2 - 1, pending.sequence * 2]);
+  const candidates = entryNames.filter((name) => expectedSequences.has(Number(name.slice(3, 11))));
+  if (!candidates.length && !tempNames.length) throw cause;
+  const token = randomBytes(16).toString("hex");
+  const quarantineRoot = path.join(path.resolve(stagingDir), "audit-recovery-quarantine", `${pending.transactionId}-${token}`);
+  await fs.mkdir(quarantineRoot, { recursive: true });
+  for (const name of [...candidates, ...tempNames]) {
+    await fs.rename(path.join(auditDir, name), path.join(quarantineRoot, name)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+  const marker = path.join(auditDir, `recovery-blocked.${pending.transactionId}.json`);
+  await fs.writeFile(marker, jsonBytes({
+    schemaVersion: 1,
+    transactionId: pending.transactionId,
+    reason: "signed audit tail did not match the pending database intent",
+  }), { flag: "wx" });
+  throw new Error("GC audit recovery isolated an inconsistent tail and is blocked for manual review", { cause });
+}
+
+export async function recoverPixelleGcAuditJournal(options: Omit<AuditOptions, "auditAnchor"> & { pending: GcAnchorEvent }): Promise<void> {
+  const key = await keyFor(options.auditKey);
+  const auditDir = path.join(path.resolve(options.stagingDir), "audit");
+  const names: string[] = await fs.readdir(auditDir).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] as string[] : Promise.reject(error));
+  if (!names.length) return;
+  const entryNames = names.filter((name) => /^gc-\d{8}-[a-f0-9]{32}\.json$/.test(name)).sort();
+  const tempNames = names.filter((name) => /^head\.[a-f0-9]{32}\.tmp$/.test(name));
+  const unknown = names.filter((name) => name !== "head.json" && !entryNames.includes(name) && !tempNames.includes(name));
+  if (unknown.length || tempNames.length > 1) throw new Error("GC audit recovery found unfamiliar or ambiguous journal files");
+  const entries: FileEntry[] = [];
+  let previousDigest: string | null = null;
+  try {
+    for (let index = 0; index < entryNames.length; index += 1) {
+      const entry = validateFileEntry(await readCanonical(path.join(auditDir, entryNames[index])), index, previousDigest, key);
+      entries.push(entry);
+      previousDigest = entry.entryDigest;
+    }
+  } catch (error) {
+    await isolateAuditRecoveryTail(options.stagingDir, auditDir, entryNames, tempNames, options.pending, error);
+  }
+  let headCount = 0;
+  let headDigest: string | null = null;
+  if (names.includes("head.json")) {
+    const head = await readCanonical(path.join(auditDir, "head.json"));
+    const payload = { ...head };
+    delete payload.signature;
+    if (!Number.isSafeInteger(payload.count) || (payload.count as number) < 0 || (payload.count as number) > entries.length) throw new Error("GC audit recovery head count is invalid");
+    headCount = payload.count as number;
+    headDigest = headCount ? entries[headCount - 1].entryDigest : null;
+    validateHead(head, headCount, headDigest, key);
+  }
+  if (entries.length < headCount || entries.length - headCount > 1) throw new Error("GC audit recovery requires exactly one or zero trailing entries");
+  const trailing = entries[headCount];
+  const trailingIdentityInvalid = trailing && (trailing.transactionId !== options.pending.transactionId
+    || canonicalize({ ...options.pending.payload }) !== canonicalize({
+      actor: trailing.actor, generationDigest: trailing.generationDigest, packageDigests: trailing.packageDigests,
+      currentGenerationDigest: trailing.currentGenerationDigest, quarantinedBytes: trailing.quarantinedBytes,
+      quarantineName: trailing.quarantineName, reviewedAtMs: trailing.reviewedAtMs,
+    }));
+  const trailingSequenceInvalid = trailing && (trailing.phase === "intent"
+    ? trailing.previousDigest !== options.pending.previousFileDigest
+    : headCount < 1 || entries[headCount - 1].phase !== "intent" || entries[headCount - 1].transactionId !== trailing.transactionId);
+  if (trailingIdentityInvalid || trailingSequenceInvalid) {
+    await isolateAuditRecoveryTail(options.stagingDir, auditDir, entryNames, tempNames, options.pending,
+      new Error("GC audit trailing entry is not bound to the pending database intent"));
+  }
+  if (tempNames.length) {
+    try {
+      const tempHead = await readCanonical(path.join(auditDir, tempNames[0]));
+      validateHead(tempHead, entries.length, previousDigest, key);
+    } catch (error) {
+      await isolateAuditRecoveryTail(options.stagingDir, auditDir, entryNames, tempNames, options.pending, error);
+    }
+  }
+  if (trailing) {
+    const token = randomBytes(16).toString("hex");
+    const headPayload = { schemaVersion: 2, count: entries.length, lastDigest: previousDigest };
+    const rollForwardTemp = path.join(auditDir, `head.${token}.tmp`);
+    await fs.writeFile(rollForwardTemp, jsonBytes({ ...headPayload, signature: signature(headPayload, key) }), { flag: "wx" });
+    await syncFile(rollForwardTemp);
+    await fs.rename(rollForwardTemp, path.join(auditDir, "head.json"));
+  }
+  for (const tempName of tempNames) await fs.unlink(path.join(auditDir, tempName)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+}
+
 async function inspectChain(options: Omit<AuditOptions, "auditAnchor">): Promise<{ entries: FileEntry[]; lastDigest: string | null }> {
   const key = await keyFor(options.auditKey);
   const auditDir = path.join(path.resolve(options.stagingDir), "audit");
@@ -168,20 +278,12 @@ async function inspectChain(options: Omit<AuditOptions, "auditAnchor">): Promise
   const entries: FileEntry[] = [];
   let previousDigest: string | null = null;
   for (let index = 0; index < files.length; index += 1) {
-    const value = await readCanonical(path.join(auditDir, files[index]));
-    const { signature: actualSignature, entryDigest, ...payload } = value;
-    if (payload.schemaVersion !== 2 || payload.sequence !== index + 1 || payload.previousDigest !== previousDigest
-      || !["intent", "committed"].includes(String(payload.phase)) || typeof payload.transactionId !== "string") throw new Error("GC audit hash chain is broken");
-    const expectedDigest = digest(payload);
-    if (entryDigest !== expectedDigest) throw new Error("GC audit entry digest is invalid");
-    verifyHmac(actualSignature, { ...payload, entryDigest }, key);
-    previousDigest = expectedDigest;
-    entries.push(value as unknown as FileEntry);
+    const entry = validateFileEntry(await readCanonical(path.join(auditDir, files[index])), index, previousDigest, key);
+    previousDigest = entry.entryDigest;
+    entries.push(entry);
   }
   const head = await readCanonical(path.join(auditDir, "head.json"));
-  const { signature: headSignature, ...headPayload } = head;
-  if (headPayload.schemaVersion !== 2 || headPayload.count !== entries.length || headPayload.lastDigest !== previousDigest) throw new Error("GC audit head detects truncation or reordering");
-  verifyHmac(headSignature, headPayload, key);
+  validateHead(head, entries.length, previousDigest, key);
   return { entries, lastDigest: previousDigest };
 }
 
@@ -203,7 +305,12 @@ export async function getPixelleGcAuditEntries(options: Omit<AuditOptions, "audi
   return (await inspectChain(options)).entries;
 }
 
-export async function appendPixelleGcAudit(options: Omit<AuditOptions, "auditAnchor"> & { payload: GcAuditPayload; phase: Phase; transactionId: string }): Promise<{ auditFile: string; entryDigest: string }> {
+export async function appendPixelleGcAudit(options: Omit<AuditOptions, "auditAnchor"> & {
+  payload: GcAuditPayload;
+  phase: Phase;
+  transactionId: string;
+  afterDurabilityEvent?: (phase: Phase, event: AuditDurabilityEvent) => Promise<void>;
+}): Promise<{ auditFile: string; entryDigest: string }> {
   const key = await keyFor(options.auditKey);
   const state = await inspectChain(options);
   const existing = state.entries.find((entry) => entry.transactionId === options.transactionId && entry.phase === options.phase);
@@ -219,10 +326,13 @@ export async function appendPixelleGcAudit(options: Omit<AuditOptions, "auditAnc
   const entryPath = path.join(auditDir, auditFile);
   await fs.writeFile(entryPath, jsonBytes(entry), { flag: "wx" });
   await syncFile(entryPath);
+  await options.afterDurabilityEvent?.(options.phase, "entry-fsync");
   const headPayload = { schemaVersion: 2, count: sequence, lastDigest: entryDigest };
   const headTemp = path.join(auditDir, `head.${token}.tmp`);
   await fs.writeFile(headTemp, jsonBytes({ ...headPayload, signature: signature(headPayload, key) }), { flag: "wx" });
   await syncFile(headTemp);
+  await options.afterDurabilityEvent?.(options.phase, "head-temp-fsync");
   await fs.rename(headTemp, path.join(auditDir, "head.json"));
+  await options.afterDurabilityEvent?.(options.phase, "head-rename");
   return { auditFile, entryDigest };
 }

@@ -24,18 +24,60 @@ describe("Pixelle production trust store", () => {
   });
 
   it.runIf(process.platform === "win32")("provisions and verifies owner-only Windows keys plus protected fingerprint metadata", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-trust-"));
-    roots.push(root);
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-trust-"));
+    roots.push(parent);
+    const root = path.join(parent, "trust");
     const paths = await provisionPixelleTrustStore({ root });
     await expect(verifyPixelleTrustStore({ root })).resolves.toMatchObject({ valid: true });
     const metadata = JSON.parse(await fs.readFile(paths.metadata, "utf8")) as { publicKeySha256: string };
     expect(metadata.publicKeySha256).toMatch(/^[a-f0-9]{64}$/);
     await execFileAsync("icacls.exe", [paths.metadata, "/remove:g", "*S-1-5-18"], { windowsHide: true });
     await expect(verifyPixelleTrustStore({ root })).rejects.toThrow(/DACL|SYSTEM|ACL/i);
-    await provisionPixelleTrustStore({ root });
+    await expect(provisionPixelleTrustStore({ root })).rejects.toThrow(/DACL|SYSTEM|ACL/i);
+    await execFileAsync("icacls.exe", [paths.metadata, "/grant:r", "*S-1-5-18:(F)"], { windowsHide: true });
     await fs.writeFile(paths.metadata, JSON.stringify({ ...metadata, publicKeySha256: "0".repeat(64) }));
     await expect(verifyPixelleTrustStore({ root })).rejects.toThrow(/fingerprint|metadata/i);
+  }, 45_000);
+
+  it.runIf(process.platform === "win32")("writes no keys through an existing junction or an invalid target ACL", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-trust-target-"));
+    roots.push(parent);
+    const victim = path.join(parent, "victim");
+    const junction = path.join(parent, "trust");
+    await fs.mkdir(victim);
+    await fs.symlink(victim, junction, "junction");
+    await expect(provisionPixelleTrustStore({ root: junction })).rejects.toThrow(/reparse|junction|regular|DACL/i);
+    expect(await fs.readdir(victim)).toEqual([]);
+
+    const valid = path.join(parent, "valid");
+    const paths = await provisionPixelleTrustStore({ root: valid });
+    const originalPrivate = await fs.readFile(paths.privateKey);
+    await execFileAsync("icacls.exe", [valid, "/grant", "*S-1-5-32-545:(R)"], { windowsHide: true });
+    await expect(provisionPixelleTrustStore({ root: valid })).rejects.toThrow(/DACL|ACL/i);
+    expect(await fs.readFile(paths.privateKey)).toEqual(originalPrivate);
+  }, 20_000);
+
+  it.runIf(process.platform === "win32")("cleans its private temporary root on atomic rename failure", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-trust-rename-"));
+    roots.push(parent);
+    const root = path.join(parent, "trust");
+    await expect(provisionPixelleTrustStore({
+      root,
+      renameRoot: async () => { throw new Error("injected trust rename failure"); },
+    })).rejects.toThrow(/injected trust rename failure/);
+    await expect(fs.lstat(root)).rejects.toThrow();
+    expect((await fs.readdir(parent)).filter((name) => name.includes("provision"))).toEqual([]);
   }, 15_000);
+
+  it.runIf(process.platform === "win32")("publishes exactly one valid root under concurrent provisioning", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-trust-race-"));
+    roots.push(parent);
+    const root = path.join(parent, "trust");
+    const results = await Promise.allSettled([provisionPixelleTrustStore({ root }), provisionPixelleTrustStore({ root })]);
+    expect(results.filter((result) => result.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
+    await expect(verifyPixelleTrustStore({ root })).resolves.toMatchObject({ valid: true });
+    expect((await fs.readdir(parent)).filter((name) => name.includes("provision"))).toEqual([]);
+  }, 30_000);
 
   it("rejects oversized evidence before JSON parsing", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "pixelle-evidence-"));

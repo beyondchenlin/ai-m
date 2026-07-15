@@ -32,11 +32,12 @@ async function currentWindowsSid(): Promise<string> {
   return sid;
 }
 
-async function protectAcl(target: string, sid: string, directory: boolean): Promise<void> {
-  const inheritance = directory ? "(OI)(CI)(F)" : "(F)";
-  await execFileAsync("icacls.exe", [target, "/inheritance:r", "/grant:r", `*${sid}:${inheritance}`, `*${SYSTEM_SID}:${inheritance}`], {
-    windowsHide: true, maxBuffer: 64 * 1024,
-  });
+async function setProtectedAcl(target: string, sid: string, directory: boolean): Promise<void> {
+  const encoded = Buffer.from(target, "utf16le").toString("base64");
+  const aclType = directory ? "DirectorySecurity" : "FileSecurity";
+  const inheritance = directory ? "[Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'" : "[Security.AccessControl.InheritanceFlags]::None";
+  const script = `$p=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'));$s=[Security.Principal.SecurityIdentifier]'${sid}';$y=[Security.Principal.SecurityIdentifier]'${SYSTEM_SID}';$a=New-Object Security.AccessControl.${aclType};$a.SetOwner($s);$a.SetAccessRuleProtection($true,$false);$f=[Security.AccessControl.FileSystemRights]::FullControl;$n=[Security.AccessControl.PropagationFlags]::None;$t=[Security.AccessControl.AccessControlType]::Allow;$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($s,$f,${inheritance},$n,$t)));$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($y,$f,${inheritance},$n,$t)));Set-Acl -LiteralPath $p -AclObject $a`;
+  await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, maxBuffer: 64 * 1024 });
 }
 
 type AclSummary = { owner: string; protected: boolean; reparse: boolean; directory: boolean; rules: Array<{ sid: string; inherited: boolean; type: string; rights: string }> };
@@ -46,6 +47,31 @@ async function aclSummary(target: string): Promise<AclSummary> {
   const script = `$p=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}'));$i=Get-Item -LiteralPath $p -Force;$a=Get-Acl -LiteralPath $p;$r=@($a.Access|ForEach-Object{@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;inherited=$_.IsInherited;type=$_.AccessControlType.ToString();rights=$_.FileSystemRights.ToString()}});$o=([System.Security.Principal.NTAccount]$a.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value;@{owner=$o;protected=$a.AreAccessRulesProtected;reparse=[bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint);directory=$i.PSIsContainer;rules=$r}|ConvertTo-Json -Compress -Depth 4`;
   const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, maxBuffer: 64 * 1024 });
   return JSON.parse(stdout) as AclSummary;
+}
+
+async function assertNoReparseComponents(target: string): Promise<void> {
+  const resolved = path.resolve(target);
+  const parsed = path.parse(resolved);
+  let cursor = parsed.root;
+  for (const component of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    const stat = await fs.lstat(cursor).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat) break;
+    if (stat.isSymbolicLink()) throw new Error(`Pixelle trust path contains a junction or reparse point: ${cursor}`);
+  }
+}
+
+function assertAcl(summary: AclSummary, sid: string, name: string, directory: boolean): void {
+  const allowedSids = new Set(summary.rules.map((rule) => rule.sid));
+  if (summary.reparse || summary.directory !== directory) throw new Error(`Pixelle trust ${name} must be regular and have no reparse point`);
+  if (summary.owner !== sid || !summary.protected || summary.rules.length < 1
+    || allowedSids.size !== 2 || !allowedSids.has(sid) || !allowedSids.has(SYSTEM_SID)
+    || summary.rules.some((rule) => rule.inherited || rule.type !== "Allow" || rule.rights !== "FullControl" || ![sid, SYSTEM_SID].includes(rule.sid))) {
+    throw new Error(`Pixelle trust ${name} owner or protected DACL is invalid`);
+  }
 }
 
 async function readRegularBounded(file: string, maximum = MAX_KEY_BYTES): Promise<Buffer> {
@@ -65,15 +91,10 @@ function publicFingerprint(publicPem: Buffer): string {
 export async function verifyPixelleTrustStore(options: { root?: string } = {}): Promise<{ valid: true; publicKeySha256: string }> {
   const paths = pathsFor(options.root ?? PIXELLE_TRUST_PATHS.root);
   const sid = await currentWindowsSid();
+  await assertNoReparseComponents(paths.root);
   for (const [name, target] of Object.entries(paths)) {
     const summary = await aclSummary(target);
-    const allowedSids = new Set(summary.rules.map((rule) => rule.sid));
-    if (summary.reparse || summary.directory !== (name === "root")) throw new Error(`Pixelle trust ${name} must be regular and have no reparse point`);
-    if (summary.owner !== sid || !summary.protected || summary.rules.length < 1
-      || allowedSids.size !== 2 || !allowedSids.has(sid) || !allowedSids.has(SYSTEM_SID)
-      || summary.rules.some((rule) => rule.inherited || rule.type !== "Allow" || rule.rights !== "FullControl" || ![sid, SYSTEM_SID].includes(rule.sid))) {
-      throw new Error(`Pixelle trust ${name} owner or protected DACL is invalid`);
-    }
+    assertAcl(summary, sid, name, name === "root");
   }
   const privatePem = await readRegularBounded(paths.privateKey);
   const publicPem = await readRegularBounded(paths.publicKey);
@@ -93,26 +114,62 @@ export async function verifyPixelleTrustStore(options: { root?: string } = {}): 
   return { valid: true, publicKeySha256: fingerprint };
 }
 
-export async function provisionPixelleTrustStore(options: { root?: string } = {}): Promise<ReturnType<typeof pathsFor>> {
+async function cleanupOwnedTempRoot(tempRoot: string): Promise<void> {
+  const stat = await fs.lstat(tempRoot).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+  if (!stat) return;
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing to clean an unsafe Pixelle trust temporary root");
+  const allowed = new Set(["pixelle-task4-ed25519-private.pem", "pixelle-task4-ed25519-public.pem", "pixelle-gc-audit-hmac.key", "pixelle-trust-metadata.json"]);
+  for (const name of await fs.readdir(tempRoot)) {
+    if (!allowed.has(name)) throw new Error("Refusing to clean an unfamiliar Pixelle trust temporary root");
+    const child = await fs.lstat(path.join(tempRoot, name));
+    if (!child.isFile() || child.isSymbolicLink()) throw new Error("Refusing to clean a linked Pixelle trust temporary file");
+  }
+  await fs.rm(tempRoot, { recursive: true, force: false });
+}
+
+export async function provisionPixelleTrustStore(options: { root?: string; renameRoot?: typeof fs.rename } = {}): Promise<ReturnType<typeof pathsFor>> {
   const paths = pathsFor(options.root ?? PIXELLE_TRUST_PATHS.root);
   const sid = await currentWindowsSid();
-  await fs.mkdir(paths.root, { recursive: true });
-  await protectAcl(paths.root, sid, true);
-  const present = await Promise.all([paths.privateKey, paths.publicKey, paths.auditKey, paths.metadata].map((file) => fs.lstat(file).then(() => true, () => false)));
-  if (present.some(Boolean) && !present.every(Boolean)) throw new Error("Pixelle trust store is partial; refusing to replace or complete keys automatically");
-  if (!present.every(Boolean)) {
+  await assertNoReparseComponents(paths.root);
+  const target = await fs.lstat(paths.root).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+  if (target) {
+    await verifyPixelleTrustStore({ root: paths.root });
+    return paths;
+  }
+  const parent = path.dirname(paths.root);
+  await fs.mkdir(parent, { recursive: true });
+  await assertNoReparseComponents(parent);
+  const token = randomBytes(16).toString("hex");
+  const tempRoot = path.join(parent, `.${path.basename(paths.root)}.provision-${token}`);
+  const tempPaths = pathsFor(tempRoot);
+  let published = false;
+  try {
+    await fs.mkdir(tempRoot);
+    await setProtectedAcl(tempRoot, sid, true);
+    assertAcl(await aclSummary(tempRoot), sid, "temporary root", true);
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
     const privatePem = privateKey.export({ type: "pkcs8", format: "pem" });
     const publicPem = publicKey.export({ type: "spki", format: "pem" });
     const metadata = { schemaVersion: 1, keyId: "pixelle-task4-local-ed25519-v1", publicKeySha256: publicFingerprint(Buffer.from(publicPem)) };
-    await fs.writeFile(paths.privateKey, privatePem, { flag: "wx" });
-    await fs.writeFile(paths.publicKey, publicPem, { flag: "wx" });
-    await fs.writeFile(paths.auditKey, randomBytes(32), { flag: "wx" });
-    await fs.writeFile(paths.metadata, `${canonicalize(metadata)}\n`, { flag: "wx" });
+    await fs.writeFile(tempPaths.privateKey, privatePem, { flag: "wx" });
+    await fs.writeFile(tempPaths.publicKey, publicPem, { flag: "wx" });
+    await fs.writeFile(tempPaths.auditKey, randomBytes(32), { flag: "wx" });
+    await fs.writeFile(tempPaths.metadata, `${canonicalize(metadata)}\n`, { flag: "wx" });
+    for (const file of [tempPaths.privateKey, tempPaths.publicKey, tempPaths.auditKey, tempPaths.metadata]) await setProtectedAcl(file, sid, false);
+    await verifyPixelleTrustStore({ root: tempRoot });
+    try {
+      await (options.renameRoot ?? fs.rename)(tempRoot, paths.root);
+      published = true;
+    } catch (error) {
+      const appeared = await fs.lstat(paths.root).then(() => true, () => false);
+      if (!appeared) throw error;
+      await verifyPixelleTrustStore({ root: paths.root });
+    }
+    await verifyPixelleTrustStore({ root: paths.root });
+    return paths;
+  } finally {
+    if (!published) await cleanupOwnedTempRoot(tempRoot);
   }
-  for (const target of [paths.privateKey, paths.publicKey, paths.auditKey, paths.metadata]) await protectAcl(target, sid, false);
-  await verifyPixelleTrustStore({ root: paths.root });
-  return paths;
 }
 
 export async function loadProductionTask4PublicKey(): Promise<Buffer> {

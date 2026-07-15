@@ -9,6 +9,8 @@ import {
   appendPixelleGcAudit,
   getPixelleGcAuditEntries,
   productionPixelleGcAuditAnchor,
+  recoverPixelleGcAuditJournal,
+  type AuditDurabilityEvent,
   type SqlitePixelleGcAuditAnchor,
   verifyPixelleGcAuditChain,
 } from "./pixelle-gc-audit";
@@ -65,6 +67,7 @@ export interface GarbageCollectOptions {
   auditKey?: Buffer;
   auditAnchor?: SqlitePixelleGcAuditAnchor;
   renameGeneration?: typeof fs.rename;
+  afterAuditDurabilityEvent?: (phase: "intent" | "committed", event: AuditDurabilityEvent) => Promise<void>;
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -1062,6 +1065,7 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
       if (pending.payload.generationDigest !== options.generationDigest || pending.payload.currentGenerationDigest !== current.generationDigest) {
         throw new Error("A different or stale Pixelle GC database intent requires manual recovery");
       }
+      await recoverPixelleGcAuditJournal({ stagingDir, auditKey: options.auditKey, pending });
       const entries = await getPixelleGcAuditEntries({ stagingDir, auditKey: options.auditKey });
       if (!entries.some((entry) => entry.transactionId === pending.transactionId && entry.phase === "intent")) {
         await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload: pending.payload, phase: "intent", transactionId: pending.transactionId });
@@ -1088,6 +1092,18 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
       await syncDirectory(stagingDir);
       return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes: pending.payload.quarantinedBytes, auditFile: committedAudit.auditFile, recovered: true };
     }
+    const completed = [...anchorEvents].reverse().find((event) => event.phase === "committed" && event.payload.generationDigest === options.generationDigest);
+    if (completed) {
+      const sourceExists = Boolean(await lstatOrNull(generationRoot));
+      const targetExists = Boolean(await lstatOrNull(quarantineTarget));
+      if (sourceExists || !targetExists) throw new Error("Committed Pixelle GC anchor conflicts with source/quarantine state");
+      for (const [packageName, expectedPackageDigest] of Object.entries(completed.payload.packageDigests)) {
+        await verifyPreparedGenerationPackage({ generationRoot: quarantineTarget, packageName, expectedGenerationDigest: completed.payload.generationDigest, expectedPackageDigest });
+      }
+      if (await measureSafeTree(quarantineTarget) !== completed.payload.quarantinedBytes) throw new Error("Committed Pixelle GC quarantine bytes changed");
+      await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
+      return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes: completed.payload.quarantinedBytes, auditFile: "database-anchor", recovered: true };
+    }
     const generationRaw = JSON.parse(await fs.readFile(path.join(generationRoot, "generation.json"), "utf8")) as unknown;
     if (!isRecord(generationRaw) || !isRecord(generationRaw.packageDigests) || generationRaw.generationDigest !== options.generationDigest) {
       throw new Error("GC target generation metadata is invalid");
@@ -1111,9 +1127,9 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
     const chain = await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
     const transactionId = randomBytes(16).toString("hex");
     const intent = auditAnchor.begin(payload, chain.lastDigest, transactionId);
-    await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "intent", transactionId: intent.transactionId });
+    await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "intent", transactionId: intent.transactionId, afterDurabilityEvent: options.afterAuditDurabilityEvent });
     await (options.renameGeneration ?? fs.rename)(generationRoot, quarantineTarget);
-    const audit = await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "committed", transactionId: intent.transactionId });
+    const audit = await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "committed", transactionId: intent.transactionId, afterDurabilityEvent: options.afterAuditDurabilityEvent });
     auditAnchor.commit(intent, audit.entryDigest);
     await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
     await syncDirectory(path.join(stagingDir, "generations"));
