@@ -59,14 +59,14 @@ type ManagedRuntimeConfig =
 - Create: `src/worker/job-runtime-boundary.ts`
 - Create: `src/worker/__tests__/job-runtime-boundary.test.ts`
 
-- [ ] Write failing tests proving the exact order `execute → artifact/job settlement → release terminal claim → close connections → stop → start → readiness → next claim`.
-- [ ] Add tests proving restart is not entered while the execution promise or output callback is unresolved, and concurrent restart requests coalesce into one lifecycle operation.
-- [ ] Add failure tests: restart failure pauses polling; shutdown aborts readiness; retained/uncertain results remain retained and pause polling even if the process restart succeeds.
-- [ ] Run the new tests and confirm expected RED failures.
-- [ ] Implement a small `JobRuntimeBoundary` state machine with states `ready | running-job | restarting | blocked | stopped`. It receives `execute`, `closeConnections`, and `restart` dependencies and exposes `run(job)` plus `assertReadyToClaim()`.
-- [ ] Initialize the managed controller once after database migrations. When enabled, validate the configured execution backend uses the canonical endpoint and its resource pool capacity is exactly one before polling.
-- [ ] Route `processJob` through the boundary. Only a terminally settled job may return the boundary to `ready`; retained/ownership-lost results set `blocked` and require operator intervention.
-- [ ] Run worker tests, generation worker tests, typecheck, worker build, lint, and diff check; commit `feat(worker): restart managed ComfyUI between jobs`.
+- [x] Write failing tests proving the exact order `execute → artifact/job terminal persistence → close connections → stop → start → readiness → release resource slot → release terminal claim → next claim`.
+- [x] Add tests proving restart is not entered while the execution promise or output callback is unresolved, and concurrent lifecycle requests are explicitly rejected rather than interleaved.
+- [x] Add failure tests: restart failure pauses polling; shutdown aborts readiness; retained/uncertain results remain retained and fail-stop without erasing reconciliation evidence.
+- [x] Run the new tests and confirm expected RED failures.
+- [x] Implement a small `JobRuntimeBoundary` state machine with states `ready | running-job | restarting | blocked | stopped`. It receives `execute`, `closeConnections`, and `restart` dependencies and exposes `run(job)` plus `assertReadyToClaim()`.
+- [x] Initialize the managed controller once after database migrations. When enabled, validate the configured execution backend uses the canonical endpoint and its resource pool capacity and physical slot cardinality are exactly one before polling and before each job.
+- [x] Route `processJob` through the boundary. Only a terminally settled job may return the boundary to `ready`; retained/ownership-lost results fail-stop with their claim and resource evidence retained for recovery.
+- [x] Run worker tests, generation worker tests, typecheck, worker build, lint, and diff check; commit `feat(worker): restart managed ComfyUI between jobs`.
 
 ### Task 3: Build reviewed workflow packages from Pixelle API workflows
 
