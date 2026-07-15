@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 
 const temporaryDirectories: string[] = [];
+const STAGING_MARKER = ".ai-m-pixelle-staging.json";
 
 function node(classType: string, title: string, inputs: Record<string, unknown>) {
   return { class_type: classType, _meta: { title }, inputs };
@@ -86,6 +87,24 @@ async function makePixelleTree(overrides: Record<string, unknown> = {}) {
   return { root, workflowDir, stagingDir };
 }
 
+function partialInventory() {
+  const classes = new Set<string>();
+  for (const workflow of Object.values(workflows)) {
+    for (const item of Object.values(workflow) as Array<{ class_type: string }>) classes.add(item.class_type);
+  }
+  classes.delete("PixelleDurationInput");
+  return {
+    schemaVersion: 1,
+    objectInfo: Object.fromEntries([...classes].map((classType) => [classType, {}])),
+    models: {
+      diffusion_models: ["z_image_turbo_bf16.safetensors"],
+      text_encoders: ["qwen_3_4b.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"],
+      vae: ["ae.safetensors"],
+    },
+    backendFingerprint: { baseUrl: "http://127.0.0.1:8000", objectInfoSha256: "fixture" },
+  };
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
 });
@@ -98,7 +117,17 @@ describe("preparePixelleSingleBackendPackages", () => {
     expect(readme).toContain("D:\\demo1\\Pixelle\\Pixelle");
     expect(readme).toContain("http://127.0.0.1:8000");
     expect(readme).toMatch(/prepare[\s\S]+review[\s\S]+import[\s\S]+promote/i);
-    expect(readme).toContain("prepared-not-imported");
+    expect(readme).toContain("prepared-environment-unverified");
+    for (const name of [
+      "COMFYUI_INVENTORY_FILE", "WORKFLOW_PACKAGE_DIR", "WORKFLOW_IMPORTER_ID", "PROFILE_KEY",
+      "PROFILE_DISPLAY_NAME", "EXECUTION_BACKEND_ID", "PROFILE_CONFIG_FILE", "WORKFLOW_DIGEST",
+      "PROFILE_REVISION_ID", "CONFIRM_WORKFLOW_DIGEST", "CONFIRM_ENVIRONMENT_LOCK_DIGEST",
+      "WORKFLOW_REVIEWER_ID", "ENABLE_BACKEND",
+    ]) expect(readme).toContain(name);
+    expect(readme).toContain("PixelleDurationInput");
+    expect(readme).toContain("WanT2V_MasterModel.safetensors");
+    expect(readme).toContain("wan_2.1_vae.safetensors");
+    expect(readme).not.toMatch(/workflow:import\s+</);
   });
 
   it("prepares all six real API workflow package types with truthful bindings, outputs, and models", async () => {
@@ -106,6 +135,13 @@ describe("preparePixelleSingleBackendPackages", () => {
     const result = await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
 
     expect(result.packages.map((item) => item.sourceFile)).toEqual(Object.keys(workflows));
+    expect(result.packages.every((item) => item.environmentStatus === "unverified")).toBe(true);
+    expect(result.state).toBe("prepared-environment-unverified");
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8"))).toEqual({
+      schemaVersion: 1,
+      producer: "ai-m/pixelle-single-backend",
+      canonicalStagingPath: path.resolve(stagingDir),
+    });
     const packages = await Promise.all(result.packages.map(async (item) => ({
       item,
       manifest: JSON.parse(await fs.readFile(path.join(item.packageDir, "manifest.json"), "utf8")),
@@ -148,6 +184,32 @@ describe("preparePixelleSingleBackendPackages", () => {
       expect(entry.lock.files).toHaveProperty("manifest.json");
       expect(entry.lock.files).toHaveProperty("compiled-bindings.json");
     }
+  });
+
+  it("marks only inventory-complete candidates validated and reports exact blockers", async () => {
+    const { root, stagingDir } = await makePixelleTree();
+    const result = await preparePixelleSingleBackendPackages({
+      pixelleRoot: root,
+      stagingDir,
+      inventory: partialInventory(),
+    });
+    const bySource = Object.fromEntries(result.packages.map((item) => [item.sourceFile, item]));
+    expect(bySource["tts_index2.json"].environmentStatus).toBe("validated");
+    expect(bySource["tts_index2_8g.json"].environmentStatus).toBe("validated");
+    expect(bySource["tts_omnivoice_longform_bf16.json"].environmentStatus).toBe("validated");
+    expect(bySource["image_z_image_turbo.json"].environmentStatus).toBe("validated");
+    expect(bySource["tts_omnivoice_clone_duration_bf16.json"]).toMatchObject({
+      environmentStatus: "blocked",
+      blockedReasons: ["missing node class: PixelleDurationInput"],
+    });
+    expect(bySource["video_wan2.1_fusionx.json"]).toMatchObject({
+      environmentStatus: "blocked",
+      blockedReasons: [
+        "missing model: diffusion_models/wan-fusionx/WanT2V_MasterModel.safetensors",
+        "missing model: vae/wan_2.1_vae.safetensors",
+      ],
+    });
+    expect(result.state).toBe("prepared-with-environment-blockers");
   });
 
   it("is byte-for-byte deterministic and never leaks the absolute Pixelle path", async () => {
@@ -200,5 +262,56 @@ describe("preparePixelleSingleBackendPackages", () => {
     const { root } = await makePixelleTree();
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: root })).rejects.toThrow(/staging|distinct|Pixelle/i);
     expect(await fs.stat(path.join(root, "workflows", "selfhost", "tts_index2.json"))).toBeTruthy();
+  });
+
+  it("refuses unmanaged existing staging directories, including empty ones", async () => {
+    const { root, stagingDir } = await makePixelleTree();
+    await fs.mkdir(stagingDir);
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/ownership marker|unmanaged/i);
+    await fs.writeFile(path.join(stagingDir, "sentinel.txt"), "keep", "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/ownership marker|unmanaged/i);
+    expect(await fs.readFile(path.join(stagingDir, "sentinel.txt"), "utf8")).toBe("keep");
+  });
+
+  it("rejects forged or path-mismatched ownership markers without deleting staging", async () => {
+    const { root, stagingDir } = await makePixelleTree();
+    await fs.mkdir(stagingDir);
+    await fs.writeFile(path.join(stagingDir, "sentinel.txt"), "keep", "utf8");
+    await fs.writeFile(path.join(stagingDir, STAGING_MARKER), JSON.stringify({
+      schemaVersion: 1,
+      producer: "ai-m/pixelle-single-backend",
+      canonicalStagingPath: `${path.resolve(stagingDir)}-forged`,
+    }), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/marker|path|ownership/i);
+    expect(await fs.readFile(path.join(stagingDir, "sentinel.txt"), "utf8")).toBe("keep");
+  });
+
+  it("keeps the previous owned staging intact when writing the replacement fails", async () => {
+    const { root, workflowDir, stagingDir } = await makePixelleTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
+    const oldWorkflow = await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"));
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "changed";
+    await fs.writeFile(path.join(workflowDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+    let writes = 0;
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: root,
+      stagingDir,
+      writeBytes: async (...args: Parameters<typeof fs.writeFile>) => {
+        writes += 1;
+        if (writes === 3) throw new Error("injected write failure");
+        return fs.writeFile(...args);
+      },
+    })).rejects.toThrow(/injected write failure/);
+    expect(await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"))).toEqual(oldWorkflow);
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8")).canonicalStagingPath).toBe(path.resolve(stagingDir));
+  });
+
+  it("rejects the repository root and user profile before touching their contents", async () => {
+    const { root } = await makePixelleTree();
+    const packageBefore = await fs.readFile(path.resolve("package.json"));
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: path.resolve(".") })).rejects.toThrow(/repository|dangerous|staging/i);
+    expect(await fs.readFile(path.resolve("package.json"))).toEqual(packageBefore);
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: os.homedir() })).rejects.toThrow(/user profile|dangerous|staging/i);
   });
 });

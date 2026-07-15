@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalize, sha256 } from "../src/lib/generation/workflows/canonical";
@@ -10,21 +11,37 @@ import { parseWorkflowPackageLock, verifyLockedFiles } from "../src/lib/generati
 import { applyStaticPolicy, validateWorkflowStructure } from "../src/lib/generation/workflows/validator";
 import type { AuthorBinding, AuthorOutput, ComfyWorkflow, WorkflowManifest } from "../src/lib/generation/workflows/types";
 
-interface PrepareOptions {
+export interface ComfyUIInventory {
+  schemaVersion: 1;
+  objectInfo: Record<string, unknown>;
+  models: Record<string, string[]>;
+  backendFingerprint: Record<string, unknown>;
+}
+
+export interface PrepareOptions {
   pixelleRoot: string;
   stagingDir: string;
+  inventory?: unknown;
+  writeBytes?: typeof fs.writeFile;
 }
 
 interface PreparedPackage {
   sourceFile: string;
   packageDir: string;
   workflowId: string;
+  environmentStatus: "unverified" | "validated" | "blocked";
+  blockedReasons: string[];
 }
 
 export interface PrepareResult {
   stagingDir: string;
   packages: PreparedPackage[];
+  state: "prepared-environment-unverified" | "prepared-environment-validated" | "prepared-with-environment-blockers";
 }
+
+const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
+const STAGING_MARKER_PRODUCER = "ai-m/pixelle-single-backend";
+const STAGING_MARKER_SCHEMA_VERSION = 1;
 
 interface CandidateDefinition {
   sourceFile: string;
@@ -237,6 +254,100 @@ function isInside(parent: string, child: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+async function lstatOrNull(target: string) {
+  try {
+    return await fs.lstat(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function stagingMarker(canonicalStagingPath: string) {
+  return {
+    schemaVersion: STAGING_MARKER_SCHEMA_VERSION,
+    producer: STAGING_MARKER_PRODUCER,
+    canonicalStagingPath,
+  };
+}
+
+async function assertOwnedStaging(directory: string, canonicalStagingPath: string): Promise<void> {
+  const stat = await fs.lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Existing staging is not a safe owned directory");
+  const markerPath = path.join(directory, STAGING_MARKER_FILENAME);
+  const markerStat = await lstatOrNull(markerPath);
+  if (!markerStat || !markerStat.isFile() || markerStat.isSymbolicLink()) {
+    throw new Error("Existing staging is unmanaged: a valid ownership marker is required");
+  }
+  let marker: unknown;
+  try {
+    marker = JSON.parse(await fs.readFile(markerPath, "utf8"));
+  } catch {
+    throw new Error("Existing staging ownership marker is invalid");
+  }
+  const expected = stagingMarker(canonicalStagingPath);
+  if (!isRecord(marker)
+    || Object.keys(marker).sort().join(",") !== Object.keys(expected).sort().join(",")
+    || marker.schemaVersion !== expected.schemaVersion
+    || marker.producer !== expected.producer
+    || marker.canonicalStagingPath !== expected.canonicalStagingPath) {
+    throw new Error("Existing staging ownership marker does not match the canonical staging path");
+  }
+}
+
+function parseInventory(value: unknown): ComfyUIInventory {
+  if (!isRecord(value) || value.schemaVersion !== 1) throw new Error("ComfyUI inventory schemaVersion must equal 1");
+  if (!isRecord(value.objectInfo)) throw new Error("ComfyUI inventory objectInfo must be an object");
+  if (!isRecord(value.models)) throw new Error("ComfyUI inventory models must be an object");
+  if (!isRecord(value.backendFingerprint) || Object.keys(value.backendFingerprint).length === 0) {
+    throw new Error("ComfyUI inventory backendFingerprint must be a non-empty object");
+  }
+  const models: Record<string, string[]> = {};
+  for (const [folder, filenames] of Object.entries(value.models)) {
+    if (!Array.isArray(filenames) || !filenames.every((item) => typeof item === "string" && item.length > 0)) {
+      throw new Error(`ComfyUI inventory models.${folder} must be string[]`);
+    }
+    models[folder] = [...new Set(filenames.map((item) => item.replace(/\\/g, "/")))].sort();
+  }
+  return {
+    schemaVersion: 1,
+    objectInfo: value.objectInfo,
+    models,
+    backendFingerprint: value.backendFingerprint,
+  };
+}
+
+function environmentAssessment(manifest: WorkflowManifest, inventory: ComfyUIInventory | undefined) {
+  if (!inventory) return { environmentStatus: "unverified" as const, blockedReasons: [] as string[] };
+  const blockedReasons: string[] = [];
+  for (const classType of manifest.requirements.nodeClasses) {
+    if (!(classType in inventory.objectInfo)) blockedReasons.push(`missing node class: ${classType}`);
+  }
+  for (const model of manifest.requirements.models) {
+    const filename = model.filename.replace(/\\/g, "/");
+    if (!inventory.models[model.folder]?.includes(filename)) {
+      blockedReasons.push(`missing model: ${model.folder}/${filename}`);
+    }
+  }
+  return blockedReasons.length
+    ? { environmentStatus: "blocked" as const, blockedReasons }
+    : { environmentStatus: "validated" as const, blockedReasons };
+}
+
+async function removeInvocationDirectory(directory: string, parent: string, prefix: string): Promise<void> {
+  if (path.dirname(directory) !== parent || !path.basename(directory).startsWith(prefix)) {
+    throw new Error("Refusing to remove a directory not owned by this invocation");
+  }
+  const stat = await lstatOrNull(directory);
+  if (!stat) return;
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Refusing to remove a linked invocation directory");
+  await fs.rm(directory, { recursive: true, force: false });
+}
+
 async function assertNoSymlinkComponents(target: string, label: string): Promise<void> {
   const resolved = path.resolve(target);
   const parsed = path.parse(resolved);
@@ -308,15 +419,30 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   if (!options.stagingDir?.trim()) throw new Error("PIXELLE_WORKFLOW_STAGING_DIR is required");
   const pixelleRoot = path.resolve(options.pixelleRoot);
   const stagingDir = path.resolve(options.stagingDir);
+  const repositoryRoot = path.resolve(process.cwd());
+  const userProfile = path.resolve(os.homedir());
   const driveRoot = path.parse(stagingDir).root;
   if (stagingDir === driveRoot || isInside(pixelleRoot, stagingDir) || isInside(stagingDir, pixelleRoot)) {
     throw new Error("Staging directory must be a distinct tree outside PIXELLE_ROOT");
   }
+  if (isInside(repositoryRoot, stagingDir) || isInside(stagingDir, repositoryRoot)) {
+    throw new Error("Staging directory must not be the repository root or its parent/child");
+  }
+  if (stagingDir === userProfile || isInside(stagingDir, userProfile)) {
+    throw new Error("Staging directory must not be the user profile or its parent");
+  }
   await assertNoSymlinkComponents(pixelleRoot, "PIXELLE_ROOT");
   await assertNoSymlinkComponents(stagingDir, "staging directory");
+  const stagingParent = path.dirname(stagingDir);
+  await assertNoSymlinkComponents(stagingParent, "staging parent");
+  const parentStat = await fs.lstat(stagingParent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("Staging parent must be an existing regular directory");
   const workflowDir = path.resolve(pixelleRoot, "workflows", "selfhost");
   await assertNoSymlinkComponents(workflowDir, "Pixelle workflows/selfhost");
   if (await fs.realpath(workflowDir) !== workflowDir) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
+  const existingStaging = await lstatOrNull(stagingDir);
+  if (existingStaging) await assertOwnedStaging(stagingDir, stagingDir);
+  const inventory = options.inventory === undefined ? undefined : parseInventory(options.inventory);
 
   const prepared: Array<{
     definition: CandidateDefinition;
@@ -331,52 +457,111 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     prepared.push({ definition, workflow, manifest, compiled });
   }
 
-  await fs.rm(stagingDir, { recursive: true, force: true });
-  await fs.mkdir(stagingDir, { recursive: true });
+  const basename = path.basename(stagingDir);
+  const tempPrefix = `${basename}.ai-m-tmp-`;
+  const tempDir = path.join(stagingParent, `${tempPrefix}${randomUUID()}`);
+  await fs.mkdir(tempDir);
+  const writeBytes = options.writeBytes ?? fs.writeFile;
   const packages: PreparedPackage[] = [];
-  for (const item of prepared) {
-    const packageDir = path.join(stagingDir, item.definition.packageName);
-    await fs.mkdir(packageDir);
-    const workflowBytes = jsonBytes(item.workflow);
-    const manifestBytes = jsonBytes(item.manifest);
-    const compiledBytes = jsonBytes(item.compiled);
-    const fileDigests = {
-      "workflow.api.json": digestBytes(workflowBytes),
-      "manifest.json": digestBytes(manifestBytes),
-      "compiled-bindings.json": digestBytes(compiledBytes),
-    };
-    const packageLock = {
-      schemaVersion: 1,
-      workflowId: item.manifest.workflowId,
-      version: item.manifest.version,
-      files: fileDigests,
-      environmentLockDigest: sha256({
-        requirements: item.manifest.requirements,
-        outputContract: item.manifest.outputs,
-      }),
-    };
-    const parsedLock = parseWorkflowPackageLock(packageLock, item.manifest);
-    verifyLockedFiles(parsedLock, fileDigests);
-    await Promise.all([
-      fs.writeFile(path.join(packageDir, "workflow.api.json"), workflowBytes),
-      fs.writeFile(path.join(packageDir, "manifest.json"), manifestBytes),
-      fs.writeFile(path.join(packageDir, "compiled-bindings.json"), compiledBytes),
-      fs.writeFile(path.join(packageDir, "package.lock.json"), jsonBytes(parsedLock)),
-    ]);
-    packages.push({ sourceFile: item.definition.sourceFile, packageDir, workflowId: item.manifest.workflowId });
+  try {
+    for (const item of prepared) {
+      const tempPackageDir = path.join(tempDir, item.definition.packageName);
+      await fs.mkdir(tempPackageDir);
+      const workflowBytes = jsonBytes(item.workflow);
+      const manifestBytes = jsonBytes(item.manifest);
+      const compiledBytes = jsonBytes(item.compiled);
+      const fileDigests = {
+        "workflow.api.json": digestBytes(workflowBytes),
+        "manifest.json": digestBytes(manifestBytes),
+        "compiled-bindings.json": digestBytes(compiledBytes),
+      };
+      const packageLock = {
+        schemaVersion: 1,
+        workflowId: item.manifest.workflowId,
+        version: item.manifest.version,
+        files: fileDigests,
+        environmentLockDigest: sha256({
+          requirements: item.manifest.requirements,
+          outputContract: item.manifest.outputs,
+        }),
+      };
+      const parsedLock = parseWorkflowPackageLock(packageLock, item.manifest);
+      verifyLockedFiles(parsedLock, fileDigests);
+      const files: Record<string, Buffer> = {
+        "workflow.api.json": workflowBytes,
+        "manifest.json": manifestBytes,
+        "compiled-bindings.json": compiledBytes,
+        "package.lock.json": jsonBytes(parsedLock),
+      };
+      for (const [filename, bytes] of Object.entries(files)) {
+        const destination = path.join(tempPackageDir, filename);
+        await writeBytes(destination, bytes);
+        if (!(await fs.readFile(destination)).equals(bytes)) throw new Error(`Staging write verification failed: ${filename}`);
+      }
+      const assessment = environmentAssessment(item.manifest, inventory);
+      packages.push({
+        sourceFile: item.definition.sourceFile,
+        packageDir: path.join(stagingDir, item.definition.packageName),
+        workflowId: item.manifest.workflowId,
+        ...assessment,
+      });
+    }
+    const markerBytes = jsonBytes(stagingMarker(stagingDir));
+    await writeBytes(path.join(tempDir, STAGING_MARKER_FILENAME), markerBytes);
+    await assertOwnedStaging(tempDir, stagingDir);
+
+    if (!existingStaging) {
+      await fs.rename(tempDir, stagingDir);
+    } else {
+      const backupPrefix = `${basename}.ai-m-backup-`;
+      const backupDir = path.join(stagingParent, `${backupPrefix}${randomUUID()}`);
+      await fs.rename(stagingDir, backupDir);
+      try {
+        await fs.rename(tempDir, stagingDir);
+      } catch (error) {
+        await fs.rename(backupDir, stagingDir);
+        throw error;
+      }
+      try {
+        await assertOwnedStaging(backupDir, stagingDir);
+        await fs.rm(backupDir, { recursive: true, force: false });
+      } catch (error) {
+        if (await lstatOrNull(backupDir)) {
+          await assertOwnedStaging(backupDir, stagingDir);
+          const failedNewPrefix = `${basename}.ai-m-rollback-new-`;
+          const failedNewDir = path.join(stagingParent, `${failedNewPrefix}${randomUUID()}`);
+          await fs.rename(stagingDir, failedNewDir);
+          await fs.rename(backupDir, stagingDir);
+          await removeInvocationDirectory(failedNewDir, stagingParent, failedNewPrefix);
+        }
+        throw error;
+      }
+    }
+  } catch (error) {
+    await removeInvocationDirectory(tempDir, stagingParent, tempPrefix);
+    throw error;
   }
-  return { stagingDir, packages };
+  const state = !inventory
+    ? "prepared-environment-unverified" as const
+    : packages.some((item) => item.environmentStatus === "blocked")
+      ? "prepared-with-environment-blockers" as const
+      : "prepared-environment-validated" as const;
+  return { stagingDir, packages, state };
 }
 
 async function main(): Promise<void> {
+  const inventoryFile = process.env.COMFYUI_INVENTORY_FILE?.trim();
   const result = await preparePixelleSingleBackendPackages({
     pixelleRoot: process.env.PIXELLE_ROOT ?? "",
     stagingDir: process.env.PIXELLE_WORKFLOW_STAGING_DIR ?? "",
+    inventory: inventoryFile ? JSON.parse(await fs.readFile(path.resolve(inventoryFile), "utf8")) : undefined,
   });
   console.log(JSON.stringify({
     stagingDir: result.stagingDir,
-    packages: result.packages.map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
-    state: "prepared-not-imported",
+    state: result.state,
+    validated: result.packages.filter((item) => item.environmentStatus === "validated").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
+    unverified: result.packages.filter((item) => item.environmentStatus === "unverified").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
+    blocked: result.packages.filter((item) => item.environmentStatus === "blocked").map(({ sourceFile, workflowId, blockedReasons }) => ({ sourceFile, workflowId, blockedReasons })),
   }, null, 2));
 }
 
