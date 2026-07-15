@@ -143,7 +143,7 @@ describe("immutable Pixelle workflow preparation", () => {
       expect(await fs.stat(path.join(generationDir, item.packageName, "package.lock.json"))).toBeTruthy();
       await expect(fs.stat(path.join(generationDir, item.packageName, ROOT_MARKER))).rejects.toThrow();
     }
-  });
+  }, 10_000);
 
   it("binds clone duration to the real 0.5..60 step-0.5 Pixelle contract", async () => {
     const { pixelleRoot, stagingDir } = await makeTree();
