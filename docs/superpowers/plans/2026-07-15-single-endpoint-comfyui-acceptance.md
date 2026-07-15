@@ -28,9 +28,9 @@
 - Create: `src/lib/generation/runtime/__tests__/managed-comfyui-runtime.test.ts`
 - Modify: `src/lib/generation/index.ts`
 
-- [ ] Write failing tests for strict environment parsing: disabled by default; enabled mode requires the Pixelle repository root, canonical loopback `8000`, existing fixed `scripts/comfyui/start_backend.ps1` and `stop_backend.ps1`, positive bounded command/ready timeouts, and rejects request/database-selected command paths.
-- [ ] Run `corepack pnpm vitest run src/lib/generation/runtime/__tests__/managed-comfyui-runtime.test.ts` and confirm failures are caused by the missing controller.
-- [ ] Implement `parseManagedComfyUIRuntimeConfig(env)` returning the discriminated union below and export it through `src/lib/generation/index.ts`:
+- [x] Write failing tests for strict environment parsing: disabled by default; enabled mode requires the Pixelle repository root, canonical loopback `8000`, existing fixed `scripts/comfyui/start_backend.ps1` and `stop_backend.ps1`, positive bounded command/ready timeouts, and rejects request/database-selected command paths.
+- [x] Run `corepack pnpm vitest run src/lib/generation/runtime/__tests__/managed-comfyui-runtime.test.ts` and confirm failures are caused by the missing controller.
+- [x] Implement `parseManagedComfyUIRuntimeConfig(env)` returning the discriminated union below and export it through `src/lib/generation/index.ts`:
 
 ```ts
 type ManagedRuntimeConfig =
@@ -46,10 +46,10 @@ type ManagedRuntimeConfig =
     };
 ```
 
-- [ ] Write failing real-process tests using temporary PowerShell scripts and local HTTP servers for: stop→start order, non-zero exit, command timeout with child-tree termination, bounded output, readiness timeout, and abort during shutdown.
-- [ ] Implement `ManagedComfyUIRuntime.restartAfterJob()` with injected command runner/probe factory for tests. Use argument arrays, hidden windows, bounded capture, and exact fixed script filenames under `pixelleRoot`.
-- [ ] Require a fresh `/system_stats` and `/object_info` probe after start; close the probe transport in `finally`.
-- [ ] Run focused tests, `corepack pnpm typecheck`, and `git diff --check`; commit `feat(runtime): manage one local ComfyUI endpoint`.
+- [x] Write failing real-process tests using temporary PowerShell scripts and local HTTP servers for: stop→start order, non-zero exit, command timeout with child-tree termination, bounded output, readiness timeout, and abort during shutdown.
+- [x] Implement `ManagedComfyUIRuntime.restartAfterJob()` with injected command runner/probe factory for tests. Use argument arrays, hidden windows, bounded capture, and exact fixed script filenames under `pixelleRoot`.
+- [x] Require a fresh `/system_stats` and `/object_info` probe after start; close the probe transport in `finally`.
+- [x] Run focused tests, `corepack pnpm typecheck`, and `git diff --check`; commit `feat(runtime): manage one local ComfyUI endpoint`.
 
 ### Task 2: Gate worker claims on post-job restart
 
@@ -116,4 +116,3 @@ type ManagedRuntimeConfig =
 - [ ] Fix every P0-P3 finding and repeat both reviews until READY.
 - [ ] Re-run full quality, worker/app builds, migrations, and real acceptance after the final fix commit.
 - [ ] Merge the reviewed branch into local `dev`, push `origin/dev`, restart the stable app/worker, and verify the browser plus worker health.
-
