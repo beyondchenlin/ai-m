@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +21,7 @@ import { normalizeComfyWorkflow } from "../src/lib/generation/workflows/normaliz
 import { parseWorkflowPackageLock, verifyLockedFiles } from "../src/lib/generation/workflows/package-lock";
 import { applyStaticPolicy, validateWorkflowStructure } from "../src/lib/generation/workflows/validator";
 import type { AuthorBinding, AuthorOutput, ComfyWorkflow, WorkflowManifest } from "../src/lib/generation/workflows/types";
+import { comparePixelleProcessIdentity, getPixelleProcessIdentity, getPixelleProcessLiveness } from "./pixelle-process-identity";
 
 export interface PrepareOptions {
   pixelleRoot: string;
@@ -40,7 +40,7 @@ export interface PrepareOptions {
   maxStagingBytes?: number;
   minimumFreeBytes?: number;
   getAvailableBytes?: (directory: string) => Promise<number>;
-  getProcessIdentity?: (pid: number) => Promise<string | "unknown">;
+  getProcessIdentity?: (pid: number) => Promise<string | "missing" | "unknown">;
 }
 
 interface PreparedPackage {
@@ -506,54 +506,13 @@ function parseLock(value: unknown): ReturnType<typeof lockRecord> {
   return lockRecord(value.pid as number, value.processIdentity, value.token, value.startedAtMs as number);
 }
 
-function runIdentityCommand(command: string, args: string[]): Promise<string | "unknown"> {
-  return new Promise((resolve) => {
-    execFile(command, args, { windowsHide: true, timeout: 10_000 }, (error, stdout) => {
-      const value = stdout.trim();
-      resolve(error || !value || value.length > 300 ? "unknown" : value);
-    });
-  });
-}
+let ownProcessIdentity: Promise<string | "missing" | "unknown"> | undefined;
 
-async function defaultProcessIdentity(pid: number): Promise<string | "unknown"> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return "unknown";
-  if (process.platform === "win32") {
-    const script = `$p=Get-Process -Id ${pid} -ErrorAction Stop; $o=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; [Console]::Out.Write('win:'+$o.LastBootUpTime.ToFileTimeUtc().ToString()+':'+$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString())`;
-    return runIdentityCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
-  }
-  try {
-    const [bootId, stat] = await Promise.all([
-      fs.readFile("/proc/sys/kernel/random/boot_id", "utf8"),
-      fs.readFile(`/proc/${pid}/stat`, "utf8"),
-    ]);
-    const close = stat.lastIndexOf(")");
-    const fields = stat.slice(close + 2).split(" ");
-    const startTicks = fields[19];
-    if (!/^[a-f0-9-]+$/i.test(bootId.trim()) || !/^\d+$/.test(startTicks)) return "unknown";
-    return `linux:${bootId.trim()}:${startTicks}`;
-  } catch {
-    return "unknown";
-  }
-}
-
-let ownProcessIdentity: Promise<string | "unknown"> | undefined;
-
-function processIdentityFor(pid: number, options: PrepareOptions): Promise<string | "unknown"> {
+function processIdentityFor(pid: number, options: PrepareOptions): Promise<string | "missing" | "unknown"> {
   if (options.getProcessIdentity) return options.getProcessIdentity(pid);
-  if (pid !== process.pid) return defaultProcessIdentity(pid);
-  ownProcessIdentity ??= defaultProcessIdentity(pid);
+  if (pid !== process.pid) return getPixelleProcessIdentity(pid);
+  ownProcessIdentity ??= getPixelleProcessIdentity(pid);
   return ownProcessIdentity;
-}
-
-async function defaultIsProcessAlive(pid: number): Promise<boolean | "unknown"> {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return false;
-    return "unknown";
-  }
 }
 
 async function acquireLock(stagingDir: string, options: PrepareOptions, token: string): Promise<void> {
@@ -564,7 +523,7 @@ async function acquireLock(stagingDir: string, options: PrepareOptions, token: s
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const identity = await processIdentityFor(process.pid, options);
-      if (identity === "unknown") throw new Error("Cannot establish process creation/boot identity; manual recovery audit is required");
+      if (identity === "unknown" || identity === "missing") throw new Error("Cannot establish process creation/boot identity; manual recovery audit is required");
       const handle = await fs.open(lockPath, "wx");
       try {
         await handle.writeFile(jsonBytes(lockRecord(process.pid, identity, token, nowMs)));
@@ -586,12 +545,14 @@ async function acquireLock(stagingDir: string, options: PrepareOptions, token: s
       throw new Error(`Staging is locked and lock ownership is uncertain: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (nowMs - existing.startedAtMs <= staleMs) throw new Error("Staging is locked by an active prepare.lock");
-    const alive = await (options.isProcessAlive ?? defaultIsProcessAlive)(existing.pid);
+    const alive = await (options.isProcessAlive ?? getPixelleProcessLiveness)(existing.pid);
     if (alive === "unknown") throw new Error("Staging is locked because process liveness is uncertain");
     if (alive === true) {
       const identity = await processIdentityFor(existing.pid, options);
-      if (identity === "unknown") throw new Error("Staging lock identity is uncertain; manual recovery audit is required");
-      if (identity === existing.processIdentity) throw new Error("Staging is locked by the original live process");
+      if (identity === "unknown" || identity === "missing") throw new Error("Staging lock identity is uncertain; manual recovery audit is required");
+      const sameIdentity = comparePixelleProcessIdentity(existing.processIdentity, identity, existing.pid);
+      if (sameIdentity === "unknown") throw new Error("Staging lock uses an unsupported legacy process identity; manual recovery audit is required");
+      if (sameIdentity) throw new Error("Staging is locked by the original live process");
     }
     const currentRaw = await fs.readFile(lockPath);
     const current = parseLock(JSON.parse(currentRaw.toString("utf8")));

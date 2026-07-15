@@ -34,7 +34,7 @@ corepack pnpm workflow:verify:pixelle-single
 
 如果 stop/start 或重连 readiness 结果不确定，CLI 会保留 `PIXELLE_WORKFLOW_STAGING_DIR/task4-restart-blocked.json` 并拒绝后续运行。操作员必须先从系统外部核对 8000 listener、PID、启动时间及健康探测，再用当前 generation digest 明确解除；例如 `$env:TASK4_RECOVERY_CONFIRM = 'RECOVER-<generationDigest>'`。恢复流程会再次建立新 WebSocket、核对 OS listener 并执行两项 readiness probe，全部成功后才删除 marker。
 
-整个 recovery、连接、六包运行、重启和 committed 发布都先取得 staging 共用的 identity-bound `prepare.lock`，再取得 `task4.lock`，并按相反顺序释放。固定顺序避免死锁，也让 prepare/GC 与 Task 4 互斥。两把锁覆盖锁内读取 `current.json`、六包执行和最终 committed 发布；签名和发布前都会再次确认 current digest 未切换。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复，身份不确定时必须人工处理。
+整个 recovery、连接、六包运行、重启和 committed 发布都先取得 staging 共用的 identity-bound `prepare.lock`，再取得 `task4.lock`，并按相反顺序释放。固定顺序避免死锁，也让 prepare/GC 与 Task 4 互斥。两把锁覆盖锁内读取 `current.json`、六包执行和最终 committed 发布；签名和发布前都会再次确认 current digest 未切换。prepare、GC 与 Task 4 共用同一个 boot-session/process-creation identity 和 process-liveness 实现。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；旧 Task 4 的 Windows epoch-ms identity 会无损转换后比较，不可识别的旧 schema 2 identity 在 owner 存活时 fail closed 并要求人工审计。PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复。
 
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 

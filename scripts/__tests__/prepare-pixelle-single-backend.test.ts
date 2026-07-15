@@ -460,7 +460,7 @@ describe("immutable Pixelle workflow preparation", () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     const lockPath = path.join(stagingDir, "prepare.lock");
-    const stale = { schemaVersion: 2, pid: 999999, processIdentity: "boot-a:created-a", token: "a".repeat(32), startedAtMs: 1_000 };
+    const stale = { schemaVersion: 2, pid: 999999, processIdentity: "win:133000000000000000:133000000001000000", token: "a".repeat(32), startedAtMs: 1_000 };
     await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => false })).resolves.toBeTruthy();
     expect((await fs.readdir(stagingDir)).some((name) => name.startsWith("prepare.lock.stale."))).toBe(true);
@@ -468,7 +468,7 @@ describe("immutable Pixelle workflow preparation", () => {
     await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
     await expect(preparePixelleSingleBackendPackages({
       pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
-      isProcessAlive: async () => true, getProcessIdentity: async () => "boot-a:created-a",
+      isProcessAlive: async () => true, getProcessIdentity: async () => "win:133000000000000000:133000000001000000",
     })).rejects.toThrow(/locked|alive/i);
     await expect(preparePixelleSingleBackendPackages({
       pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
@@ -478,7 +478,7 @@ describe("immutable Pixelle workflow preparation", () => {
     await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
     await expect(preparePixelleSingleBackendPackages({
       pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
-      isProcessAlive: async () => true, getProcessIdentity: async () => "boot-a:created-reused-pid",
+      isProcessAlive: async () => true, getProcessIdentity: async () => "win:133000000000000000:133000000009000000",
     })).resolves.toBeTruthy();
   });
 

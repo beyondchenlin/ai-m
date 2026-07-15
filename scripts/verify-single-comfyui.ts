@@ -13,6 +13,7 @@ import type { ComfyWorkflow, CompiledBindings, WorkflowManifest } from "../src/l
 import { loadProductionTask4PrivateKey } from "./pixelle-trust-store";
 import { signTask4Evidence, verifyGenerationPackageForImport, verifyPreparedGenerationPackage } from "./verify-generation-package";
 import { createPowerShellCommandRunner } from "../src/lib/generation/runtime/managed-comfyui-runtime";
+import { comparePixelleProcessIdentity, getPixelleProcessIdentity, getPixelleProcessLiveness } from "./pixelle-process-identity";
 
 const BASE_URL = "http://127.0.0.1:8000" as const;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -79,6 +80,7 @@ export interface Task4Dependencies {
   removeRestartMarker?: (file: string) => Promise<void>;
   afterRestartMarker?: () => Promise<void>;
   processIdentityForPid?: (pid: number) => Promise<string | "missing" | "unknown">;
+  isProcessAlive?: (pid: number) => Promise<boolean | "unknown">;
   lockStaleMs?: number;
   beforeFinalCurrentCheck?: () => Promise<void>;
 }
@@ -284,19 +286,10 @@ function combinedError(primary: unknown, cleanup: unknown[], label: string): Err
 }
 
 interface Task4LockRecord { schemaVersion: 2; pid: number; processIdentity: string; token: string; startedAtMs: number }
-async function queryProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
-  if (process.platform !== "win32") {
-    try { process.kill(pid, 0); return pid === process.pid ? `process-${pid}-${process.uptime()}` : "unknown"; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown"; }
-  }
-  const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction SilentlyContinue;if(-not $p){'missing';exit};$os=Get-CimInstance Win32_OperatingSystem;('windows-'+([DateTimeOffset]$os.LastBootUpTime).ToUnixTimeMilliseconds()+':'+$p.ProcessId+':'+([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds())`;
-  try { const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 }); return stdout.trim() || "unknown"; }
-  catch { return "unknown"; }
-}
 let currentTask4ProcessIdentity: Promise<string | "missing" | "unknown"> | undefined;
 function defaultProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
-  if (pid !== process.pid) return queryProcessIdentityForPid(pid);
-  currentTask4ProcessIdentity ??= queryProcessIdentityForPid(pid);
+  if (pid !== process.pid) return getPixelleProcessIdentity(pid);
+  currentTask4ProcessIdentity ??= getPixelleProcessIdentity(pid);
   return currentTask4ProcessIdentity;
 }
 function parseTask4Lock(value: unknown, lockName = "task4.lock"): Task4LockRecord {
@@ -307,7 +300,7 @@ function parseTask4Lock(value: unknown, lockName = "task4.lock"): Task4LockRecor
   return lock as unknown as Task4LockRecord;
 }
 async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): Promise<Task4LockRecord> {
-  const target = path.resolve(file); const lockName = path.basename(target); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 6 * 60 * 60_000;
+  const target = path.resolve(file); const lockName = path.basename(target); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 15 * 60_000;
   if (!Number.isSafeInteger(staleMs) || staleMs < 1_000) throw new Error("Task 4 lock stale threshold is invalid");
   const identityFor = dependencies.processIdentityForPid ?? defaultProcessIdentityForPid;
   const processIdentity = await identityFor(process.pid); if (processIdentity === "missing" || processIdentity === "unknown") throw new Error("Current Task 4 process identity is uncertain");
@@ -320,9 +313,15 @@ async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): 
       const stat = await fs.lstat(target); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_096) throw new Error(`${lockName} is unsafe`);
       const raw = await fs.readFile(target); const existing = parseTask4Lock(parseJson(raw, lockName), lockName);
       if (now() - existing.startedAtMs <= staleMs) throw new Error(`Task 4 is locked by an active ${lockName}`);
-      const observed = await identityFor(existing.pid);
-      if (observed === "unknown") throw new Error("Stale Task 4 lock owner identity is uncertain");
-      if (observed === existing.processIdentity) throw new Error("Task 4 is locked by the original live process");
+      const alive = await (dependencies.isProcessAlive ?? getPixelleProcessLiveness)(existing.pid);
+      if (alive === "unknown") throw new Error("Stale Task 4 lock owner liveness is uncertain");
+      if (alive) {
+        const observed = await identityFor(existing.pid);
+        if (observed === "unknown" || observed === "missing") throw new Error("Stale Task 4 lock owner identity is uncertain");
+        const sameIdentity = comparePixelleProcessIdentity(existing.processIdentity, observed, existing.pid);
+        if (sameIdentity === "unknown") throw new Error("Stale Task 4 lock uses an unsupported legacy process identity; manual recovery audit is required");
+        if (sameIdentity) throw new Error("Task 4 is locked by the original live process");
+      }
       if (!(await fs.readFile(target)).equals(raw)) throw new Error(`${lockName} changed during stale recovery`);
       await fs.rename(target, `${target}.stale.${existing.token}`); await syncDirectory(path.dirname(target));
     }

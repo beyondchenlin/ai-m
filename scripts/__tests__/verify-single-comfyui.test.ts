@@ -11,6 +11,8 @@ import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
 import type { ComfyWorkflow, WorkflowManifest } from "../../src/lib/generation/workflows/types";
 import { verifyGenerationPackageForImport } from "../verify-generation-package";
 import { parseTask4Mode, verifySingleComfyUI, writeAllBytes, type Task4Session } from "../verify-single-comfyui";
+import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
+import { comparePixelleProcessIdentity, getPixelleProcessIdentity } from "../pixelle-process-identity";
 import { createHash } from "node:crypto";
 
 const roots: string[] = [];
@@ -423,25 +425,47 @@ describe("single-endpoint Task 4 verifier", () => {
     const f = await fixture(); const prepareLock = path.join(f.root, "staging", "prepare.lock"); const ready = path.join(f.root, "prepare-ready");
     const helper = path.join(f.root, "prepare-owner.mts");
     const prepareModule = pathToFileURL(path.resolve("scripts/prepare-pixelle-single-backend.ts")).href;
-    await fs.writeFile(helper, `import { promises as fs } from "node:fs"; import { preparePixelleSingleBackendPackages } from ${JSON.stringify(prepareModule)}; await preparePixelleSingleBackendPackages({ pixelleRoot: process.env.PIXELLE_ROOT!, stagingDir: process.env.STAGING_DIR!, afterLockAcquired: async () => { await fs.writeFile(process.env.READY_FILE!, "ready"); await new Promise(() => {}); } });\n`);
+    await fs.writeFile(helper, `import { promises as fs } from "node:fs"; import { preparePixelleSingleBackendPackages } from ${JSON.stringify(prepareModule)}; await preparePixelleSingleBackendPackages({ pixelleRoot: process.env.PIXELLE_ROOT!, stagingDir: process.env.STAGING_DIR!, afterLockAcquired: async () => { await fs.writeFile(process.env.READY_FILE!, "ready"); setInterval(() => {}, 1000); await new Promise(() => {}); } });\n`);
     const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), env: { ...process.env, PIXELLE_ROOT: f.pixelleRoot, STAGING_DIR: path.join(f.root, "staging"), READY_FILE: ready }, windowsHide: true, stdio: "ignore" });
     const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     try {
       for (let attempt = 0; attempt < 100; attempt += 1) { try { await fs.lstat(ready); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); } }
       await expect(fs.lstat(ready)).resolves.toBeDefined(); let connected = false;
+      const agedPrepareLock = JSON.parse(await fs.readFile(prepareLock, "utf8")); agedPrepareLock.startedAtMs = Date.now() - 16 * 60_000;
+      await fs.writeFile(prepareLock, `${canonicalize(agedPrepareLock)}\n`);
+      const observedOwner = await getPixelleProcessIdentity(child.pid!); expect(observedOwner).not.toMatch(/unknown|missing/);
+      expect(comparePixelleProcessIdentity(agedPrepareLock.processIdentity, observedOwner, child.pid!)).toBe(true);
       await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
-        expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connected = true; return fakeSession([]); }, observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
-      })).rejects.toThrow(/locked by an active prepare.lock/i);
+        expectedPackageNames: [f.packageName], connect: async () => { connected = true; return fakeSession([]); }, observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+      })).rejects.toThrow(/original live process/i);
       expect(connected).toBe(false);
     } finally { child.kill(); await childClosed; }
   });
 
+  it("keeps a Task4-written aged prepare.lock when its real OS owner is still alive", async () => {
+    const f = await fixture(); const ready = path.join(f.root, "task4-ready"); const helper = path.join(f.root, "task4-owner.mts");
+    const task4Module = pathToFileURL(path.resolve("scripts/verify-single-comfyui.ts")).href;
+    const childOptions = { baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "child-e"), archiveDir: path.join(f.root, "child-a"), parameters: {} };
+    await fs.writeFile(helper, `import { promises as fs } from "node:fs"; import { verifySingleComfyUI } from ${JSON.stringify(task4Module)}; await verifySingleComfyUI(${JSON.stringify(childOptions)}, { expectedPackageNames: [${JSON.stringify(f.packageName)}], connect: async () => { await fs.writeFile(${JSON.stringify(ready)}, "ready"); setInterval(() => {}, 1000); await new Promise(() => {}); throw new Error("unreachable"); }, observeListener: async () => { throw new Error("unreachable"); }, restart: async () => { throw new Error("unreachable"); } });\n`);
+    const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), windowsHide: true, stdio: "ignore" });
+    const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    try {
+      for (let attempt = 0; attempt < 200; attempt += 1) { try { await fs.lstat(ready); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); } }
+      await expect(fs.lstat(ready)).resolves.toBeDefined(); const lockFile = path.join(f.root, "staging", "prepare.lock");
+      const aged = JSON.parse(await fs.readFile(lockFile, "utf8")); aged.startedAtMs = Date.now() - 16 * 60_000; await fs.writeFile(lockFile, `${canonicalize(aged)}\n`);
+      await expect(preparePixelleSingleBackendPackages({ pixelleRoot: f.pixelleRoot, stagingDir: path.join(f.root, "staging") })).rejects.toThrow(/original live process/i);
+      expect(JSON.parse(await fs.readFile(lockFile, "utf8"))).toMatchObject({ pid: child.pid, token: aged.token });
+    } finally { child.kill(); await childClosed; }
+  }, 15_000);
+
   it("recovers a stale reused-PID lock only when the old identity is conclusively different", async () => {
     const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_900_000;
-    const old = { schemaVersion: 2, pid: 424242, processIdentity: "old-boot:424242:1000", token: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", startedAtMs: now - 10_000 };
+    expect(comparePixelleProcessIdentity("windows-1700000000000:424242:1700000001000", "win:133444736000000000:133444736010000000", 424242)).toBe(true);
+    expect(comparePixelleProcessIdentity("old-boot:424242:1000", "win:133444736000000000:133444736010000000", 424242)).toBe("unknown");
+    const old = { schemaVersion: 2, pid: 424242, processIdentity: "win:133000000000000000:133000000001000000", token: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", startedAtMs: now - 10_000 };
     await fs.writeFile(lockFile, `${canonicalize(old)}\n`);
     await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
-      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "new-boot:424242:9000",
+      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], isProcessAlive: async () => true, processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "win:133000000000000000:133000000009000000",
       connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
     })).resolves.toMatchObject({ mode: "inventory-only" });
     await expect(fs.lstat(`${lockFile}.stale.${old.token}`)).resolves.toBeDefined();
@@ -451,7 +475,7 @@ describe("single-endpoint Task 4 verifier", () => {
     const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_950_000;
     await fs.writeFile(lockFile, `${canonicalize({ schemaVersion: 2, pid: 424242, processIdentity: "old-boot:424242:1000", token: "cccccccc-cccc-cccc-cccc-cccccccccccc", startedAtMs: now - 10_000 })}\n`);
     await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
-      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "unknown",
+      now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], isProcessAlive: async () => true, processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "unknown",
       connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
     })).rejects.toThrow(/identity is uncertain/i);
   });
