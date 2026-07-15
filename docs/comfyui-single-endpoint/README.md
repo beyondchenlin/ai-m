@@ -9,8 +9,10 @@
 ```powershell
 $env:PIXELLE_ROOT = 'D:\demo1\Pixelle\Pixelle'
 $env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
-$env:AI_M_MANAGED_COMFYUI_DATA_ROOT = '<Pixelle data root>'
-$env:AI_M_MANAGED_COMFYUI_PYTHON_EXE = '<python.exe>'
+$env:AI_M_MANAGED_COMFYUI_DATA_ROOT = 'E:\ComfyUIData'
+$env:AI_M_MANAGED_COMFYUI_ROOT = 'E:\comfyui\resources\ComfyUI'
+$env:AI_M_MANAGED_COMFYUI_PYTHON_EXE = 'E:\ComfyUIData\.venv\Scripts\python.exe'
+$env:AI_M_MANAGED_COMFYUI_BASE_URL = 'http://127.0.0.1:8000'
 $env:AI_M_MANAGED_COMFYUI_COMMAND_TIMEOUT_MS = '120000'
 $env:AI_M_MANAGED_COMFYUI_READY_TIMEOUT_MS = '300000'
 $env:TASK4_MODE = 'inventory-only'
@@ -24,12 +26,13 @@ $env:TASK4_MODE = 'verify'
 $env:TASK4_CONFIRM_RESTART = 'RESTART-127.0.0.1:8000'
 $env:TASK4_PARAMETERS_FILE = 'D:\task4\parameters.json'
 $env:TASK4_REFERENCE_AUDIO_FILE = 'D:\task4\controlled-reference.wav'
-$env:TASK4_EVIDENCE_DIR = 'D:\task4\evidence'
-$env:TASK4_ARCHIVE_DIR = 'D:\task4\artifacts'
+$env:TASK4_COMMITTED_DIR = 'D:\task4\committed-generation'
 corepack pnpm workflow:verify:pixelle-single
 ```
 
 任何未知执行状态、提交结果不确定、节点/模型/schema 缺失、输出超限、重启超时或身份未变化都会 fail closed，且不会生成可导入的 evidence。完成后仍需单独执行人工 review/import/promote；本命令不会代替这些步骤。
+
+如果 stop/start 或重连 readiness 结果不确定，CLI 会保留 `PIXELLE_WORKFLOW_STAGING_DIR/task4-restart-blocked.json` 并拒绝后续运行。操作员必须先从系统外部核对 8000 listener、PID、启动时间及健康探测，再用当前 generation digest 明确解除；例如 `$env:TASK4_RECOVERY_CONFIRM = 'RECOVER-<generationDigest>'`。恢复流程会再次建立新 WebSocket、核对 OS listener 并执行两项 readiness probe，全部成功后才删除 marker。
 
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 
