@@ -120,3 +120,16 @@ export {
 export type { ArtifactStreamInput, ArtifactCommitResult } from "./archiving";
 export { InputMaterializationError, materializeWorkflowInputs } from "./input-materializer";
 export type { MaterializedWorkflowInput } from "./input-materializer";
+export {
+  ManagedComfyUIRuntime,
+  createPowerShellCommandRunner,
+  parseManagedComfyUIRuntimeConfig,
+} from "./runtime/managed-comfyui-runtime";
+export type {
+  ManagedCommandRequest,
+  ManagedCommandResult,
+  ManagedCommandRunner,
+  ManagedProbeTransport,
+  ManagedRuntimeConfig,
+  ManagedRuntimeDependencies,
+} from "./runtime/managed-comfyui-runtime";
