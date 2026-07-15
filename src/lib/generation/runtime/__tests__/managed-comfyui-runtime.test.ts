@@ -21,7 +21,19 @@ const temporaryPaths: string[] = [];
 const powershellTest = process.platform === "win32" && spawnSync("where.exe", ["powershell.exe"], { windowsHide: true }).status === 0 ? test : test.skip;
 
 function readyProbeResponse(path: string, status = 200): Response {
-  const payload = path === "/system_stats" ? { system: { os: "test" }, devices: [] } : { TestNode: {} };
+  const payload = path === "/system_stats"
+    ? { system: { os: "nt", python_version: "3.12.0" }, devices: [{ name: "cuda:0", type: "cuda", index: 0, vram_total: 1024 }] }
+    : {
+        TestNode: {
+          input: { required: {}, optional: {} },
+          output: ["IMAGE"],
+          output_is_list: [false],
+          output_name: ["image"],
+          name: "TestNode",
+          display_name: "Test Node",
+          description: "Fixture node",
+        },
+      };
   return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
 }
 
@@ -200,7 +212,9 @@ describe("ManagedComfyUIRuntime", () => {
     const server = createServer((request, response) => {
       response.setHeader("content-type", "application/json");
       if (++attempts < 3) { response.statusCode = 503; response.end("{}"); return; }
-      response.end(request.url === "/system_stats" ? JSON.stringify({ system: { os: "test" }, devices: [] }) : JSON.stringify({ TestNode: {} }));
+      response.end(request.url === "/system_stats"
+        ? JSON.stringify({ system: { os: "test" }, devices: [] })
+        : JSON.stringify({ TestNode: { input: {}, output: [], output_is_list: [], output_name: [], name: "TestNode", display_name: "Test Node", description: "" } }));
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
@@ -236,6 +250,45 @@ describe("ManagedComfyUIRuntime", () => {
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
       commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
       probeFactory: () => ({ get: async (path) => path === "/system_stats" ? new Response(body, { status: 200 }) : readyProbeResponse(path), close() {} }),
+      readinessPollMs: 1,
+    });
+    await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
+  });
+
+  test.each([
+    ["no recognizable system field", { system: {}, devices: [] }],
+    ["wrong recognizable system field type", { system: { os: 7 }, devices: [] }],
+    ["devices is not an array", { system: { os: "nt" }, devices: {} }],
+    ["device is not an object", { system: { os: "nt" }, devices: [null] }],
+    ["device name has wrong type", { system: { os: "nt" }, devices: [{ name: 1, type: "cuda", index: 0, vram_total: 1 }] }],
+    ["device index has wrong type", { system: { os: "nt" }, devices: [{ name: "gpu", type: "cuda", index: "0", vram_total: 1 }] }],
+    ["device VRAM has wrong type", { system: { os: "nt" }, devices: [{ name: "gpu", type: "cuda", index: 0, vram_total: "1" }] }],
+  ])("rejects system_stats when %s", async (_label, payload) => {
+    const fixture = await makePixelleFixture();
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
+      commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+      probeFactory: () => ({ get: async (path) => path === "/system_stats" ? Response.json(payload) : readyProbeResponse(path), close() {} }),
+      readinessPollMs: 1,
+    });
+    await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
+  });
+
+  test.each([
+    ["payload is empty", {}],
+    ["descriptor is not an object", { Node: [] }],
+    ["input is missing", { Node: { output: [], output_is_list: [], output_name: [], name: "Node", display_name: "Node", description: "" } }],
+    ["required input is not an object", { Node: { input: { required: [] }, output: [], output_is_list: [], output_name: [], name: "Node", display_name: "Node", description: "" } }],
+    ["optional input is not an object", { Node: { input: { required: {}, optional: [] }, output: [], output_is_list: [], output_name: [], name: "Node", display_name: "Node", description: "" } }],
+    ["output is not an array", { Node: { input: {}, output: {}, output_is_list: [], output_name: [], name: "Node", display_name: "Node", description: "" } }],
+    ["output array lengths differ", { Node: { input: {}, output: ["IMAGE"], output_is_list: [], output_name: ["image"], name: "Node", display_name: "Node", description: "" } }],
+    ["output_is_list contains non-booleans", { Node: { input: {}, output: ["IMAGE"], output_is_list: [0], output_name: ["image"], name: "Node", display_name: "Node", description: "" } }],
+    ["output_name contains non-strings", { Node: { input: {}, output: ["IMAGE"], output_is_list: [false], output_name: [1], name: "Node", display_name: "Node", description: "" } }],
+    ["node metadata has wrong types", { Node: { input: {}, output: [], output_is_list: [], output_name: [], name: 1, display_name: "Node", description: "" } }],
+  ])("rejects object_info when %s", async (_label, payload) => {
+    const fixture = await makePixelleFixture();
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
+      commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+      probeFactory: () => ({ get: async (path) => path === "/object_info" ? Response.json(payload) : readyProbeResponse(path), close() {} }),
       readinessPollMs: 1,
     });
     await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);

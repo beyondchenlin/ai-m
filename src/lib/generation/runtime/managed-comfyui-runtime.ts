@@ -395,6 +395,43 @@ async function discardResponseBody(response: Response): Promise<void> {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function hasRecognizableComfySystemField(system: Record<string, unknown>): boolean {
+  return ["os", "python_version", "pytorch_version", "comfyui_version", "required_frontend_version"]
+    .some((field) => typeof system[field] === "string")
+    || ["ram_total", "ram_free"].some((field) => isFiniteNumber(system[field]))
+    || typeof system.embedded_python === "boolean";
+}
+
+function isComfyDeviceDescriptor(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const vramTotal = value.vram_total ?? value.vramTotal;
+  return typeof value.name === "string"
+    && typeof value.type === "string"
+    && Number.isInteger(value.index)
+    && isFiniteNumber(vramTotal);
+}
+
+function isComfyNodeDescriptor(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.input)) return false;
+  if (value.input.required !== undefined && !isRecord(value.input.required)) return false;
+  if (value.input.optional !== undefined && !isRecord(value.input.optional)) return false;
+  if (!Array.isArray(value.output) || !Array.isArray(value.output_is_list) || !Array.isArray(value.output_name)) return false;
+  if (value.output.length !== value.output_is_list.length || value.output.length !== value.output_name.length) return false;
+  if (!value.output_is_list.every((item) => typeof item === "boolean")) return false;
+  if (!value.output_name.every((item) => typeof item === "string")) return false;
+  return typeof value.name === "string"
+    && typeof value.display_name === "string"
+    && typeof value.description === "string";
+}
+
 async function assertReadyProbeResponse(response: Response, path: "/system_stats" | "/object_info"): Promise<void> {
   if (!response.ok) {
     await discardResponseBody(response);
@@ -403,9 +440,15 @@ async function assertReadyProbeResponse(response: Response, path: "/system_stats
   const payload = await readResponseJsonObject(response, path === "/system_stats" ? 1024 * 1024 : 16 * 1024 * 1024);
   if (path === "/system_stats") {
     const system = payload.system;
-    if (!system || typeof system !== "object" || Array.isArray(system) || !Array.isArray(payload.devices))
+    if (!isRecord(system)
+      || !hasRecognizableComfySystemField(system)
+      || !Array.isArray(payload.devices)
+      || !payload.devices.every(isComfyDeviceDescriptor))
       throw new Error("ComfyUI system_stats readiness probe returned an invalid schema");
+    return;
   }
+  if (Object.keys(payload).length === 0 || !Object.values(payload).some(isComfyNodeDescriptor))
+    throw new Error("ComfyUI object_info readiness probe returned an invalid schema");
 }
 
 /**
