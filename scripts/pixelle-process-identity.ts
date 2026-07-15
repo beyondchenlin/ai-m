@@ -53,5 +53,13 @@ export function normalizePixelleProcessIdentity(identity: string, pid: number): 
 
 export function comparePixelleProcessIdentity(stored: string, observed: string, pid: number): boolean | "unknown" {
   const left = normalizePixelleProcessIdentity(stored, pid); const right = normalizePixelleProcessIdentity(observed, pid);
-  return left && right ? left === right : "unknown";
+  if (!left || !right) return "unknown";
+  if (stored.startsWith("windows-") || observed.startsWith("windows-")) {
+    const leftWindows = /^win:(\d+):(\d+)$/.exec(left); const rightWindows = /^win:(\d+):(\d+)$/.exec(right);
+    if (leftWindows && rightWindows) {
+      return BigInt(leftWindows[1]) / FILETIME_TICKS_PER_MS === BigInt(rightWindows[1]) / FILETIME_TICKS_PER_MS
+        && BigInt(leftWindows[2]) / FILETIME_TICKS_PER_MS === BigInt(rightWindows[2]) / FILETIME_TICKS_PER_MS;
+    }
+  }
+  return left === right;
 }

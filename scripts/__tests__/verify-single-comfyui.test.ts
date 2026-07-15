@@ -434,6 +434,10 @@ describe("single-endpoint Task 4 verifier", () => {
       const agedPrepareLock = JSON.parse(await fs.readFile(prepareLock, "utf8")); agedPrepareLock.startedAtMs = Date.now() - 16 * 60_000;
       await fs.writeFile(prepareLock, `${canonicalize(agedPrepareLock)}\n`);
       const observedOwner = await getPixelleProcessIdentity(child.pid!); expect(observedOwner).not.toMatch(/unknown|missing/);
+      if (process.platform === "win32") {
+        const windowsIdentity = /^win:(\d+):(\d+)$/.exec(observedOwner); expect(windowsIdentity).not.toBeNull();
+        expect([windowsIdentity![1], windowsIdentity![2]].some((part) => BigInt(part) % BigInt(10_000) !== BigInt(0))).toBe(true);
+      }
       expect(comparePixelleProcessIdentity(agedPrepareLock.processIdentity, observedOwner, child.pid!)).toBe(true);
       await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
         expectedPackageNames: [f.packageName], connect: async () => { connected = true; return fakeSession([]); }, observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
@@ -461,6 +465,8 @@ describe("single-endpoint Task 4 verifier", () => {
   it("recovers a stale reused-PID lock only when the old identity is conclusively different", async () => {
     const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_900_000;
     expect(comparePixelleProcessIdentity("windows-1700000000000:424242:1700000001000", "win:133444736000000000:133444736010000000", 424242)).toBe(true);
+    expect(comparePixelleProcessIdentity("windows-1700000000000:424242:1700000001000", "win:133444736000000123:133444736010004567", 424242)).toBe(true);
+    expect(comparePixelleProcessIdentity("win:133444736000000123:133444736010004567", "win:133444736000000124:133444736010004567", 424242)).toBe(false);
     expect(comparePixelleProcessIdentity("old-boot:424242:1000", "win:133444736000000000:133444736010000000", 424242)).toBe("unknown");
     const old = { schemaVersion: 2, pid: 424242, processIdentity: "win:133000000000000000:133000000001000000", token: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", startedAtMs: now - 10_000 };
     await fs.writeFile(lockFile, `${canonicalize(old)}\n`);
@@ -478,6 +484,18 @@ describe("single-endpoint Task 4 verifier", () => {
       now: () => now, lockStaleMs: 1_000, expectedPackageNames: [f.packageName], isProcessAlive: async () => true, processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "unknown",
       connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
     })).rejects.toThrow(/identity is uncertain/i);
+  });
+
+  it("does not steal an aged live legacy Windows lock when canonical identity has 100ns remainder", async () => {
+    const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_975_000;
+    const lock = { schemaVersion: 2, pid: 424242, processIdentity: "windows-1700000000000:424242:1700000001000", token: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", startedAtMs: now - 16 * 60_000 };
+    await fs.writeFile(lockFile, `${canonicalize(lock)}\n`);
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), lockFile, parameters: {} }, {
+      now: () => now, expectedPackageNames: [f.packageName], isProcessAlive: async () => true,
+      processIdentityForPid: async (pid) => pid === process.pid ? "current-process-identity" : "win:133444736000000123:133444736010004567",
+      connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).rejects.toThrow(/original live process/i);
+    expect(JSON.parse(await fs.readFile(lockFile, "utf8"))).toMatchObject({ token: lock.token });
   });
 
   it("chains all six package restarts and publishes the last package after as final endpoint", async () => {
