@@ -189,8 +189,8 @@ async function verifyEvidence(
   const restartedAtMs = value.restart.restartedAtMs as number;
   const readinessAtMs = value.restart.readinessAtMs as number;
   const reconnectedAtMs = value.restart.reconnectedAtMs as number;
-  if (!(latestRunCompletion < stoppedAtMs && stoppedAtMs < restartedAtMs && restartedAtMs < readinessAtMs
-    && readinessAtMs <= reconnectedAtMs && reconnectedAtMs <= (value.issuedAtMs as number))) {
+  if (!(latestRunCompletion < stoppedAtMs && stoppedAtMs < restartedAtMs && restartedAtMs < reconnectedAtMs
+    && reconnectedAtMs <= readinessAtMs && readinessAtMs <= (value.issuedAtMs as number))) {
     throw new Error("Task 4 evidence timeline order is invalid");
   }
   if (!isRecord(value.readiness) || value.readiness.checkedAtMs !== readinessAtMs) throw new Error("Task 4 readiness summary is invalid");

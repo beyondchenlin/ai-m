@@ -238,10 +238,10 @@ describe("immutable Pixelle workflow preparation", () => {
         before: { pid: 101, processCreatedAtMs: 1_001, bootId: "boot-session-1", processIdentity: "boot-1:process-before", connectionId: "connection-before" },
         after: { pid: 102, processCreatedAtMs: 1_002, bootId: "boot-session-1", processIdentity: "boot-1:process-after", connectionId: "connection-after" },
         stoppedAtMs: nowMs - 1_600, restartedAtMs: nowMs - 1_500,
-        readinessAtMs: nowMs - 1_400, reconnectedAtMs: nowMs - 1_300,
+        reconnectedAtMs: nowMs - 1_400, readinessAtMs: nowMs - 1_300,
       },
       readiness: {
-        checkedAtMs: nowMs - 1_400,
+        checkedAtMs: nowMs - 1_300,
         systemStats: { path: "/system_stats", statusCode: 200, responseSha256: "3".repeat(64) },
         objectInfo: { path: "/object_info", statusCode: 200, responseSha256: "4".repeat(64) },
       },
