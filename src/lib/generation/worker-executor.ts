@@ -58,6 +58,15 @@ import {
 } from "@/lib/generation/jobs/worker-finalization";
 export type { JobExecutionResult } from "@/lib/generation/jobs/worker-finalization";
 
+export interface GenerationJobLifecycleHooks {
+  beforeTerminalResourceRelease?: (identity: {
+    jobId: string;
+    attemptId: string;
+    resourcePoolId: string;
+    slotNo: number;
+  }) => Promise<void>;
+}
+
 function mimeForOutput(
   filename: string,
   expectedKind: "image" | "video" | "audio",
@@ -103,6 +112,7 @@ export async function executeGenerationJob(
   workerId: string,
   jobFencingToken: number,
   abortSignal?: AbortSignal,
+  lifecycle: GenerationJobLifecycleHooks = {},
 ): Promise<JobExecutionResult> {
   if (job.cancelRequestedAtMs) {
     await cancelQueuedJob(job.id, workerId, jobFencingToken);
@@ -114,10 +124,16 @@ export async function executeGenerationJob(
 
   const attemptId = genId();
   let resourceSlot: { slotNo: number; leaseToken: string; fencingToken: number } | null = null;
+  let resourcePoolIdForSlot: string | null = null;
   let resourceTimer: ReturnType<typeof setInterval> | null = null;
   let retainResource = false;
   let orchestrator: ComfyUIExecutionOrchestrator | null = null;
   let transport: ComfyUITransport | null = null;
+  const lifecycleState: { completedResult: JobExecutionResult | null } = { completedResult: null };
+  const complete = (result: JobExecutionResult): JobExecutionResult => {
+    lifecycleState.completedResult = result;
+    return result;
+  };
   let resourceRenewalInFlight = false;
   let inputCleanup: (() => Promise<void>) | null = null;
   const committedArtifacts: CollectedArtifactCandidate[] = [];
@@ -226,6 +242,7 @@ export async function executeGenerationJob(
       }
       return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
     }
+    resourcePoolIdForSlot = backend.resourcePoolId;
     const begun = beginOwnedAttemptSubmission({
       jobId: job.id,
       attemptId,
@@ -466,18 +483,18 @@ export async function executeGenerationJob(
             createdAtMs: Date.now(),
           }).catch(() => undefined);
         }
-        return { success: true, finalPhase: "SUCCEEDED", needsAttention: false, claimDisposition: "release-terminal" };
+        return complete({ success: true, finalPhase: "SUCCEEDED", needsAttention: false, claimDisposition: "release-terminal" });
       }
       if (result.cancellationRequested && result.phase === "CANCELLED") {
         retainResource = false;
         await cancelJob(job.id, attemptId, workerId, jobFencingToken);
-        return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
+        return complete({ success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" });
       }
       retainResource = retainResource
         || result.submissionDisposition === "submission-uncertain"
         || result.needsAttention
         || result.phase === "SUBMISSION_UNKNOWN";
-      return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
+      return complete(await failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource));
     } finally {
       abortSignal?.removeEventListener("abort", abortListener);
     }
@@ -500,39 +517,52 @@ export async function executeGenerationJob(
       : null;
     if (materializationCause?.submissionDisposition === "definitely-not-submitted") {
       retainResource = false;
-      return failJob(
+      return complete(await failJob(
         job.id, attemptId, workerId, jobFencingToken,
         "Input upload was not submitted before its operation deadline",
         "input_upload_not_sent",
-      );
+      ));
     }
     retainResource = true;
     throw error;
   } finally {
-    if (resourceTimer) clearInterval(resourceTimer);
     transport?.close();
     if (!retainResource && inputCleanup) await inputCleanup().catch(() => undefined);
-    if (resourceSlot && !retainResource) {
-      const snapshot = job.executionSnapshotJson as Record<string, unknown>;
-      const backendId = snapshot.executionBackendId as string;
-      const [backend] = backendId ? await db.select().from(executionBackends).where(eq(executionBackends.id, backendId)) : [];
-      if (backend) {
-        await releaseResourceSlot(
-          backend.resourcePoolId,
-          resourceSlot.slotNo,
-          attemptId,
-          resourceSlot.leaseToken,
-          resourceSlot.fencingToken,
-        ).catch((error: unknown) => {
-          if (error instanceof InvalidResourceCardinalityError) {
-            console.error(
-              "[generation] retained resource leases after terminal release cardinality failure",
-              { code: error.code, attemptId: error.attemptId, slotCount: error.slotCount },
-            );
-          }
-          return false;
-        });
+    try {
+      if (resourceSlot && resourcePoolIdForSlot && !retainResource
+        && lifecycleState.completedResult?.claimDisposition === "release-terminal"
+        && lifecycle.beforeTerminalResourceRelease) {
+        try {
+          await lifecycle.beforeTerminalResourceRelease({
+            jobId: job.id,
+            attemptId,
+            resourcePoolId: resourcePoolIdForSlot,
+            slotNo: resourceSlot.slotNo,
+          });
+        } catch (error) {
+          retainResource = true;
+          throw error;
+        }
       }
+    } finally {
+      if (resourceTimer) clearInterval(resourceTimer);
+    }
+    if (resourceSlot && resourcePoolIdForSlot && !retainResource) {
+      await releaseResourceSlot(
+        resourcePoolIdForSlot,
+        resourceSlot.slotNo,
+        attemptId,
+        resourceSlot.leaseToken,
+        resourceSlot.fencingToken,
+      ).catch((error: unknown) => {
+        if (error instanceof InvalidResourceCardinalityError) {
+          console.error(
+            "[generation] retained resource leases after terminal release cardinality failure",
+            { code: error.code, attemptId: error.attemptId, slotCount: error.slotCount },
+          );
+        }
+        return false;
+      });
     }
   }
 }

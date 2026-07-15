@@ -340,8 +340,8 @@ describe("worker completion after cancellation intent", () => {
       return { id: artifactId };
     });
 
-    const execute = async () => {
-      if (scenario === "known-completed") return executeGenerationJob(job, workerId, fencingToken);
+    const execute = async (lifecycle?: { beforeTerminalResourceRelease?: () => Promise<void> }) => {
+      if (scenario === "known-completed") return executeGenerationJob(job, workerId, fencingToken, undefined, lifecycle);
       vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
       try {
         const execution = executeGenerationJob(job, workerId, fencingToken);
@@ -396,6 +396,43 @@ describe("worker completion after cancellation intent", () => {
       status: "SUCCEEDED",
     });
     expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toEqual({ policyRevision: sha256({}) });
+  });
+
+  it("holds the physical resource slot until the terminal lifecycle hook completes", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    const readiness = (() => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      return { promise, resolve };
+    })();
+    const events: string[] = [];
+    mocks.releaseResourceSlot.mockImplementation(async () => { events.push("release-slot"); return true; });
+
+    const execution = arranged.execute({
+      beforeTerminalResourceRelease: async () => {
+        events.push("restart-start");
+        await readiness.promise;
+        events.push("readiness-complete");
+      },
+    });
+    await vi.waitFor(() => expect(events).toContain("restart-start"));
+    expect(events).toEqual(["restart-start"]);
+    expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+
+    readiness.resolve();
+    await execution;
+    expect(events).toEqual(["restart-start", "readiness-complete", "release-slot"]);
+  });
+
+  it("retains the terminal claim and slot when the lifecycle hook fails", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    await expect(arranged.execute({
+      beforeTerminalResourceRelease: async () => { throw new Error("restart failed"); },
+    })).rejects.toThrow("restart failed");
+    expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
+      status: "SUCCEEDED",
+    });
   });
 
   it("propagates validated backend operation-class timeouts into the production transport", async () => {

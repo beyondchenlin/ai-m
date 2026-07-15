@@ -25,7 +25,6 @@ import {
   renewJobClaim,
   releaseJobClaim,
   scanExpiredClaims,
-  LEASE_CONFIG,
 } from "../leases";
 import { recoverExpiredJob } from "@/lib/generation/jobs/state-transitions";
 
@@ -292,6 +291,22 @@ describe("PR-11: 资源槽位租约", () => {
     )).toBe(false);
   });
 
+  it("renews a terminal attempt slot while its claim is held for managed restart readiness", async () => {
+    const seeded = await createOwnedPreparingAttempt({ claimUntilMs: Date.now() + 60_000 });
+    const slot = (await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId))!;
+    await db.update(generationAttempts).set({
+      phase: "SUCCEEDED",
+      resourceSlotNo: slot.slotNo,
+      resourceLeaseToken: slot.leaseToken,
+      resourceFencingToken: slot.fencingToken,
+    }).where(eq(generationAttempts.id, seeded.attemptId));
+    await db.update(generationJobs).set({ status: "SUCCEEDED" }).where(eq(generationJobs.id, seeded.jobId));
+
+    expect(await renewOwnedResourceSlot(
+      seeded.poolId, slot.slotNo, slot.leaseToken, slot.fencingToken, seeded.workerId,
+    )).toBe(true);
+  });
+
   it("空闲槽位应被原子领取", async () => {
     const { poolId, backendId } = await createBackendAndPool();
     const jobId = await createQueuedJob();
@@ -359,6 +374,39 @@ describe("PR-11: 资源槽位租约", () => {
     } finally {
       rmSync(goPath, { force: true });
       for (const readyPath of readyPaths) rmSync(readyPath, { force: true });
+    }
+  });
+
+  it("keeps a second worker out while the first worker holds the slot through managed readiness", async () => {
+    const { poolId, backendId } = await createBackendAndPool("image", 1);
+    const firstJobId = await createQueuedJob();
+    const firstAttemptId = await createAttempt(firstJobId, backendId, poolId, { phase: "PREPARING" });
+    const first = (await acquireResourceSlot(poolId, firstAttemptId, "worker-1"))!;
+    const secondJobId = await createQueuedJob();
+    const secondAttemptId = await createAttempt(secondJobId, backendId, poolId, { phase: "PREPARING" }, "worker-2");
+    const barrierId = crypto.randomUUID();
+    const readyPath = `${ctx.dbPath}.${barrierId}.ready`;
+    const goPath = `${ctx.dbPath}.${barrierId}.go`;
+    try {
+      const competing = spawnAcquireProcess({
+        dbPath: ctx.dbPath,
+        poolId,
+        attemptId: secondAttemptId,
+        workerId: "worker-2",
+        readyPath,
+        goPath,
+      });
+      await waitForFiles([readyPath]);
+      writeFileSync(goPath, "readiness-still-pending");
+      await expect(competing).resolves.toBeNull();
+
+      expect(await releaseResourceSlot(
+        poolId, first.slotNo, firstAttemptId, first.leaseToken, first.fencingToken,
+      )).toBe(true);
+      await expect(acquireResourceSlot(poolId, secondAttemptId, "worker-2")).resolves.not.toBeNull();
+    } finally {
+      rmSync(goPath, { force: true });
+      rmSync(readyPath, { force: true });
     }
   });
 

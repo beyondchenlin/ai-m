@@ -205,9 +205,13 @@ export async function renewResourceSlot(
       || attempt.resourceLeaseToken !== leaseToken
       || attempt.resourceFencingToken !== fencingToken) return false;
     const job = tx.select().from(generationJobs).where(eq(generationJobs.id, attempt.jobId)).get();
+    const activeJob = job?.status === "RUNNING" || job?.status === "CANCEL_REQUESTED";
+    const terminalRestartWindow = (job?.status === "SUCCEEDED" && attempt.phase === "SUCCEEDED")
+      || (job?.status === "CANCELLED" && attempt.phase === "CANCELLED")
+      || (job?.status === "FAILED" && attempt.phase === "FAILED");
     if (!job
       || job.currentAttemptId !== attempt.id
-      || (job.status !== "RUNNING" && job.status !== "CANCEL_REQUESTED")
+      || (!activeJob && !terminalRestartWindow)
       || job.claimOwner !== workerId
       || job.claimUntilMs === null
       || job.claimUntilMs <= now

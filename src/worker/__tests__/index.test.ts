@@ -76,10 +76,17 @@ vi.mock("@/lib/generation/transports/comfyui-connection-manager", () => ({
 
 describe("PR-11: Worker 信号处理", () => {
   beforeEach(() => {
+    vi.resetModules();
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("SIGTERM");
+    process.exitCode = undefined;
     isEnabledMock.mockImplementation((flag: unknown) => flag === "V2_DURABLE_EXECUTION");
   });
 
   afterEach(() => {
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("SIGTERM");
+    process.exitCode = undefined;
     isEnabledMock.mockClear();
     closeAllConnectionsMock.mockClear();
   });
@@ -108,14 +115,19 @@ describe("PR-11: Worker 信号处理", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(process.exitCode).toBe(0);
+    expect(closeAllConnectionsMock).toHaveBeenCalledOnce();
   });
 });
 
 describe("managed single-endpoint worker startup", () => {
   it("parses managed runtime configuration exactly once per worker module", async () => {
+    vi.resetModules();
+    parseManagedConfigMock.mockClear();
     await import("../index");
     expect(parseManagedConfigMock).toHaveBeenCalledOnce();
     expect(parseManagedConfigMock).toHaveBeenCalledWith(process.env);
+    process.emit("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 20));
   });
 
   it("allows multiple enabled rows only for one physical endpoint and one capacity-one pool", async () => {
@@ -127,6 +139,7 @@ describe("managed single-endpoint worker startup", () => {
         { id: "speech", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
       ],
       [{ id: "gpu", capacity: 1 }],
+      [{ resourcePoolId: "gpu", slotNo: 0 }],
     )).not.toThrow();
   });
 
@@ -159,8 +172,25 @@ describe("managed single-endpoint worker startup", () => {
     },
   ])("fails closed for $name", async ({ backends, pools }) => {
     const { validateManagedWorkerBackendConfiguration } = await import("../index");
-    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools))
+    const slots = pools.map((pool, slotNo) => ({ resourcePoolId: pool.id, slotNo }));
+    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools, slots))
       .toThrow(/managed_comfyui_worker_configuration_invalid/);
+  });
+
+  it("fails closed when the capacity-one pool has zero or multiple physical slot rows", async () => {
+    const { validateManagedWorkerBackendConfiguration } = await import("../index");
+    const backends = [
+      { id: "managed", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
+    ];
+    const pools = [{ id: "gpu", capacity: 1 }];
+    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools, []))
+      .toThrow(/managed_comfyui_worker_configuration_invalid/);
+    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools, [
+      { resourcePoolId: "gpu", slotNo: 0 }, { resourcePoolId: "gpu", slotNo: 1 },
+    ])).toThrow(/managed_comfyui_worker_configuration_invalid/);
+    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools, [
+      { resourcePoolId: "gpu", slotNo: 0 },
+    ])).not.toThrow();
   });
 
   it("adapts the production transport into an awaitable readiness probe", async () => {
@@ -210,39 +240,47 @@ describe("managed single-endpoint worker startup", () => {
     expect(initialized.runtime).toBe(runtime);
   });
 
-  it("gates the second managed claim through execute, terminal release, close, stop/start, and readiness", async () => {
+  it("gates the second managed claim through output settlement, restart readiness, slot release, and claim release", async () => {
     const { pollWorkerJobs } = await import("../index");
     type Settled = JobExecutionResult;
     type Job = { id: string; execute: () => Promise<Settled>; release: () => Promise<boolean> };
-    const execution = deferred<Settled>();
+    const outputSettlement = deferred<void>();
     const release = deferred<boolean>();
     const readiness = deferred<void>();
     const events: string[] = [];
     let keepPolling = true;
-    const releaseFirstClaim = vi.fn(() => release.promise);
+    const terminal = (): Settled => ({
+      success: true,
+      finalPhase: "SUCCEEDED",
+      needsAttention: false,
+      claimDisposition: "release-terminal",
+    });
+    const managedExecute = async (waitForOutput: Promise<void>) => {
+      await waitForOutput;
+      events.push("close", "stop", "start");
+      await readiness.promise;
+      events.push("ready", "release-slot");
+      return terminal();
+    };
+    const releaseFirstClaim = vi.fn(async () => {
+      await release.promise;
+      events.push("release-claim");
+      return true;
+    });
     const jobs: Job[] = [
-      { id: "one", execute: () => execution.promise, release: releaseFirstClaim },
+      { id: "one", execute: () => managedExecute(outputSettlement.promise), release: releaseFirstClaim },
       {
         id: "two",
-        execute: async () => ({
-          success: true,
-          finalPhase: "SUCCEEDED",
-          needsAttention: false,
-          claimDisposition: "release-terminal",
-        }),
-        release: async () => { keepPolling = false; return true; },
+        execute: () => managedExecute(Promise.resolve()),
+        release: async () => { events.push("release-claim"); keepPolling = false; return true; },
       },
     ];
     const claim = vi.fn(async () => jobs.shift() ?? null);
     const boundary = new JobRuntimeBoundary<Job, Settled>({
       execute: (job) => settleClaimedJob({ execute: job.execute, release: job.release }),
-      closeConnections: async () => { events.push("close"); },
-      restart: async () => {
-        events.push("stop");
-        events.push("start");
-        await readiness.promise;
-        events.push("ready");
-      },
+      closeConnections: async () => { throw new Error("duplicate close"); },
+      restart: async () => { throw new Error("duplicate restart"); },
+      policy: { restartAfterJob: false, blockOnExecutionError: true, blockOnRetainedResult: true },
     });
 
     const polling = pollWorkerJobs({
@@ -255,24 +293,22 @@ describe("managed single-endpoint worker startup", () => {
 
     await vi.waitFor(() => expect(claim).toHaveBeenCalledTimes(1));
     expect(events).toEqual([]);
-    execution.resolve({
-      success: true,
-      finalPhase: "SUCCEEDED",
-      needsAttention: false,
-      claimDisposition: "release-terminal",
-    });
-    await vi.waitFor(() => expect(releaseFirstClaim).toHaveBeenCalledOnce());
-    expect(boundary.state).toBe("running-job");
-    expect(events).toEqual([]);
-    release.resolve(true);
+    outputSettlement.resolve();
     await vi.waitFor(() => expect(events).toEqual(["close", "stop", "start"]));
+    expect(boundary.state).toBe("running-job");
     expect(claim).toHaveBeenCalledTimes(1);
-    expect(() => boundary.assertReadyToClaim()).toThrow(/restarting/);
 
     readiness.resolve();
+    await vi.waitFor(() => expect(releaseFirstClaim).toHaveBeenCalledOnce());
+    expect(events).toEqual(["close", "stop", "start", "ready", "release-slot"]);
+    expect(claim).toHaveBeenCalledTimes(1);
+    release.resolve(true);
     await polling;
     expect(claim).toHaveBeenCalledTimes(2);
-    expect(events).toEqual(["close", "stop", "start", "ready", "close", "stop", "start", "ready"]);
+    expect(events).toEqual([
+      "close", "stop", "start", "ready", "release-slot", "release-claim",
+      "close", "stop", "start", "ready", "release-slot", "release-claim",
+    ]);
   });
 
   it("continues to the next unmanaged claim after an unexpected execution exception without reset", async () => {
@@ -291,7 +327,7 @@ describe("managed single-endpoint worker startup", () => {
       },
       closeConnections,
       restart,
-      policy: { restartAfterJob: false, blockOnExecutionError: false },
+      policy: { restartAfterJob: false, blockOnExecutionError: false, blockOnRetainedResult: false },
     });
 
     await pollWorkerJobs({
@@ -306,6 +342,67 @@ describe("managed single-endpoint worker startup", () => {
     expect(boundary.state).toBe("ready");
     expect(closeConnections).not.toHaveBeenCalled();
     expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("releases a claim returned after shutdown without starting execution or heartbeat", async () => {
+    const { claimReadyJob } = await import("../index");
+    const claim = deferred<{ id: string; claimFencingToken: number } | null>();
+    const release = vi.fn(async (id: string, fencingToken: number) => {
+      void id;
+      void fencingToken;
+      return true;
+    });
+    const execute = vi.fn();
+    let running = true;
+    const boundary = new JobRuntimeBoundary<string, { claimDisposition: "release-terminal" }>({
+      execute: async () => ({ claimDisposition: "release-terminal" }),
+      closeConnections: async () => undefined,
+      restart: async () => undefined,
+      policy: { restartAfterJob: false, blockOnExecutionError: false, blockOnRetainedResult: false },
+    });
+
+    const pending = claimReadyJob({
+      claim: () => claim.promise,
+      isRunning: () => running,
+      boundary,
+      release: (job) => release(job.id, job.claimFencingToken),
+    });
+    running = false;
+    await boundary.stop(10);
+    claim.resolve({ id: "late-job", claimFencingToken: 7 });
+
+    await expect(pending).resolves.toBeNull();
+    expect(release).toHaveBeenCalledWith("late-job", 7);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("releases a newly claimed job and blocks before execution when managed configuration mutates", async () => {
+    const { claimReadyJob, validateManagedWorkerBackendConfiguration } = await import("../index");
+    const release = vi.fn(async () => true);
+    const boundary = new JobRuntimeBoundary<string, { claimDisposition: "release-terminal" }>({
+      execute: async () => ({ claimDisposition: "release-terminal" }),
+      closeConnections: async () => undefined,
+      restart: async () => undefined,
+      policy: { restartAfterJob: false, blockOnExecutionError: true, blockOnRetainedResult: true },
+    });
+
+    await expect(claimReadyJob({
+      claim: async () => "claimed-job",
+      isRunning: () => true,
+      boundary,
+      release,
+      afterClaim: () => validateManagedWorkerBackendConfiguration(
+        "http://127.0.0.1:8000",
+        [
+          { id: "managed", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
+          { id: "injected", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8001", resourcePoolId: "gpu", enabled: true },
+        ],
+        [{ id: "gpu", capacity: 1 }],
+        [{ resourcePoolId: "gpu", slotNo: 0 }],
+      ),
+    })).rejects.toThrow(/managed_comfyui_worker_configuration_invalid/);
+    expect(release).toHaveBeenCalledWith("claimed-job");
+    expect(boundary.state).toBe("blocked");
   });
 });
 

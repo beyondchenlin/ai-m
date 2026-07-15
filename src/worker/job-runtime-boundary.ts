@@ -11,7 +11,17 @@ export interface JobRuntimeBoundaryDependencies<TJob, TResult extends JobRuntime
   policy?: {
     restartAfterJob: boolean;
     blockOnExecutionError: boolean;
+    blockOnRetainedResult?: boolean;
   };
+}
+
+export class JobExecutionAndRuntimeResetError extends AggregateError {
+  readonly code = "execution_and_runtime_reset_failed";
+
+  constructor(executionError: unknown, resetError: unknown) {
+    super([executionError, resetError], "Job execution and runtime reset both failed", { cause: executionError });
+    this.name = "JobExecutionAndRuntimeResetError";
+  }
 }
 
 export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
@@ -29,6 +39,10 @@ export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
     if (this.currentState !== "ready") {
       throw new Error(`job_runtime_boundary_not_ready:${this.currentState}`);
     }
+  }
+
+  block(): void {
+    if (this.currentState !== "stopped") this.currentState = "blocked";
   }
 
   run(job: TJob): Promise<TResult> {
@@ -53,18 +67,24 @@ export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
   private async runWithinBoundary(job: TJob, controller: AbortController): Promise<TResult> {
     const restartAfterJob = this.dependencies.policy?.restartAfterJob ?? true;
     const blockOnExecutionError = this.dependencies.policy?.blockOnExecutionError ?? true;
+    const blockOnRetainedResult = this.dependencies.policy?.blockOnRetainedResult ?? true;
     let result: TResult;
     try {
       result = await this.dependencies.execute(job, controller.signal);
     } catch (error) {
-      if (restartAfterJob) await this.resetRuntime(controller.signal).catch(() => undefined);
+      let resetError: unknown;
+      if (restartAfterJob) {
+        try { await this.resetRuntime(controller.signal); }
+        catch (caught) { resetError = caught; }
+      }
       if (this.currentState !== "stopped") this.currentState = blockOnExecutionError ? "blocked" : "ready";
+      if (resetError !== undefined) throw new JobExecutionAndRuntimeResetError(error, resetError);
       throw error;
     }
 
     if (restartAfterJob) await this.resetRuntime(controller.signal);
     if (this.currentState !== "stopped") {
-      this.currentState = !restartAfterJob || result.claimDisposition === "release-terminal" ? "ready" : "blocked";
+      this.currentState = result.claimDisposition === "retain-recovery" && blockOnRetainedResult ? "blocked" : "ready";
     }
     return result;
   }
@@ -90,9 +110,14 @@ export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
       return;
     }
 
-    await Promise.race([
-      active.then(() => undefined, () => undefined),
-      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        active.then(() => undefined, () => undefined),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }
