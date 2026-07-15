@@ -1,5 +1,36 @@
 # Pixelle 单端口 ComfyUI 工作流准备
 
+## Task 4：单端口盘点、执行、整体重启和重连
+
+验证器只接受 `http://127.0.0.1:8000`，只读取 `PIXELLE_WORKFLOW_STAGING_DIR/current.json` 指向的当前内容寻址代际，并只调用 Pixelle 固定的 `scripts/comfyui/stop_backend.ps1` 与 `start_backend.ps1`。它不会 import、promote 或 enable 工作流。
+
+默认是安全的盘点模式（`dry-run` 是 `inventory-only` 的别名）：检查代际/package digest、实际 `/system_stats`、`/object_info`、节点和模型 inventory，不提交任务，也不重启 ComfyUI：
+
+```powershell
+$env:PIXELLE_ROOT = 'D:\demo1\Pixelle\Pixelle'
+$env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
+$env:AI_M_MANAGED_COMFYUI_DATA_ROOT = '<Pixelle data root>'
+$env:AI_M_MANAGED_COMFYUI_PYTHON_EXE = '<python.exe>'
+$env:AI_M_MANAGED_COMFYUI_COMMAND_TIMEOUT_MS = '120000'
+$env:AI_M_MANAGED_COMFYUI_READY_TIMEOUT_MS = '300000'
+$env:TASK4_MODE = 'inventory-only'
+corepack pnpm workflow:verify:pixelle-single
+```
+
+真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包、限时轮询 history、限额下载并 fsync 归档，关闭旧连接，停止并启动整个 8000 后端，确认 PID/process creation/connection identity 全部变化，重新探测并为每个包写入签名 evidence：
+
+```powershell
+$env:TASK4_MODE = 'verify'
+$env:TASK4_CONFIRM_RESTART = 'RESTART-127.0.0.1:8000'
+$env:TASK4_PARAMETERS_FILE = 'D:\task4\parameters.json'
+$env:TASK4_REFERENCE_AUDIO_FILE = 'D:\task4\controlled-reference.wav'
+$env:TASK4_EVIDENCE_DIR = 'D:\task4\evidence'
+$env:TASK4_ARCHIVE_DIR = 'D:\task4\artifacts'
+corepack pnpm workflow:verify:pixelle-single
+```
+
+任何未知执行状态、提交结果不确定、节点/模型/schema 缺失、输出超限、重启超时或身份未变化都会 fail closed，且不会生成可导入的 evidence。完成后仍需单独执行人工 review/import/promote；本命令不会代替这些步骤。
+
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 
 ## 准备不可变代际

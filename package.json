@@ -32,6 +32,7 @@
     "workflow:import:verified-generation": "tsx scripts/import-verified-generation.ts",
     "workflow:promote": "tsx scripts/promote-workflow-package.ts",
     "workflow:prepare:pixelle-single": "tsx scripts/prepare-pixelle-single-backend.ts",
+    "workflow:verify:pixelle-single": "tsx scripts/verify-single-comfyui.ts",
     "workflow:gc:pixelle-single": "tsx scripts/gc-pixelle-generation.ts",
     "workflow:audit:verify:pixelle-single": "tsx scripts/verify-pixelle-gc-audit.ts",
     "workflow:trust:provision:pixelle-single": "tsx scripts/provision-pixelle-trust.ts",

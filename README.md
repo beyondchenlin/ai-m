@@ -1,5 +1,7 @@
 # AI Comic Builder
 
+Pixelle 单端口 ComfyUI 的当前代际盘点、真实验证、整体重启与重连流程见 [docs/comfyui-single-endpoint/README.md](docs/comfyui-single-endpoint/README.md)。`workflow:verify:pixelle-single` 默认仅执行 inventory，不会提交任务或重启后端。
+
 
 社区交流：[https://linux.do/](https://linux.do/)
 
