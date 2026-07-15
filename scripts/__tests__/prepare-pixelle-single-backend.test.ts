@@ -1,11 +1,14 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
+import { canonicalize } from "../../src/lib/generation/workflows/canonical";
+import { cleanupOwnedBackupDirectory, preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 
 const temporaryDirectories: string[] = [];
 const STAGING_MARKER = ".ai-m-pixelle-staging.json";
+const INVENTORY_NOW = 2_000_000_000_000;
 
 function node(classType: string, title: string, inputs: Record<string, unknown>) {
   return { class_type: classType, _meta: { title }, inputs };
@@ -87,22 +90,34 @@ async function makePixelleTree(overrides: Record<string, unknown> = {}) {
   return { root, workflowDir, stagingDir };
 }
 
-function partialInventory() {
+function hashCanonical(value: unknown): string {
+  return createHash("sha256").update(canonicalize(value)).digest("hex");
+}
+
+function partialInventory(overrides: Record<string, unknown> = {}) {
   const classes = new Set<string>();
   for (const workflow of Object.values(workflows)) {
     for (const item of Object.values(workflow) as Array<{ class_type: string }>) classes.add(item.class_type);
   }
   classes.delete("PixelleDurationInput");
-  return {
+  const nodeClasses = [...classes].sort();
+  const payload = {
     schemaVersion: 1,
-    objectInfo: Object.fromEntries([...classes].map((classType) => [classType, {}])),
+    source: "ai-m-live-comfyui-probe-v1",
+    baseUrl: "http://127.0.0.1:8000",
+    capturedAtMs: INVENTORY_NOW - 1_000,
+    maxAgeMs: 300_000,
+    backendFingerprint: "a".repeat(64),
+    nodeClasses,
     models: {
       diffusion_models: ["z_image_turbo_bf16.safetensors"],
       text_encoders: ["qwen_3_4b.safetensors", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"],
       vae: ["ae.safetensors"],
     },
-    backendFingerprint: { baseUrl: "http://127.0.0.1:8000", objectInfoSha256: "fixture" },
+    objectInfoSha256: hashCanonical(nodeClasses),
+    ...overrides,
   };
+  return { ...payload, inventoryDigest: hashCanonical(payload) };
 }
 
 afterEach(async () => {
@@ -128,6 +143,10 @@ describe("preparePixelleSingleBackendPackages", () => {
     expect(readme).toContain("WanT2V_MasterModel.safetensors");
     expect(readme).toContain("wan_2.1_vae.safetensors");
     expect(readme).not.toMatch(/workflow:import\s+</);
+    const importBlock = readme.match(/```powershell\n([\s\S]*?corepack pnpm workflow:import[\s\S]*?)```/)?.[1] ?? "";
+    expect(importBlock).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
+    expect(importBlock).not.toMatch(/\$env:PROFILE_CONFIG_FILE\s*=/);
+    expect(readme).toMatch(/无配置文件[\s\S]*disabled profile/i);
   });
 
   it("prepares all six real API workflow package types with truthful bindings, outputs, and models", async () => {
@@ -135,7 +154,7 @@ describe("preparePixelleSingleBackendPackages", () => {
     const result = await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
 
     expect(result.packages.map((item) => item.sourceFile)).toEqual(Object.keys(workflows));
-    expect(result.packages.every((item) => item.environmentStatus === "unverified")).toBe(true);
+    expect(result.packages.every((item) => item.inventoryStatus === "unverified")).toBe(true);
     expect(result.state).toBe("prepared-environment-unverified");
     expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8"))).toEqual({
       schemaVersion: 1,
@@ -192,24 +211,57 @@ describe("preparePixelleSingleBackendPackages", () => {
       pixelleRoot: root,
       stagingDir,
       inventory: partialInventory(),
+      nowMs: INVENTORY_NOW,
     });
     const bySource = Object.fromEntries(result.packages.map((item) => [item.sourceFile, item]));
-    expect(bySource["tts_index2.json"].environmentStatus).toBe("validated");
-    expect(bySource["tts_index2_8g.json"].environmentStatus).toBe("validated");
-    expect(bySource["tts_omnivoice_longform_bf16.json"].environmentStatus).toBe("validated");
-    expect(bySource["image_z_image_turbo.json"].environmentStatus).toBe("validated");
+    expect(bySource["tts_index2.json"].inventoryStatus).toBe("matched");
+    expect(bySource["tts_index2_8g.json"].inventoryStatus).toBe("matched");
+    expect(bySource["tts_omnivoice_longform_bf16.json"].inventoryStatus).toBe("matched");
+    expect(bySource["image_z_image_turbo.json"].inventoryStatus).toBe("matched");
     expect(bySource["tts_omnivoice_clone_duration_bf16.json"]).toMatchObject({
-      environmentStatus: "blocked",
+      inventoryStatus: "blocked",
       blockedReasons: ["missing node class: PixelleDurationInput"],
     });
     expect(bySource["video_wan2.1_fusionx.json"]).toMatchObject({
-      environmentStatus: "blocked",
+      inventoryStatus: "blocked",
       blockedReasons: [
         "missing model: diffusion_models/wan-fusionx/WanT2V_MasterModel.safetensors",
         "missing model: vae/wan_2.1_vae.safetensors",
       ],
     });
-    expect(result.state).toBe("prepared-with-environment-blockers");
+    expect(result.state).toBe("prepared-with-inventory-blockers");
+  });
+
+  it.each([
+    ["wrong 8001 endpoint", { baseUrl: "http://127.0.0.1:8001" }, /baseUrl|8000/i],
+    ["wrong 8002 endpoint", { baseUrl: "http://127.0.0.1:8002" }, /baseUrl|8000/i],
+    ["bad source", { source: "fixture" }, /source/i],
+    ["bad schema", { schemaVersion: 2 }, /schemaVersion/i],
+    ["fixture fingerprint", { backendFingerprint: "fixture" }, /backendFingerprint/i],
+    ["stale capture", { capturedAtMs: INVENTORY_NOW - 300_001 }, /stale|fresh/i],
+    ["unsafe node class", { nodeClasses: ["../bad"] }, /unsafe class/i],
+  ])("rejects inventory with %s", async (_label, override, expected) => {
+    const { root, stagingDir } = await makePixelleTree();
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: root,
+      stagingDir,
+      inventory: partialInventory(override),
+      nowMs: INVENTORY_NOW,
+    })).rejects.toThrow(expected);
+  });
+
+  it("rejects inventory node/model tampering and mismatched object-info evidence", async () => {
+    const { root, stagingDir } = await makePixelleTree();
+    const nodeTampered = partialInventory();
+    nodeTampered.nodeClasses = nodeTampered.nodeClasses.slice(1);
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: nodeTampered, nowMs: INVENTORY_NOW })).rejects.toThrow(/inventoryDigest/i);
+
+    const modelTampered = partialInventory();
+    modelTampered.models.vae.push("tampered.safetensors");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: modelTampered, nowMs: INVENTORY_NOW })).rejects.toThrow(/inventoryDigest/i);
+
+    const evidenceMismatch = partialInventory({ objectInfoSha256: "b".repeat(64) });
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir, inventory: evidenceMismatch, nowMs: INVENTORY_NOW })).rejects.toThrow(/objectInfoSha256/i);
   });
 
   it("is byte-for-byte deterministic and never leaks the absolute Pixelle path", async () => {
@@ -313,5 +365,50 @@ describe("preparePixelleSingleBackendPackages", () => {
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: path.resolve(".") })).rejects.toThrow(/repository|dangerous|staging/i);
     expect(await fs.readFile(path.resolve("package.json"))).toEqual(packageBefore);
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir: os.homedir() })).rejects.toThrow(/user profile|dangerous|staging/i);
+  });
+
+  it("keeps committed new staging when owned backup cleanup partially fails", async () => {
+    const { root, workflowDir, stagingDir } = await makePixelleTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "committed-new";
+    await fs.writeFile(path.join(workflowDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+
+    const result = await preparePixelleSingleBackendPackages({
+      pixelleRoot: root,
+      stagingDir,
+      removeOwnedBackup: async (backupDir: string) => {
+        await fs.rm(path.join(backupDir, "tts-index2"), { recursive: true });
+        throw new Error("injected partial backup cleanup failure");
+      },
+    });
+    expect(result.cleanupWarnings).toEqual([expect.stringMatching(/partial backup cleanup failure/i)]);
+    expect(await fs.readFile(path.join(stagingDir, "tts-index2", "workflow.api.json"), "utf8")).toContain("committed-new");
+    expect(JSON.parse(await fs.readFile(path.join(stagingDir, STAGING_MARKER), "utf8")).canonicalStagingPath).toBe(path.resolve(stagingDir));
+    const orphans = (await fs.readdir(path.dirname(stagingDir))).filter((name) => name.startsWith(`${path.basename(stagingDir)}.ai-m-backup-`));
+    expect(orphans).toHaveLength(1);
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: root, stagingDir })).rejects.toThrow(/orphan backup|cleanup/i);
+    await fs.rm(path.join(path.dirname(stagingDir), orphans[0]), { recursive: true });
+  });
+
+  it("deletes owned backup contents before its ownership marker", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "ai-m-owned-backup-"));
+    temporaryDirectories.push(parent);
+    const canonicalStagingPath = path.join(parent, "staging");
+    const backupDir = path.join(parent, "staging.ai-m-backup-test");
+    await fs.mkdir(path.join(backupDir, "a"), { recursive: true });
+    await fs.mkdir(path.join(backupDir, "b"), { recursive: true });
+    await fs.writeFile(path.join(backupDir, STAGING_MARKER), JSON.stringify({
+      schemaVersion: 1,
+      producer: "ai-m/pixelle-single-backend",
+      canonicalStagingPath,
+    }), "utf8");
+    let removals = 0;
+    await expect(cleanupOwnedBackupDirectory(backupDir, canonicalStagingPath, async (target) => {
+      removals += 1;
+      if (removals === 2) throw new Error("injected child cleanup failure");
+      await fs.rm(target, { recursive: true });
+    })).rejects.toThrow(/injected child cleanup failure/);
+    expect(await fs.stat(path.join(backupDir, STAGING_MARKER))).toBeTruthy();
   });
 });

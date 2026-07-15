@@ -34,19 +34,19 @@ corepack pnpm workflow:prepare:pixelle-single
 ```json
 {
   "schemaVersion": 1,
-  "objectInfo": {
-    "SaveAudio": {},
-    "VHS_VideoCombine": {}
-  },
+  "source": "ai-m-live-comfyui-probe-v1",
+  "baseUrl": "http://127.0.0.1:8000",
+  "capturedAtMs": 2000000000000,
+  "maxAgeMs": 300000,
+  "backendFingerprint": "<64 lowercase hex>",
+  "nodeClasses": ["SaveAudio", "VHS_VideoCombine"],
   "models": {
     "diffusion_models": ["example.safetensors"],
     "text_encoders": [],
     "vae": []
   },
-  "backendFingerprint": {
-    "baseUrl": "http://127.0.0.1:8000",
-    "objectInfoSha256": "..."
-  }
+  "objectInfoSha256": "<sha256 of canonical nodeClasses bytes, 64 lowercase hex>",
+  "inventoryDigest": "<sha256 of the canonical payload excluding this field>"
 }
 ```
 
@@ -55,9 +55,11 @@ $env:COMFYUI_INVENTORY_FILE = 'D:\demo1\ai-m-workflow-staging\inventory-8000.jso
 corepack pnpm workflow:prepare:pixelle-single
 ```
 
+schema、source、端口、新鲜度、backend fingerprint、node class evidence hash 与完整 inventory digest 任一不匹配都会拒绝整个 inventory。`maxAgeMs` 由 Task 4 probe 配置，范围为 1 秒至 24 小时；过期或明显来自未来的快照拒绝使用。节点名、模型 folder/filename 必须安全且唯一。
+
 CLI 分别输出：
 
-- `validated`：所需 node classes 与明确声明的 model folder/filename 全部匹配。
+- `inventoryMatched`：Task 4 live inventory 中的 node classes 与明确声明的 model folder/filename 匹配；状态为 `prepared-inventory-matched`，仍需后续 live run/review，不能等同于生产可用。
 - `unverified`：没有提供 inventory；不能称为可用或可导入。
 - `blocked`：列出缺失节点或模型；禁止进入 import。
 
@@ -70,7 +72,7 @@ CLI 分别输出：
 
 ## 3. Review 与逐包 import
 
-只对 CLI `validated` 列表中的包执行。先人工检查 workflow、manifest、compiled bindings、package lock 和 inventory fingerprint。
+只对 Task 4 live verify 后 CLI `inventoryMatched` 列表中的包执行。先人工检查 workflow、manifest、compiled bindings、package lock 和 inventory fingerprint。没有 Task 4 live verify，即使本地磁盘存在节点或模型文件，也不能 import/promote。
 
 import 脚本只从环境变量读取完整流程配置；不要使用 positional package 参数。下面示例会同时导入不可变 workflow package 并创建一个 disabled profile：
 
@@ -80,23 +82,29 @@ $env:WORKFLOW_IMPORTER_ID = 'local-importer'
 $env:PROFILE_KEY = 'pixelle.tts.index2.local'
 $env:PROFILE_DISPLAY_NAME = 'Pixelle IndexTTS2 Local'
 $env:EXECUTION_BACKEND_ID = '<8000 后端数据库 ID>'
-
-# 可选；未设置时使用 {"defaultParameters":{}}
-$env:PROFILE_CONFIG_FILE = 'D:\demo1\ai-m-workflow-staging\profiles\tts-index2.profile.json'
+Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue
 
 corepack pnpm workflow:import | Tee-Object -FilePath '.\import-tts-index2.log'
 ```
 
-对每个 validated 包分别设置 `WORKFLOW_PACKAGE_DIR`、唯一 `PROFILE_KEY`、匹配 capability 的 `PROFILE_DISPLAY_NAME` 后重复执行。记录命令输出中的：
+无配置文件时，上面的主流程会使用 `{"defaultParameters":{}}`，仍会创建 disabled profile（admin visibility）。对每个 inventoryMatched 包分别设置 `WORKFLOW_PACKAGE_DIR`、唯一 `PROFILE_KEY`、匹配 capability 的 `PROFILE_DISPLAY_NAME` 后重复执行。记录命令输出中的：
 
 - `workflowDigest` → 后续设置为 `WORKFLOW_DIGEST` 与 `CONFIRM_WORKFLOW_DIGEST`。
 - `profileRevisionId` → 后续设置为 `PROFILE_REVISION_ID`。
 - `package.lock.json.environmentLockDigest` → 后续设置为 `CONFIRM_ENVIRONMENT_LOCK_DIGEST`。
 
-如果不设置 `PROFILE_KEY`，import 只安装 workflow package，不创建 profile；只有设置 `PROFILE_KEY` 的 import 才要求 `EXECUTION_BACKEND_ID`，并创建初始为 disabled/admin 的 profile。`PROFILE_CONFIG_FILE` 是可选项，不使用时应清除旧环境变量：
+如果不设置 `PROFILE_KEY`，import 只安装 workflow package，不创建 profile；只有设置 `PROFILE_KEY` 的 import 才要求 `EXECUTION_BACKEND_ID`，并创建初始为 disabled/admin 的 profile。
+
+确实需要 `PROFILE_CONFIG_FILE` 时，必须先创建完整合法 JSON，再设置变量：
 
 ```powershell
-Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force 'D:\demo1\ai-m-workflow-staging\profiles' | Out-Null
+@'
+{
+  "defaultParameters": {}
+}
+'@ | Set-Content -Encoding utf8 'D:\demo1\ai-m-workflow-staging\profiles\tts-index2.profile.json'
+$env:PROFILE_CONFIG_FILE = 'D:\demo1\ai-m-workflow-staging\profiles\tts-index2.profile.json'
 ```
 
 ## 4. Live review 与 promote

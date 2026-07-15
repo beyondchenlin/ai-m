@@ -13,30 +13,39 @@ import type { AuthorBinding, AuthorOutput, ComfyWorkflow, WorkflowManifest } fro
 
 export interface ComfyUIInventory {
   schemaVersion: 1;
-  objectInfo: Record<string, unknown>;
+  source: "ai-m-live-comfyui-probe-v1";
+  baseUrl: "http://127.0.0.1:8000";
+  capturedAtMs: number;
+  maxAgeMs: number;
+  backendFingerprint: string;
+  nodeClasses: string[];
   models: Record<string, string[]>;
-  backendFingerprint: Record<string, unknown>;
+  objectInfoSha256: string;
+  inventoryDigest: string;
 }
 
 export interface PrepareOptions {
   pixelleRoot: string;
   stagingDir: string;
   inventory?: unknown;
+  nowMs?: number;
   writeBytes?: typeof fs.writeFile;
+  removeOwnedBackup?: (backupDir: string) => Promise<void>;
 }
 
 interface PreparedPackage {
   sourceFile: string;
   packageDir: string;
   workflowId: string;
-  environmentStatus: "unverified" | "validated" | "blocked";
+  inventoryStatus: "unverified" | "matched" | "blocked";
   blockedReasons: string[];
 }
 
 export interface PrepareResult {
   stagingDir: string;
   packages: PreparedPackage[];
-  state: "prepared-environment-unverified" | "prepared-environment-validated" | "prepared-with-environment-blockers";
+  state: "prepared-environment-unverified" | "prepared-inventory-matched" | "prepared-with-inventory-blockers";
+  cleanupWarnings: string[];
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -299,33 +308,104 @@ async function assertOwnedStaging(directory: string, canonicalStagingPath: strin
   }
 }
 
-function parseInventory(value: unknown): ComfyUIInventory {
-  if (!isRecord(value) || value.schemaVersion !== 1) throw new Error("ComfyUI inventory schemaVersion must equal 1");
-  if (!isRecord(value.objectInfo)) throw new Error("ComfyUI inventory objectInfo must be an object");
-  if (!isRecord(value.models)) throw new Error("ComfyUI inventory models must be an object");
-  if (!isRecord(value.backendFingerprint) || Object.keys(value.backendFingerprint).length === 0) {
-    throw new Error("ComfyUI inventory backendFingerprint must be a non-empty object");
+export async function cleanupOwnedBackupDirectory(
+  backupDir: string,
+  canonicalStagingPath: string,
+  removeEntry: (target: string) => Promise<void> = async (target) => fs.rm(target, { recursive: true, force: false }),
+): Promise<void> {
+  await assertOwnedStaging(backupDir, canonicalStagingPath);
+  const entries = (await fs.readdir(backupDir)).filter((name) => name !== STAGING_MARKER_FILENAME).sort();
+  for (const name of entries) await removeEntry(path.join(backupDir, name));
+  const markerPath = path.join(backupDir, STAGING_MARKER_FILENAME);
+  await fs.unlink(markerPath);
+  try {
+    await fs.rmdir(backupDir);
+  } catch (error) {
+    try { await fs.writeFile(markerPath, jsonBytes(stagingMarker(canonicalStagingPath))); } catch { /* keep the original cleanup failure */ }
+    throw error;
   }
+}
+
+function parseInventory(value: unknown, nowMs: number): ComfyUIInventory {
+  if (!isRecord(value) || value.schemaVersion !== 1) throw new Error("ComfyUI inventory schemaVersion must equal 1");
+  const allowed = [
+    "schemaVersion", "source", "baseUrl", "capturedAtMs", "maxAgeMs", "backendFingerprint",
+    "nodeClasses", "models", "objectInfoSha256", "inventoryDigest",
+  ];
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length) throw new Error(`ComfyUI inventory has unknown field(s): ${unknown.join(", ")}`);
+  if (value.source !== "ai-m-live-comfyui-probe-v1") throw new Error("ComfyUI inventory source is invalid");
+  if (value.baseUrl !== "http://127.0.0.1:8000") throw new Error("ComfyUI inventory baseUrl must exactly equal http://127.0.0.1:8000");
+  if (!Number.isSafeInteger(value.capturedAtMs) || (value.capturedAtMs as number) <= 0) throw new Error("ComfyUI inventory capturedAtMs must be a positive integer");
+  if (!Number.isSafeInteger(value.maxAgeMs) || (value.maxAgeMs as number) < 1_000 || (value.maxAgeMs as number) > 86_400_000) {
+    throw new Error("ComfyUI inventory maxAgeMs must be an integer between 1000 and 86400000");
+  }
+  const ageMs = nowMs - (value.capturedAtMs as number);
+  if (ageMs < -300_000) throw new Error("ComfyUI inventory capture time is unreasonably far in the future");
+  if (ageMs > (value.maxAgeMs as number)) throw new Error("ComfyUI inventory is stale and must be refreshed by the live probe");
+  if (typeof value.backendFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.backendFingerprint)) {
+    throw new Error("ComfyUI inventory backendFingerprint must be 64 lowercase hex characters");
+  }
+  if (!Array.isArray(value.nodeClasses) || value.nodeClasses.length === 0) throw new Error("ComfyUI inventory nodeClasses must be non-empty");
+  const nodeClasses: string[] = [];
+  const seenClasses = new Set<string>();
+  for (const item of value.nodeClasses) {
+    if (typeof item !== "string" || item !== item.trim() || !/^[A-Za-z0-9_ .:+-]{1,200}$/.test(item)) {
+      throw new Error("ComfyUI inventory nodeClasses contains an unsafe class name");
+    }
+    if (seenClasses.has(item)) throw new Error(`ComfyUI inventory nodeClasses contains duplicate: ${item}`);
+    seenClasses.add(item);
+    nodeClasses.push(item);
+  }
+  nodeClasses.sort();
+  if (!isRecord(value.models)) throw new Error("ComfyUI inventory models must be an object");
   const models: Record<string, string[]> = {};
   for (const [folder, filenames] of Object.entries(value.models)) {
+    if (!/^[A-Za-z0-9._-]+$/.test(folder)) throw new Error(`ComfyUI inventory model folder is unsafe: ${folder}`);
     if (!Array.isArray(filenames) || !filenames.every((item) => typeof item === "string" && item.length > 0)) {
       throw new Error(`ComfyUI inventory models.${folder} must be string[]`);
     }
-    models[folder] = [...new Set(filenames.map((item) => item.replace(/\\/g, "/")))].sort();
+    const normalized = (filenames as string[]).map((item) => item.replace(/\\/g, "/"));
+    for (const filename of normalized) {
+      const parts = filename.split("/");
+      if (filename.length > 1_024 || path.isAbsolute(filename) || parts.some((part) => !part || part === "." || part === ".." || part.length > 255)) {
+        throw new Error(`ComfyUI inventory model filename is unsafe: ${folder}/${filename}`);
+      }
+    }
+    if (new Set(normalized).size !== normalized.length) throw new Error(`ComfyUI inventory models.${folder} contains duplicate filenames`);
+    models[folder] = normalized.sort();
   }
-  return {
-    schemaVersion: 1,
-    objectInfo: value.objectInfo,
-    models,
+  if (typeof value.objectInfoSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.objectInfoSha256)) {
+    throw new Error("ComfyUI inventory objectInfoSha256 must be 64 lowercase hex characters");
+  }
+  if (typeof value.inventoryDigest !== "string" || !/^[a-f0-9]{64}$/.test(value.inventoryDigest)) {
+    throw new Error("ComfyUI inventory inventoryDigest must be 64 lowercase hex characters");
+  }
+  const normalizedPayload = {
+    schemaVersion: 1 as const,
+    source: "ai-m-live-comfyui-probe-v1" as const,
+    baseUrl: "http://127.0.0.1:8000" as const,
+    capturedAtMs: value.capturedAtMs as number,
+    maxAgeMs: value.maxAgeMs as number,
     backendFingerprint: value.backendFingerprint,
+    nodeClasses,
+    models,
+    objectInfoSha256: value.objectInfoSha256,
   };
+  if (digestBytes(Buffer.from(canonicalize(normalizedPayload), "utf8")) !== value.inventoryDigest) {
+    throw new Error("ComfyUI inventory inventoryDigest does not match its canonical payload");
+  }
+  if (digestBytes(Buffer.from(canonicalize(nodeClasses), "utf8")) !== value.objectInfoSha256) {
+    throw new Error("ComfyUI inventory objectInfoSha256 does not match canonical nodeClasses evidence");
+  }
+  return { ...normalizedPayload, inventoryDigest: value.inventoryDigest };
 }
 
 function environmentAssessment(manifest: WorkflowManifest, inventory: ComfyUIInventory | undefined) {
-  if (!inventory) return { environmentStatus: "unverified" as const, blockedReasons: [] as string[] };
+  if (!inventory) return { inventoryStatus: "unverified" as const, blockedReasons: [] as string[] };
   const blockedReasons: string[] = [];
   for (const classType of manifest.requirements.nodeClasses) {
-    if (!(classType in inventory.objectInfo)) blockedReasons.push(`missing node class: ${classType}`);
+    if (!inventory.nodeClasses.includes(classType)) blockedReasons.push(`missing node class: ${classType}`);
   }
   for (const model of manifest.requirements.models) {
     const filename = model.filename.replace(/\\/g, "/");
@@ -334,8 +414,8 @@ function environmentAssessment(manifest: WorkflowManifest, inventory: ComfyUIInv
     }
   }
   return blockedReasons.length
-    ? { environmentStatus: "blocked" as const, blockedReasons }
-    : { environmentStatus: "validated" as const, blockedReasons };
+    ? { inventoryStatus: "blocked" as const, blockedReasons }
+    : { inventoryStatus: "matched" as const, blockedReasons };
 }
 
 async function removeInvocationDirectory(directory: string, parent: string, prefix: string): Promise<void> {
@@ -442,7 +522,18 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   if (await fs.realpath(workflowDir) !== workflowDir) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
   const existingStaging = await lstatOrNull(stagingDir);
   if (existingStaging) await assertOwnedStaging(stagingDir, stagingDir);
-  const inventory = options.inventory === undefined ? undefined : parseInventory(options.inventory);
+  const basename = path.basename(stagingDir);
+  const backupPrefix = `${basename}.ai-m-backup-`;
+  const orphanBackups = (await fs.readdir(stagingParent, { withFileTypes: true }))
+    .filter((entry) => entry.name.startsWith(backupPrefix));
+  if (orphanBackups.length) {
+    for (const orphan of orphanBackups) {
+      if (!orphan.isDirectory() || orphan.isSymbolicLink()) throw new Error(`Unsafe orphan backup blocks staging: ${orphan.name}`);
+      await assertOwnedStaging(path.join(stagingParent, orphan.name), stagingDir);
+    }
+    throw new Error(`Owned orphan backup cleanup is required before another run: ${orphanBackups.map((item) => item.name).join(", ")}`);
+  }
+  const inventory = options.inventory === undefined ? undefined : parseInventory(options.inventory, options.nowMs ?? Date.now());
 
   const prepared: Array<{
     definition: CandidateDefinition;
@@ -457,12 +548,12 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     prepared.push({ definition, workflow, manifest, compiled });
   }
 
-  const basename = path.basename(stagingDir);
   const tempPrefix = `${basename}.ai-m-tmp-`;
   const tempDir = path.join(stagingParent, `${tempPrefix}${randomUUID()}`);
   await fs.mkdir(tempDir);
   const writeBytes = options.writeBytes ?? fs.writeFile;
   const packages: PreparedPackage[] = [];
+  const cleanupWarnings: string[] = [];
   try {
     for (const item of prepared) {
       const tempPackageDir = path.join(tempDir, item.definition.packageName);
@@ -512,29 +603,27 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
 
     if (!existingStaging) {
       await fs.rename(tempDir, stagingDir);
+      await assertOwnedStaging(stagingDir, stagingDir);
     } else {
-      const backupPrefix = `${basename}.ai-m-backup-`;
       const backupDir = path.join(stagingParent, `${backupPrefix}${randomUUID()}`);
       await fs.rename(stagingDir, backupDir);
       try {
         await fs.rename(tempDir, stagingDir);
+        await assertOwnedStaging(stagingDir, stagingDir);
       } catch (error) {
+        const failedNewPrefix = `${basename}.ai-m-precommit-new-`;
+        const failedNewDir = path.join(stagingParent, `${failedNewPrefix}${randomUUID()}`);
+        if (await lstatOrNull(stagingDir)) await fs.rename(stagingDir, failedNewDir);
         await fs.rename(backupDir, stagingDir);
+        await removeInvocationDirectory(failedNewDir, stagingParent, failedNewPrefix);
         throw error;
       }
+      await assertOwnedStaging(backupDir, stagingDir);
       try {
-        await assertOwnedStaging(backupDir, stagingDir);
-        await fs.rm(backupDir, { recursive: true, force: false });
+        if (options.removeOwnedBackup) await options.removeOwnedBackup(backupDir);
+        else await cleanupOwnedBackupDirectory(backupDir, stagingDir);
       } catch (error) {
-        if (await lstatOrNull(backupDir)) {
-          await assertOwnedStaging(backupDir, stagingDir);
-          const failedNewPrefix = `${basename}.ai-m-rollback-new-`;
-          const failedNewDir = path.join(stagingParent, `${failedNewPrefix}${randomUUID()}`);
-          await fs.rename(stagingDir, failedNewDir);
-          await fs.rename(backupDir, stagingDir);
-          await removeInvocationDirectory(failedNewDir, stagingParent, failedNewPrefix);
-        }
-        throw error;
+        cleanupWarnings.push(`Committed new staging; owned backup cleanup failed at ${backupDir}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   } catch (error) {
@@ -543,10 +632,10 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   }
   const state = !inventory
     ? "prepared-environment-unverified" as const
-    : packages.some((item) => item.environmentStatus === "blocked")
-      ? "prepared-with-environment-blockers" as const
-      : "prepared-environment-validated" as const;
-  return { stagingDir, packages, state };
+    : packages.some((item) => item.inventoryStatus === "blocked")
+      ? "prepared-with-inventory-blockers" as const
+      : "prepared-inventory-matched" as const;
+  return { stagingDir, packages, state, cleanupWarnings };
 }
 
 async function main(): Promise<void> {
@@ -559,9 +648,10 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({
     stagingDir: result.stagingDir,
     state: result.state,
-    validated: result.packages.filter((item) => item.environmentStatus === "validated").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
-    unverified: result.packages.filter((item) => item.environmentStatus === "unverified").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
-    blocked: result.packages.filter((item) => item.environmentStatus === "blocked").map(({ sourceFile, workflowId, blockedReasons }) => ({ sourceFile, workflowId, blockedReasons })),
+    inventoryMatched: result.packages.filter((item) => item.inventoryStatus === "matched").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
+    unverified: result.packages.filter((item) => item.inventoryStatus === "unverified").map(({ sourceFile, workflowId }) => ({ sourceFile, workflowId })),
+    blocked: result.packages.filter((item) => item.inventoryStatus === "blocked").map(({ sourceFile, workflowId, blockedReasons }) => ({ sourceFile, workflowId, blockedReasons })),
+    cleanupWarnings: result.cleanupWarnings,
   }, null, 2));
 }
 
