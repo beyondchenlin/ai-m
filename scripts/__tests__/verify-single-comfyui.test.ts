@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -116,6 +117,19 @@ describe("single-endpoint Task 4 verifier", () => {
     expect(() => parseTask4Mode({ TASK4_MODE: "verify" })).toThrow(/CONFIRM_RESTART/);
     expect(parseTask4Mode({ TASK4_MODE: "verify", TASK4_CONFIRM_RESTART: "RESTART-127.0.0.1:8000" })).toBe("verify");
   });
+  it("parses locale-independent numeric PowerShell listener identity", async () => {
+    const verifierModule = await import("../verify-single-comfyui") as unknown as { parseTask4ListenerObservation(value: unknown): unknown };
+    expect(verifierModule.parseTask4ListenerObservation({ pid: 13024, createdMs: 1_784_096_849_140, bootMs: 1_783_292_991_204 })).toEqual({
+      pid: 13024, processCreatedAtMs: 1_784_096_849_140, bootId: "windows-1783292991204", processIdentity: "windows-1783292991204:13024:1784096849140",
+    });
+  });
+  it("allows the measured ComfyUI object_info node count under a dedicated bound", async () => {
+    const verifierModule = await import("../verify-single-comfyui") as unknown as { parseTask4Json(bytes: Buffer, label: string, maximumNodes?: number): unknown };
+    const measured = Buffer.from(JSON.stringify({ nodes: Object.fromEntries(Array.from({ length: 125_924 }, (_, index) => [String(index), 1])) }));
+    expect(verifierModule.parseTask4Json(measured, "object_info", 200_000)).toBeDefined();
+    expect(() => verifierModule.parseTask4Json(Buffer.from(JSON.stringify({ nodes: Array.from({ length: 10_001 }, () => 1) })), "object_info", 200_000)).toThrow(/array.*bound/i);
+    expect(() => verifierModule.parseTask4Json(Buffer.from(JSON.stringify({ nodes: Object.fromEntries(Array.from({ length: 200_001 }, (_, index) => [String(index), 1])) })), "object_info", 200_000)).toThrow(/structural bounds/i);
+  });
   it("inventory-only verifies current bytes and inventory without submit, restart, import or promote", async () => {
     const f = await fixture(); const events: string[] = [];
     const result = await verifySingleComfyUI({
@@ -127,6 +141,73 @@ describe("single-endpoint Task 4 verifier", () => {
     expect(events).toEqual(["/system_stats", "/object_info", "close"]);
     expect(result.packages).toEqual(["image-test"]);
   });
+
+  it("closes the initial HTTP/WebSocket session when listener observation fails", async () => {
+    const f = await fixture(); let closes = 0;
+    await expect(verifySingleComfyUI({
+      baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot,
+      generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest,
+      evidenceDir: path.join(f.root, "evidence"), archiveDir: path.join(f.root, "archive"), parameters: {},
+    }, {
+      expectedPackageNames: [f.packageName], connect: async () => fakeSession([], { close: async () => { closes += 1; } }),
+      observeListener: async () => { throw new Error("listener schema failed"); }, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).rejects.toThrow(/listener schema failed/i);
+    expect(closes).toBe(1);
+  });
+
+  it("lets a real Node process exit promptly after closing a local WebSocket session", async () => {
+    const f = await fixture(); const sockets = new Set<import("node:stream").Duplex>();
+    const server = createServer();
+    server.on("upgrade", (request, socket) => {
+      sockets.add(socket); socket.on("close", () => sockets.delete(socket));
+      const key = request.headers["sec-websocket-key"];
+      if (typeof key !== "string") { socket.destroy(); return; }
+      const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      socket.on("data", (bytes) => { if ((bytes[0] & 0x0f) === 0x08) { socket.end(Buffer.from([0x88, 0x00])); } });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address(); if (!address || typeof address === "string") throw new Error("local WebSocket server address is unavailable");
+    const helper = path.join(f.root, "session-exit.mts"); const moduleUrl = pathToFileURL(path.resolve("scripts/verify-single-comfyui.ts")).href;
+    await fs.writeFile(helper, `import { createHttpSession } from ${JSON.stringify(moduleUrl)}; const session = await createHttpSession(${JSON.stringify(`http://127.0.0.1:${address.port}`)}); await session.close(); console.log("closed");\n`);
+    const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = ""; let stderr = ""; child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8"); child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        new Promise<{ code: number | null }>((resolve) => child.once("close", (code) => resolve({ code }))),
+        new Promise<never>((_, reject) => { exitTimer = setTimeout(() => reject(new Error("session child did not exit within 5 seconds")), 5_000); }),
+      ]);
+      expect(result.code, stderr).toBe(0); expect(stdout).toContain("closed");
+    } finally {
+      if (exitTimer) clearTimeout(exitTimer);
+      child.kill(); for (const socket of sockets) socket.destroy(); await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 10_000);
+
+  it("forces bounded process exit when a local WebSocket peer ignores the close handshake", async () => {
+    const f = await fixture(); const sockets = new Set<import("node:stream").Duplex>(); const server = createServer();
+    server.on("upgrade", (request, socket) => {
+      sockets.add(socket); socket.on("close", () => sockets.delete(socket)); const key = request.headers["sec-websocket-key"];
+      if (typeof key !== "string") { socket.destroy(); return; }
+      const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)); const address = server.address();
+    if (!address || typeof address === "string") throw new Error("local WebSocket server address is unavailable");
+    const helper = path.join(f.root, "session-timeout-exit.mts"); const moduleUrl = pathToFileURL(path.resolve("scripts/verify-single-comfyui.ts")).href;
+    await fs.writeFile(helper, `import { createHttpSession } from ${JSON.stringify(moduleUrl)}; const session = await createHttpSession(${JSON.stringify(`http://127.0.0.1:${address.port}`)}); try { await session.close(); } catch { console.log("close-failed"); }\n`);
+    const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = ""; let stderr = ""; child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8"); child.stdout.on("data", (chunk) => { stdout += chunk; }); child.stderr.on("data", (chunk) => { stderr += chunk; });
+    let exitTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        new Promise<{ code: number | null }>((resolve) => child.once("close", (code) => resolve({ code }))),
+        new Promise<never>((_, reject) => { exitTimer = setTimeout(() => reject(new Error("session child retained an active WebSocket handle")), 8_000); }),
+      ]);
+      expect(result.code, stderr).toBe(0); expect(stdout).toContain("close-failed");
+    } finally { if (exitTimer) clearTimeout(exitTimer); child.kill(); for (const socket of sockets) socket.destroy(); await new Promise<void>((resolve) => server.close(() => resolve())); }
+  }, 12_000);
 
   it("executes, archives, closes, restarts, reconnects and emits self-verifiable signed evidence", async () => {
     const f = await fixture(); const events: string[] = []; let connections = 0; let now = 2_000_000_000_000;
@@ -370,6 +451,13 @@ describe("single-endpoint Task 4 verifier", () => {
     })).resolves.toMatchObject({ mode: "inventory-only" });
   });
 
+  it("accepts a locally captured required node with null display_name", async () => {
+    const f = await fixture(); const primitive = (await fakeSession([]).objectInfo()).PrimitiveStringMultiline as Record<string, unknown>;
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
+      expectedPackageNames: [f.packageName], connect: async () => fakeSession([], { objectInfo: async () => ({ ...(await fakeSession([]).objectInfo()), PrimitiveStringMultiline: { ...primitive, display_name: null } }) }), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).resolves.toMatchObject({ mode: "inventory-only" });
+  });
+
   it("accepts locally captured VHS output_node with VHS_FILENAMES while keeping gifs history-only", async () => {
     const f = await fixture("video"); const captured = JSON.parse(await fs.readFile(path.join(__dirname, "fixtures", "comfyui-object-info-captured.json"), "utf8"));
     const primitive = { input: { required: { value: ["STRING", {}] } }, output: ["STRING"], output_is_list: [false], output_name: ["STRING"], output_node: false, name: "PrimitiveStringMultiline", display_name: "Text", description: "" };
@@ -429,7 +517,7 @@ describe("single-endpoint Task 4 verifier", () => {
     const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), env: { ...process.env, PIXELLE_ROOT: f.pixelleRoot, STAGING_DIR: path.join(f.root, "staging"), READY_FILE: ready }, windowsHide: true, stdio: "ignore" });
     const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     try {
-      for (let attempt = 0; attempt < 100; attempt += 1) { try { await fs.lstat(ready); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); } }
+      for (let attempt = 0; attempt < 300; attempt += 1) { try { await fs.lstat(ready); break; } catch { await new Promise((resolve) => setTimeout(resolve, 20)); } }
       await expect(fs.lstat(ready)).resolves.toBeDefined(); let connected = false;
       const agedPrepareLock = JSON.parse(await fs.readFile(prepareLock, "utf8")); agedPrepareLock.startedAtMs = Date.now() - 16 * 60_000;
       await fs.writeFile(prepareLock, `${canonicalize(agedPrepareLock)}\n`);
@@ -444,7 +532,7 @@ describe("single-endpoint Task 4 verifier", () => {
       })).rejects.toThrow(/original live process/i);
       expect(connected).toBe(false);
     } finally { child.kill(); await childClosed; }
-  });
+  }, 15_000);
 
   it("keeps a Task4-written aged prepare.lock when its real OS owner is still alive", async () => {
     const f = await fixture(); const ready = path.join(f.root, "task4-ready"); const helper = path.join(f.root, "task4-owner.mts");

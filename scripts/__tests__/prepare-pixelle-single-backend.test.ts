@@ -419,22 +419,23 @@ describe("immutable Pixelle workflow preparation", () => {
     const helperPath = path.join(root, "prepare-child.mts");
     const moduleUrl = pathToFileURL(path.resolve("scripts/prepare-pixelle-single-backend.ts")).href;
     await fs.writeFile(helperPath, `
+      import { promises as fs } from "node:fs";
       import { preparePixelleSingleBackendPackages } from ${JSON.stringify(moduleUrl)};
       try {
         await preparePixelleSingleBackendPackages({
           pixelleRoot: process.env.PIXELLE_ROOT!,
           stagingDir: process.env.STAGING_DIR!,
-          afterLockAcquired: async () => new Promise((resolve) => setTimeout(resolve, Number(process.env.HOLD_MS ?? 0))),
+          afterLockAcquired: async () => { while (process.env.RELEASE_FILE && !await fs.stat(process.env.RELEASE_FILE).then(() => true, () => false)) await new Promise((resolve) => setTimeout(resolve, 20)); },
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;
       }
     `, "utf8");
-    const runChild = (holdMs: number) => {
+    const runChild = (releaseFile?: string) => {
       const child = spawn(process.execPath, ["--import", "tsx", helperPath], {
         cwd: process.cwd(),
-        env: { ...process.env, PIXELLE_ROOT: pixelleRoot, STAGING_DIR: stagingDir, HOLD_MS: String(holdMs) },
+        env: { ...process.env, PIXELLE_ROOT: pixelleRoot, STAGING_DIR: stagingDir, RELEASE_FILE: releaseFile },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stderr = "";
@@ -442,14 +443,15 @@ describe("immutable Pixelle workflow preparation", () => {
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       return { child, done: new Promise<{ code: number | null; stderr: string }>((resolve) => child.once("close", (code) => resolve({ code, stderr }))) };
     };
-    const first = runChild(1_000);
+    const releaseFile = path.join(root, "release-first-prepare"); const first = runChild(releaseFile);
     for (let attempt = 0; attempt < 100; attempt += 1) {
       if (await fs.stat(path.join(stagingDir, "prepare.lock")).then(() => true, () => false)) break;
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     expect(await fs.stat(path.join(stagingDir, "prepare.lock"))).toBeTruthy();
-    const second = runChild(0);
+    const second = runChild();
     const secondResult = await second.done;
+    await fs.writeFile(releaseFile, "release");
     const firstResult = await first.done;
     expect(firstResult.code).toBe(0);
     expect(secondResult.code).toBe(1);

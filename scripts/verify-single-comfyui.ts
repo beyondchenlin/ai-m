@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { WebSocketStream } from "undici";
 import { bindWorkflow } from "../src/lib/generation/workflows/binder";
 import { canonicalize } from "../src/lib/generation/workflows/canonical";
 import { parseCompiledBindings } from "../src/lib/generation/workflows/compiled";
@@ -19,6 +20,7 @@ const BASE_URL = "http://127.0.0.1:8000" as const;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 32;
+const MAX_JSON_ARRAY_ITEMS = 10_000;
 const execFileAsync = promisify(execFile);
 
 export interface Task4ListenerIdentity {
@@ -110,20 +112,25 @@ function record(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as Record<string, unknown>;
 }
-function parseJson(bytes: Buffer, label: string): unknown {
+export function parseTask4Json(bytes: Buffer, label: string, maximumNodes = 100_000): unknown {
+  if (!Number.isSafeInteger(maximumNodes) || maximumNodes < 1 || maximumNodes > 500_000) throw new Error(`${label} node bound is invalid`);
   let value: unknown;
   try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new Error(`${label} is invalid JSON`); }
   let count = 0;
   const inspect = (candidate: unknown, depth: number) => {
     count += 1;
-    if (depth > MAX_JSON_DEPTH || count > 100_000) throw new Error(`${label} exceeds structural bounds`);
+    if (depth > MAX_JSON_DEPTH || count > maximumNodes) throw new Error(`${label} exceeds structural bounds`);
     if (typeof candidate === "string" && Buffer.byteLength(candidate) > MAX_CONFIG_BYTES) throw new Error(`${label} contains an oversized string`);
-    if (Array.isArray(candidate)) for (const item of candidate) inspect(item, depth + 1);
+    if (Array.isArray(candidate)) {
+      if (candidate.length > MAX_JSON_ARRAY_ITEMS) throw new Error(`${label} array exceeds its bounded length`);
+      for (const item of candidate) inspect(item, depth + 1);
+    }
     else if (candidate && typeof candidate === "object") for (const item of Object.values(candidate)) inspect(item, depth + 1);
   };
   inspect(value, 0);
   return value;
 }
+const parseJson = parseTask4Json;
 function safeInteger(value: number | undefined, fallback: number, maximum: number, label: string): number {
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result < 1 || result > maximum) throw new Error(`${label} is outside its bounded range`);
@@ -142,6 +149,14 @@ function assertIdentity(value: Task4ListenerIdentity, label: string): void {
     || !/^[A-Za-z0-9._:-]{3,200}$/.test(value.bootId) || !/^[A-Za-z0-9._:-]{3,300}$/.test(value.processIdentity)
   ) throw new Error(`${label} listener identity is uncertain`);
 }
+
+export function parseTask4ListenerObservation(input: unknown): Task4ListenerIdentity {
+  const value = record(input, "listener identity"); const pid = value.pid; const created = value.createdMs; const boot = value.bootMs;
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 0 || !Number.isSafeInteger(created) || (created as number) <= 0 || !Number.isSafeInteger(boot) || (boot as number) <= 0) {
+    throw new Error("Listener identity schema is malformed");
+  }
+  return { pid: pid as number, processCreatedAtMs: created as number, bootId: `windows-${boot}`, processIdentity: `windows-${boot}:${pid}:${created}` };
+}
 function sameListener(left: Task4ListenerIdentity, right: Task4ListenerIdentity): boolean {
   return left.pid === right.pid && left.processCreatedAtMs === right.processCreatedAtMs && left.bootId === right.bootId && left.processIdentity === right.processIdentity;
 }
@@ -157,7 +172,7 @@ function assertRawNodeDescriptor(value: unknown, classType: string): Record<stri
     || !Array.isArray(descriptor.output_name) || !descriptor.output_name.every((item) => typeof item === "string")
     || !Array.isArray(descriptor.output_is_list) || !descriptor.output_is_list.every((item) => typeof item === "boolean")
     || descriptor.output.length !== descriptor.output_name.length || descriptor.output.length !== descriptor.output_is_list.length
-    || descriptor.name !== classType || typeof descriptor.display_name !== "string" || typeof descriptor.description !== "string"
+    || descriptor.name !== classType || (descriptor.display_name !== null && typeof descriptor.display_name !== "string") || typeof descriptor.description !== "string"
     || typeof descriptor.output_node !== "boolean") {
     throw new Error(`${classType} raw object_info descriptor is malformed`);
   }
@@ -355,9 +370,9 @@ async function responseBytes(response: Response, maximumBytes: number, label: st
   return Buffer.concat(chunks, size);
 }
 
-async function fetchJson(url: string, init: RequestInit, maximumBytes: number, label: string): Promise<unknown> {
+async function fetchJson(url: string, init: RequestInit, maximumBytes: number, label: string, maximumNodes?: number): Promise<unknown> {
   const signal = AbortSignal.timeout(30_000);
-  return parseJson(await responseBytes(await fetch(url, { ...init, signal }), maximumBytes, label), label);
+  return parseJson(await responseBytes(await fetch(url, { ...init, signal }), maximumBytes, label), label, maximumNodes);
 }
 export async function writeAllBytes(handle: Pick<Awaited<ReturnType<typeof fs.open>>, "write">, bytes: Uint8Array): Promise<void> {
   let offset = 0;
@@ -368,27 +383,40 @@ export async function writeAllBytes(handle: Pick<Awaited<ReturnType<typeof fs.op
   }
 }
 
-async function createHttpSession(): Promise<Task4Session> {
+export async function createHttpSession(baseUrl = BASE_URL): Promise<Task4Session> {
   const connectionId = `task4-${randomUUID()}`;
   let closed = false;
   let unhealthy: Error | undefined;
-  const socket = new WebSocket(`ws://127.0.0.1:8000/ws?clientId=${encodeURIComponent(connectionId)}`);
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { socket.close(); reject(new Error("ComfyUI WebSocket connection timed out")); }, 30_000);
-    socket.addEventListener("open", () => { clearTimeout(timer); resolve(); }, { once: true });
-    socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("ComfyUI WebSocket connection failed")); }, { once: true });
-  });
-  socket.addEventListener("error", () => { unhealthy ??= new Error("ComfyUI WebSocket reported an error"); });
-  socket.addEventListener("close", () => { if (!closed) unhealthy ??= new Error("ComfyUI WebSocket closed unexpectedly"); });
+  const websocketUrl = new URL(baseUrl); websocketUrl.protocol = websocketUrl.protocol === "https:" ? "wss:" : "ws:"; websocketUrl.pathname = "/ws"; websocketUrl.search = `clientId=${encodeURIComponent(connectionId)}`;
+  const abortController = new AbortController(); const socket = new WebSocketStream(websocketUrl, { signal: abortController.signal }); const socketClosed = socket.closed;
+  void socketClosed.catch(() => undefined);
+  const bounded = async <T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), milliseconds); })]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  let opened: Awaited<typeof socket.opened>;
+  try {
+    opened = await bounded(socket.opened, 30_000, "ComfyUI WebSocket connection timed out");
+  } catch (error) { abortController.abort(error); throw new Error("ComfyUI WebSocket connection failed", { cause: error }); }
+  const drainPromise = (async () => {
+    const reader = opened.readable.getReader();
+    try { for (;;) { const part = await reader.read(); if (part.done) return; } }
+    finally { reader.releaseLock(); }
+  })().catch((error) => { if (!closed) unhealthy ??= new Error("ComfyUI WebSocket reported an error", { cause: error }); });
+  void socketClosed.then(
+    () => { if (!closed) unhealthy ??= new Error("ComfyUI WebSocket closed unexpectedly"); },
+    (error) => { if (!closed) unhealthy ??= new Error("ComfyUI WebSocket reported an error", { cause: error }); },
+  );
   const ensureOpen = () => { if (closed) throw new Error("ComfyUI session is closed"); };
   return {
     connectionId,
-    async systemStats() { ensureOpen(); return record(await fetchJson(`${BASE_URL}/system_stats`, {}, 1024 * 1024, "system_stats"), "system_stats"); },
-    async objectInfo() { ensureOpen(); return record(await fetchJson(`${BASE_URL}/object_info`, {}, 16 * 1024 * 1024, "object_info"), "object_info"); },
+    async systemStats() { ensureOpen(); return record(await fetchJson(`${baseUrl}/system_stats`, {}, 1024 * 1024, "system_stats"), "system_stats"); },
+    async objectInfo() { ensureOpen(); return record(await fetchJson(`${baseUrl}/object_info`, {}, 16 * 1024 * 1024, "object_info", 200_000), "object_info"); },
     async models(folder) {
       ensureOpen();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(folder)) throw new Error("Model folder is unsafe");
-      const value = await fetchJson(`${BASE_URL}/models/${encodeURIComponent(folder)}`, {}, 4 * 1024 * 1024, "models");
+      const value = await fetchJson(`${baseUrl}/models/${encodeURIComponent(folder)}`, {}, 4 * 1024 * 1024, "models");
       if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.length <= 500)) throw new Error("models schema is malformed");
       return value;
     },
@@ -397,19 +425,19 @@ async function createHttpSession(): Promise<Task4Session> {
       const data = new FormData();
       data.set("image", new Blob([Uint8Array.from(input.bytes)], { type: input.mimeType }), input.filename);
       data.set("type", "input"); data.set("overwrite", "false");
-      const result = record(await fetchJson(`${BASE_URL}/upload/image`, { method: "POST", body: data }, 64 * 1024, "reference upload"), "reference upload");
+      const result = record(await fetchJson(`${baseUrl}/upload/image`, { method: "POST", body: data }, 64 * 1024, "reference upload"), "reference upload");
       if (typeof result.name !== "string" || !result.name || result.name.length > 300 || typeof result.subfolder !== "string") throw new Error("Reference upload schema is malformed");
       return result.subfolder ? `${result.subfolder.replace(/\\/g, "/")}/${result.name}` : result.name;
     },
     async submit(workflow, clientId) {
       ensureOpen();
-      const result = record(await fetchJson(`${BASE_URL}/prompt`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: workflow, client_id: clientId }) }, 64 * 1024, "prompt submission"), "prompt submission");
+      const result = record(await fetchJson(`${baseUrl}/prompt`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: workflow, client_id: clientId }) }, 64 * 1024, "prompt submission"), "prompt submission");
       if (typeof result.prompt_id !== "string") throw new Error("Prompt submission schema is malformed");
       return result.prompt_id;
     },
     async history(promptId) {
       ensureOpen();
-      const result = record(await fetchJson(`${BASE_URL}/history/${encodeURIComponent(promptId)}`, {}, 16 * 1024 * 1024, "history"), "history");
+      const result = record(await fetchJson(`${baseUrl}/history/${encodeURIComponent(promptId)}`, {}, 16 * 1024 * 1024, "history"), "history");
       if (!(promptId in result)) return undefined;
       const item = record(result[promptId], "history item");
       const status = record(item.status, "history status");
@@ -422,7 +450,7 @@ async function createHttpSession(): Promise<Task4Session> {
     async downloadToFile(file, targetFile, maximumBytes) {
       ensureOpen();
       const query = new URLSearchParams(file);
-      const response = await fetch(`${BASE_URL}/view?${query}`, { signal: AbortSignal.timeout(60_000) });
+      const response = await fetch(`${baseUrl}/view?${query}`, { signal: AbortSignal.timeout(60_000) });
       if (!response.ok) { await response.body?.cancel(); throw new Error(`output download failed (${response.status})`); }
       const declared = response.headers.get("content-length");
       if (declared && (!/^\d+$/.test(declared) || Number(declared) > maximumBytes)) { await response.body?.cancel(); throw new Error("output download response is oversized"); }
@@ -461,16 +489,16 @@ async function createHttpSession(): Promise<Task4Session> {
     },
     assertHealthy() {
       ensureOpen();
-      if (unhealthy || socket.readyState !== WebSocket.OPEN) throw unhealthy ?? new Error("ComfyUI WebSocket is not open");
+      if (unhealthy) throw unhealthy;
     },
     async close() {
       if (closed) return; closed = true;
-      if (socket.readyState === WebSocket.CLOSED) return;
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("ComfyUI WebSocket close timed out")), 5_000);
-        socket.addEventListener("close", () => { clearTimeout(timer); resolve(); }, { once: true });
-        socket.close(1000, "task4 session complete");
-      });
+      try {
+        socket.close({ closeCode: 1000, reason: "task4 session complete" });
+        await bounded(socketClosed, 5_000, "ComfyUI WebSocket close timed out"); await drainPromise;
+      } catch (error) {
+        abortController.abort(error); throw error;
+      }
     },
   };
 }
@@ -516,7 +544,9 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   }
 
   let session = await dependencies.connect();
-  let currentIdentity = await dependencies.observeListener(); assertIdentity(currentIdentity, "initial"); session.assertHealthy();
+  let currentIdentity: Task4ListenerIdentity;
+  try { currentIdentity = await dependencies.observeListener(); assertIdentity(currentIdentity, "initial"); session.assertHealthy(); }
+  catch (error) { await session.close().catch(() => undefined); throw error; }
   let system: Record<string, unknown>; let objects: Record<string, unknown>;
   try {
     system = await session.systemStats(); objects = await session.objectInfo(); assertProbeSchemas(system, objects);
@@ -726,13 +756,10 @@ async function main(): Promise<void> {
       "if($listeners.Count -ne 1){throw ('Expected exactly one 127.0.0.1:8000 listener; found '+$listeners.Count)}",
       "$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$listeners[0].OwningProcess)",
       "$os=Get-CimInstance Win32_OperatingSystem",
-      "[ordered]@{pid=[int]$p.ProcessId;created=[DateTimeOffset]$p.CreationDate;boot=[DateTimeOffset]$os.LastBootUpTime}|ConvertTo-Json -Compress",
+      "[ordered]@{pid=[int]$p.ProcessId;createdMs=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds();bootMs=([DateTimeOffset]$os.LastBootUpTime).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress",
     ].join(";");
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 30_000, maxBuffer: 64 * 1024 });
-    const value = record(parseJson(Buffer.from(stdout), "listener identity"), "listener identity");
-    const pid = value.pid; const created = Date.parse(String(value.created)); const boot = Date.parse(String(value.boot));
-    if (!Number.isSafeInteger(pid) || !Number.isFinite(created) || !Number.isFinite(boot)) throw new Error("Listener identity schema is malformed");
-    return { pid: pid as number, processCreatedAtMs: created, bootId: `windows-${boot}`, processIdentity: `windows-${boot}:${pid}:${created}` };
+    return parseTask4ListenerObservation(parseJson(Buffer.from(stdout), "listener identity"));
   };
   const runner = createPowerShellCommandRunner();
   const runScript = async (name: "stop_backend.ps1" | "start_backend.ps1") => {
