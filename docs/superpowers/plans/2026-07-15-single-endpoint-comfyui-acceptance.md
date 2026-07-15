@@ -76,17 +76,17 @@ type ManagedRuntimeConfig =
 - Create: `docs/comfyui-single-endpoint/README.md`
 - Modify: `package.json`
 
-- [ ] Write failing fixture tests that load Pixelle API workflows and require exact real selectors:
+- [x] Write failing fixture tests that load Pixelle API workflows and require exact real selectors:
   - IndexTTS2: `$text.value!`, `$ref_audio.~audio!`, `IndexTTS2BaseNode`, `VHS_LoadAudioUpload`, `SaveAudio`.
   - OmniVoice: `$text.value!`, `$reference_audio_text.value`, `$ref_audio.~audio!`, `OmniVoiceLongformTTS` or `OmniVoiceVoiceCloneTTS`, `SaveAudio`.
   - Image: the prompt primitive, width/height primitives, and `SaveImage`.
   - Video: the prompt primitive, width/height inputs, and `VHS_VideoCombine` output.
-- [ ] Reject missing/duplicate selectors, UI-format graphs, unknown node classes, absent save outputs, and model filenames not present in the probed backend inventory.
-- [ ] Run the fixture tests and confirm RED failures.
-- [ ] Implement the preparation command. It reads only from `PIXELLE_ROOT/workflows/selfhost`, writes generated packages to an explicit staging directory, invokes the existing workflow compiler/importer, and never edits Pixelle.
-- [ ] Generate manifests only for workflows whose bindings are actually supported. Do not invent unsupported IndexTTS2 speed/pitch/emotion bindings; do not claim a video `SaveImage` output.
-- [ ] Add package scripts `workflow:prepare:pixelle-single` and document the exact environment variables for `D:\demo1\Pixelle\Pixelle`, `E:\ComfyUIData`, and `http://127.0.0.1:8000`.
-- [ ] Run fixture tests plus existing workflow compiler/import/promote tests, example validation, typecheck, and diff check; commit `feat(workflows): prepare Pixelle single-backend packages`.
+- [x] Reject missing/duplicate selectors, UI-format graphs, unknown node classes, absent save outputs, and model filenames not present in the probed backend inventory.
+- [x] Run the fixture tests and confirm RED failures.
+- [x] Implement the preparation command. It reads only from `PIXELLE_ROOT/workflows/selfhost`, writes generated packages to an explicit staging directory, invokes the existing workflow compiler/importer, and never edits Pixelle.
+- [x] Generate manifests only for workflows whose bindings are actually supported. Do not invent unsupported IndexTTS2 speed/pitch/emotion bindings; do not claim a video `SaveImage` output.
+- [x] Add package scripts `workflow:prepare:pixelle-single` and document the exact environment variables for `D:\demo1\Pixelle\Pixelle`, `E:\ComfyUIData`, and `http://127.0.0.1:8000`.
+- [x] Run fixture tests plus existing workflow compiler/import/promote tests, example validation, typecheck, and diff check; commit `feat(workflows): prepare Pixelle single-backend packages`.
 
 ### Task 4: Configure and verify the real single-machine backend
 
