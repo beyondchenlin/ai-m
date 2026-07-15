@@ -33,6 +33,28 @@ export interface ManagedCommandResult {
 
 export type ManagedCommandRunner = (request: ManagedCommandRequest) => Promise<ManagedCommandResult>;
 
+interface ManagedChildProcess {
+  readonly pid?: number;
+  readonly stdout: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
+  readonly stderr: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
+  once(event: "error", listener: (error: Error) => void): unknown;
+  once(event: "exit", listener: (code: number | null) => void): unknown;
+  once(event: "close", listener: (code: number | null) => void): unknown;
+}
+
+export interface PowerShellCommandRunnerOptions {
+  spawnProcess?: (executable: string, args: readonly string[], options: { cwd: string; windowsHide: true; detached: boolean }) => ManagedChildProcess;
+  terminateProcessTree?: (pid: number) => Promise<void>;
+  cleanupTimeoutMs?: number;
+}
+
+export class ManagedProcessCleanupError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ManagedProcessCleanupError";
+  }
+}
+
 export interface ManagedProbeTransport {
   get(path: "/system_stats" | "/object_info", options?: { signal?: AbortSignal }): Promise<Response>;
   close(): void;
@@ -48,6 +70,9 @@ const CANONICAL_BASE_URL = "http://127.0.0.1:8000" as const;
 const MAX_COMMAND_TIMEOUT_MS = 600_000;
 const MAX_READY_TIMEOUT_MS = 900_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
+const DEFAULT_CLEANUP_TIMEOUT_MS = 2_000;
+const activeRestartEndpoints = new Set<string>();
+const blockedRestartEndpoints = new Set<string>();
 
 function required(env: Record<string, string | undefined>, name: string): string {
   const value = env[name]?.trim();
@@ -121,26 +146,74 @@ function appendBounded(chunks: Buffer[], chunk: Buffer, state: { bytes: number; 
   }
 }
 
-async function terminateProcessTree(pid: number): Promise<void> {
+async function terminateProcessTree(pid: number, deadlineMs: number): Promise<void> {
   if (process.platform === "win32") {
-    await new Promise<void>((resolveKill) => {
+    await new Promise<void>((resolveKill, rejectKill) => {
       const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      killer.once("error", () => resolveKill());
-      killer.once("exit", () => resolveKill());
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        killer.kill("SIGKILL");
+        rejectKill(new Error(`taskkill timed out after ${deadlineMs}ms`));
+      }, deadlineMs);
+      killer.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        rejectKill(new Error(`taskkill failed to launch: ${error.message}`));
+      });
+      killer.once("exit", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (code === 0) resolveKill();
+        else rejectKill(new Error(`taskkill exited with code ${code ?? "unknown"}`));
+      });
     });
     return;
   }
-  try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
+  try { process.kill(-pid, "SIGKILL"); }
+  catch (groupError) {
+    try { process.kill(pid, "SIGKILL"); }
+    catch (processError) { throw new Error("Process-tree termination failed", { cause: processError ?? groupError }); }
+  }
 }
 
-export function createPowerShellCommandRunner(): ManagedCommandRunner {
+function withCleanupDeadline(cleanup: Promise<void>, deadlineMs: number): Promise<void> {
+  return new Promise((resolveCleanup, rejectCleanup) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      rejectCleanup(new ManagedProcessCleanupError(`Managed ComfyUI process-tree cleanup timed out after ${deadlineMs}ms`));
+    }, deadlineMs);
+    cleanup.then(
+      () => { if (!settled) { settled = true; clearTimeout(timer); resolveCleanup(); } },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const detail = error instanceof Error ? error.message : "unknown cleanup error";
+        rejectCleanup(new ManagedProcessCleanupError(`Managed ComfyUI process-tree cleanup failed: ${detail}`, { cause: error }));
+      },
+    );
+  });
+}
+
+export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOptions = {}): ManagedCommandRunner {
+  const cleanupTimeoutMs = options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS;
+  const spawnProcess = options.spawnProcess ?? ((executable, args, spawnOptions) => spawn(executable, [...args], {
+    ...spawnOptions,
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  const treeTerminator = options.terminateProcessTree ?? ((pid) => terminateProcessTree(pid, cleanupTimeoutMs));
   return (request) => new Promise<ManagedCommandResult>((resolveRun, rejectRun) => {
     if (request.signal?.aborted) { rejectRun(request.signal.reason ?? new Error("Managed ComfyUI command aborted")); return; }
-    const child = spawn(request.executable, [...request.args], {
+    const child = spawnProcess(request.executable, request.args, {
       cwd: request.cwd,
       windowsHide: request.windowsHide,
       detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
@@ -155,20 +228,27 @@ export function createPowerShellCommandRunner(): ManagedCommandRunner {
       settled = true;
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", onAbort);
-      if (child.pid) await terminateProcessTree(child.pid);
-      rejectRun(error);
+      if (!child.pid) { rejectRun(new ManagedProcessCleanupError("Managed ComfyUI process-tree cleanup failed: child PID is unavailable", { cause: error })); return; }
+      try {
+        await withCleanupDeadline(treeTerminator(child.pid), cleanupTimeoutMs);
+        rejectRun(error);
+      } catch (cleanupError) {
+        rejectRun(cleanupError);
+      }
     };
     const onAbort = () => { void finishError(request.signal?.reason instanceof Error ? request.signal.reason : new Error("Managed ComfyUI command aborted")); };
     const timer = setTimeout(() => { void finishError(new Error(`Managed ComfyUI command timed out after ${request.timeoutMs}ms`)); }, request.timeoutMs);
     request.signal?.addEventListener("abort", onAbort, { once: true });
     child.once("error", (error) => { void finishError(new Error(`Managed ComfyUI command failed to launch: ${error.message}`)); });
-    child.once("exit", (code) => {
+    let exitCode: number | null = null;
+    child.once("exit", (code) => { exitCode = code; });
+    child.once("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", onAbort);
       resolveRun({
-        exitCode: code ?? -1,
+        exitCode: code ?? exitCode ?? -1,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
         truncated: outState.truncated || errState.truncated,
@@ -180,11 +260,22 @@ export function createPowerShellCommandRunner(): ManagedCommandRunner {
 function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolveDelay, rejectDelay) => {
     if (signal?.aborted) { rejectDelay(signal.reason ?? new Error("Managed ComfyUI restart aborted")); return; }
-    const timer = setTimeout(resolveDelay, milliseconds);
-    signal?.addEventListener("abort", () => { clearTimeout(timer); rejectDelay(signal.reason ?? new Error("Managed ComfyUI restart aborted")); }, { once: true });
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      rejectDelay(signal?.reason ?? new Error("Managed ComfyUI restart aborted"));
+    };
+    const timer = setTimeout(() => { cleanup(); resolveDelay(); }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
+/**
+ * Process-local controller for the sole canonical ComfyUI endpoint.
+ * Construct it once per worker. A shared endpoint guard also rejects accidental
+ * concurrent use by multiple controller instances in the same process.
+ */
 export class ManagedComfyUIRuntime {
   private readonly commandRunner: ManagedCommandRunner;
   private readonly readinessPollMs: number;
@@ -200,13 +291,20 @@ export class ManagedComfyUIRuntime {
 
   async restartAfterJob(signal?: AbortSignal): Promise<void> {
     if (this.restarting) throw new Error("Managed ComfyUI restart is already in progress");
+    if (blockedRestartEndpoints.has(this.config.baseUrl)) throw new Error("Managed ComfyUI endpoint restart is blocked after an unconfirmed process cleanup");
+    if (activeRestartEndpoints.has(this.config.baseUrl)) throw new Error("Managed ComfyUI endpoint restart is already in progress in this process");
     this.restarting = true;
+    activeRestartEndpoints.add(this.config.baseUrl);
     try {
       await this.runFixedScript("stop_backend.ps1", "stop", signal);
       await this.runFixedScript("start_backend.ps1", "start", signal);
       await this.waitUntilReady(signal);
+    } catch (error) {
+      if (error instanceof ManagedProcessCleanupError) blockedRestartEndpoints.add(this.config.baseUrl);
+      throw error;
     } finally {
       this.restarting = false;
+      activeRestartEndpoints.delete(this.config.baseUrl);
     }
   }
 

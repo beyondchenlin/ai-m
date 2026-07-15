@@ -122,6 +122,7 @@ export { InputMaterializationError, materializeWorkflowInputs } from "./input-ma
 export type { MaterializedWorkflowInput } from "./input-materializer";
 export {
   ManagedComfyUIRuntime,
+  ManagedProcessCleanupError,
   createPowerShellCommandRunner,
   parseManagedComfyUIRuntimeConfig,
 } from "./runtime/managed-comfyui-runtime";
@@ -132,4 +133,5 @@ export type {
   ManagedProbeTransport,
   ManagedRuntimeConfig,
   ManagedRuntimeDependencies,
+  PowerShellCommandRunnerOptions,
 } from "./runtime/managed-comfyui-runtime";
