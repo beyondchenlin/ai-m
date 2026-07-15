@@ -4,7 +4,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { verifyGenerationPackageForImport } from "./verify-generation-package";
+import { verifyPreparedGenerationPackage } from "./verify-generation-package";
+import { appendPixelleGcAudit } from "./pixelle-gc-audit";
 import { canonicalize, sha256 } from "../src/lib/generation/workflows/canonical";
 import { compileWorkflowBindings } from "../src/lib/generation/workflows/compiler";
 import { parseWorkflowManifest } from "../src/lib/generation/workflows/manifest";
@@ -55,6 +56,7 @@ export interface GarbageCollectOptions {
   confirmGenerationDigest: string;
   actor: string;
   getProcessIdentity?: PrepareOptions["getProcessIdentity"];
+  auditKey?: Buffer;
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -671,6 +673,10 @@ async function assertGenerationsDirectory(stagingDir: string): Promise<void> {
     return;
   }
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("generations must be a regular directory without links");
+  const quarantineDir = path.join(stagingDir, "quarantine");
+  const quarantineStat = await lstatOrNull(quarantineDir);
+  if (!quarantineStat) await fs.mkdir(quarantineDir);
+  else if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()) throw new Error("quarantine must be a regular directory without links");
 }
 
 async function countMarkedTempOrphans(stagingDir: string): Promise<number> {
@@ -720,7 +726,7 @@ async function availableBytes(directory: string): Promise<number> {
   return Number(stat.bavail) * Number(stat.bsize);
 }
 
-async function inspectGenerationQuota(stagingDir: string): Promise<{ generationCount: number; bytes: number }> {
+async function inspectGenerationQuota(stagingDir: string): Promise<{ generationCount: number; quarantineCount: number; bytes: number }> {
   const generationsDir = path.join(stagingDir, "generations");
   const generations = await fs.readdir(generationsDir, { withFileTypes: true });
   for (const entry of generations) {
@@ -728,7 +734,11 @@ async function inspectGenerationQuota(stagingDir: string): Promise<{ generationC
       throw new Error(`Generations directory has an unsafe entry: ${entry.name}`);
     }
   }
-  return { generationCount: generations.length, bytes: await measureSafeTree(stagingDir) };
+  const quarantine = await fs.readdir(path.join(stagingDir, "quarantine"), { withFileTypes: true });
+  for (const entry of quarantine) {
+    if (!/^[a-f0-9]{64}$/.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Quarantine has an unsafe entry: ${entry.name}`);
+  }
+  return { generationCount: generations.length, quarantineCount: quarantine.length, bytes: await measureSafeTree(stagingDir) };
 }
 
 async function recoverCleanupTombstones(stagingDir: string): Promise<void> {
@@ -835,7 +845,7 @@ async function validateCurrentPointer(stagingDir: string): Promise<void> {
     if (recomputed !== current.generationDigest) throw new Error("current generation digest does not match package digests");
     const generationRoot = path.join(stagingDir, "generations", current.generationDigest);
     for (const [packageName, packageDigest] of Object.entries(packageDigests)) {
-      await verifyGenerationPackageForImport({
+      await verifyPreparedGenerationPackage({
         generationRoot, packageName, expectedGenerationDigest: current.generationDigest, expectedPackageDigest: packageDigest,
       });
     }
@@ -903,6 +913,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     const minimumFreeBytes = positiveLimit(options.minimumFreeBytes, DEFAULT_MINIMUM_FREE_BYTES, "minimumFreeBytes", true);
     if (orphanTempCount > maxOrphanTemps) throw new Error("Generation orphan limit exceeded; manual review/GC is required");
     const quota = await inspectGenerationQuota(stagingDir);
+    if (orphanTempCount + quota.quarantineCount > maxOrphanTemps) throw new Error("Orphan/quarantine limit exceeded; offline cleanup is required");
     if (quota.generationCount > maxGenerations) throw new Error("Generation count limit exceeded; manual GC is required");
     if (quota.bytes > maxStagingBytes) throw new Error("Staging byte limit exceeded; manual GC is required");
     const freeBytes = await (options.getAvailableBytes ?? availableBytes)(stagingDir);
@@ -1010,7 +1021,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   }
 }
 
-export async function garbageCollectPixelleGeneration(options: GarbageCollectOptions): Promise<{ generationDigest: string; deleted: true; deletedBytes: number; auditFile: string }> {
+export async function garbageCollectPixelleGeneration(options: GarbageCollectOptions): Promise<{ generationDigest: string; quarantined: true; quarantinedBytes: number; auditFile: string }> {
   if (!/^[a-f0-9]{64}$/.test(options.generationDigest)) throw new Error("GC generation digest is invalid");
   if (options.confirmGenerationDigest !== options.generationDigest) throw new Error("GC confirmation digest must exactly match the target generation");
   if (!/^[A-Za-z0-9._@-]{1,200}$/.test(options.actor)) throw new Error("GC actor is invalid");
@@ -1040,38 +1051,29 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
     const packageDigests: Record<string, string> = {};
     for (const [packageName, digest] of Object.entries(generationRaw.packageDigests)) {
       if (typeof digest !== "string") throw new Error("GC target package digest is invalid");
-      await verifyGenerationPackageForImport({
+      await verifyPreparedGenerationPackage({
         generationRoot, packageName, expectedGenerationDigest: options.generationDigest, expectedPackageDigest: digest,
       });
       packageDigests[packageName] = digest;
     }
     if (!(await fs.readFile(currentPath)).equals(currentBytes)) throw new Error("current.json changed during GC review");
-    const deletedBytes = await measureSafeTree(generationRoot);
-    const auditFile = `gc-audit-${Date.now()}-${token}.json`;
-    const auditPath = path.join(stagingDir, auditFile);
-    await fs.writeFile(auditPath, jsonBytes({
-      schemaVersion: 1, producer: STAGING_MARKER_PRODUCER, action: "delete-non-current-generation",
-      actor: options.actor, generationDigest: options.generationDigest, packageDigests, currentGenerationDigest: current.generationDigest,
-      reviewedAtMs: Date.now(), deletedBytes,
-    }), { flag: "wx" });
-    await syncFile(auditPath);
-    const gcDir = path.join(stagingDir, `.gc-generation-${options.generationDigest}-${token}`);
-    await fs.rename(generationRoot, gcDir);
+    const quarantinedBytes = await measureSafeTree(generationRoot);
+    const quarantineDir = path.join(stagingDir, "quarantine");
+    const quarantineTarget = path.join(quarantineDir, options.generationDigest);
+    if (await lstatOrNull(quarantineTarget)) throw new Error("GC quarantine target already exists");
+    const audit = await appendPixelleGcAudit({
+      stagingDir, auditKey: options.auditKey,
+      payload: {
+        actor: options.actor, generationDigest: options.generationDigest, packageDigests,
+        currentGenerationDigest: current.generationDigest, quarantinedBytes,
+        quarantineName: options.generationDigest, reviewedAtMs: Date.now(),
+      },
+    });
+    await fs.rename(generationRoot, quarantineTarget);
     await syncDirectory(path.join(stagingDir, "generations"));
+    await syncDirectory(quarantineDir);
     await syncDirectory(stagingDir);
-    for (const packageName of Object.keys(packageDigests)) {
-      const packageDir = path.join(gcDir, packageName);
-      for (const filename of ["compiled-bindings.json", "manifest.json", "package.lock.json", "workflow.api.json"]) {
-        const stat = await fs.lstat(path.join(packageDir, filename));
-        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("GC target changed after verification; tombstone retained for audit");
-        await fs.unlink(path.join(packageDir, filename));
-      }
-      await fs.rmdir(packageDir);
-    }
-    await fs.unlink(path.join(gcDir, "generation.json"));
-    await fs.rmdir(gcDir);
-    await syncDirectory(stagingDir);
-    return { generationDigest: options.generationDigest, deleted: true, deletedBytes, auditFile };
+    return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes, auditFile: audit.auditFile };
   } finally {
     await releaseLock(stagingDir, token);
   }

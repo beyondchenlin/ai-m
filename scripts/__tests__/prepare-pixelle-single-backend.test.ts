@@ -1,13 +1,16 @@
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
+import { generateKeyPairSync, sign as signBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
+import { canonicalize } from "../../src/lib/generation/workflows/canonical";
 import { parseCompiledBindings } from "../../src/lib/generation/workflows/compiled";
 import { garbageCollectPixelleGeneration, preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
-import { verifyGenerationPackageForImport } from "../verify-generation-package";
+import { verifyGenerationPackageForImport, verifyPreparedGenerationPackage } from "../verify-generation-package";
+import { verifyPixelleGcAuditChain } from "../pixelle-gc-audit";
 
 const temporaryDirectories: string[] = [];
 const ROOT_MARKER = ".ai-m-pixelle-staging.json";
@@ -91,10 +94,14 @@ describe("immutable Pixelle workflow preparation", () => {
   it("documents offline-only preparation and a safe post-Task4 import reference", async () => {
     const readme = await fs.readFile(path.resolve("docs/comfyui-single-endpoint/README.md"), "utf8");
     expect(readme).not.toContain("COMFYUI_INVENTORY_FILE");
-    expect(readme).not.toContain("WORKFLOW_PACKAGE_DIR");
+    expect(readme).toContain("WORKFLOW_PACKAGE_DIR");
     expect(readme).toContain("EXPECTED_GENERATION_DIGEST");
     expect(readme).toContain("EXPECTED_PACKAGE_DIGEST");
-    expect(readme).toContain("REQUIRE_TASK4_VERIFIED_EVIDENCE");
+    expect(readme).not.toContain("REQUIRE_TASK4_VERIFIED_EVIDENCE");
+    expect(await fs.readFile(path.resolve("scripts/import-workflow-package.ts"), "utf8")).not.toContain("REQUIRE_TASK4_VERIFIED_EVIDENCE");
+    const packageJson = JSON.parse(await fs.readFile(path.resolve("package.json"), "utf8"));
+    expect(packageJson.scripts["workflow:import"]).toContain("import-workflow-package.ts");
+    expect(packageJson.scripts["workflow:import:verified-generation"]).toContain("import-verified-generation.ts");
     expect(readme).toContain("workflow:gc:pixelle-single");
     expect(readme).toMatch(/directory fsync[\s\S]*Windows/i);
     expect(readme).toMatch(/process identity[\s\S]*manual recovery audit/i);
@@ -102,7 +109,7 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(readme).toMatch(/Task 4[\s\S]*verified evidence[\s\S]*import\/promote/i);
     expect(readme).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
     expect(readme).toContain("$env:PIXELLE_WORKFLOW_STAGING_DIR\\logs");
-    expect(readme).toMatch(/New-Item[\s\S]*logs[\s\S]*Tee-Object/i);
+    expect(readme).toMatch(/New-Item[\s\S]*logs[\s\S]*workflow:import:verified-generation[\s\S]*Tee-Object/i);
     expect(readme).toMatch(/日志[\s\S]*(保留|敏感)/);
   });
 
@@ -184,7 +191,7 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(await fs.readdir(path.join(stagingDir, "generations"))).toEqual([first.generationDigest]);
   });
 
-  it("recomputes generation/package digests before import and binds optional Task 4 evidence", async () => {
+  it("recomputes generation/package digests offline and always binds Task 4 evidence for import", async () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     const prepared = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     const selected = prepared.packages.find((item) => item.packageName === "tts-index2")!;
@@ -195,22 +202,68 @@ describe("immutable Pixelle workflow preparation", () => {
       expectedGenerationDigest: prepared.generationDigest,
       expectedPackageDigest: selected.packageDigest,
     };
-    await expect(verifyGenerationPackageForImport(base)).resolves.toMatchObject({
+    await expect(verifyPreparedGenerationPackage(base)).resolves.toMatchObject({
       generationDigest: prepared.generationDigest, packageDigest: selected.packageDigest, packageName: "tts-index2",
     });
-    await expect(verifyGenerationPackageForImport({ ...base, expectedGenerationDigest: "0".repeat(64) })).rejects.toThrow(/generation digest/i);
-    await expect(verifyGenerationPackageForImport({ ...base, expectedPackageDigest: "0".repeat(64) })).rejects.toThrow(/package digest/i);
-    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true })).rejects.toThrow(/verified evidence/i);
-    const evidence = {
-      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify", generationDigest: prepared.generationDigest,
-      packageName: selected.packageName, packageDigest: selected.packageDigest,
+    await expect(verifyPreparedGenerationPackage({ ...base, expectedGenerationDigest: "0".repeat(64) })).rejects.toThrow(/generation digest/i);
+    await expect(verifyPreparedGenerationPackage({ ...base, expectedPackageDigest: "0".repeat(64) })).rejects.toThrow(/package digest/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: undefined })).rejects.toThrow(/verified evidence/i);
+    const nowMs = 2_000_000_000_000;
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const payload = {
+      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", issuedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+      generationDigest: prepared.generationDigest, packageName: selected.packageName, packageDigest: selected.packageDigest,
+      backendFingerprint: "1".repeat(64),
+      listener: { baseUrl: "http://127.0.0.1:8000", pid: 102, processIdentity: "boot-1:process-after", connectionId: "connection-after" },
+      liveRuns: [{ runId: "run-0001", startedAtMs: nowMs - 900, completedAtMs: nowMs - 800, artifact: { sha256: "2".repeat(64), mediaKind: "audio", byteLength: 123 } }],
+      restart: {
+        before: { pid: 101, processIdentity: "boot-1:process-before", connectionId: "connection-before" },
+        after: { pid: 102, processIdentity: "boot-1:process-after", connectionId: "connection-after" },
+        restartedAtMs: nowMs - 700, reconnectedAtMs: nowMs - 600,
+      },
     };
-    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true, verifiedEvidence: evidence })).resolves.toMatchObject({ packageName: "tts-index2" });
-    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true, verifiedEvidence: { ...evidence, packageDigest: "f".repeat(64) } })).rejects.toThrow(/verified evidence/i);
+    const evidence = {
+      ...payload,
+      signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(payload), "utf8"), privateKey).toString("base64") },
+    };
+    const trustRootPublicKey = publicKey.export({ type: "spki", format: "pem" });
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs })).resolves.toMatchObject({ packageName: "tts-index2" });
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, packageDigest: "f".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/verified evidence/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, backendFingerprint: "3".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/signature/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs: nowMs + 120_000 })).rejects.toThrow(/stale/i);
+    const noRunsPayload = { ...payload, liveRuns: [] };
+    const noRunsEvidence = { ...noRunsPayload, signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(noRunsPayload), "utf8"), privateKey).toString("base64") } };
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: noRunsEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/live runs/i);
+    const badRestartPayload = { ...payload, restart: { ...payload.restart, before: payload.restart.after } };
+    const badRestartEvidence = { ...badRestartPayload, signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(badRestartPayload), "utf8"), privateKey).toString("base64") } };
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: badRestartEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/restart.*identit/i);
 
     await fs.writeFile(path.join(generationRoot, selected.packageName, "workflow.api.json"), "{}\n", "utf8");
-    await expect(verifyGenerationPackageForImport(base)).rejects.toThrow(/package digest|bytes/i);
+    await expect(verifyPreparedGenerationPackage(base)).rejects.toThrow(/package digest|bytes/i);
   });
+
+  it("fails the real verified-generation CLI closed when Task 4 evidence is absent", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const prepared = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const selected = prepared.packages[0];
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      WORKFLOW_GENERATION_ROOT: path.join(stagingDir, "generations", prepared.generationDigest),
+      WORKFLOW_PACKAGE_NAME: selected.packageName,
+      EXPECTED_GENERATION_DIGEST: prepared.generationDigest,
+      EXPECTED_PACKAGE_DIGEST: selected.packageDigest,
+    };
+    delete env.TASK4_VERIFIED_EVIDENCE_FILE;
+    const child = spawn(process.execPath, ["--import", "tsx", path.resolve("scripts/import-verified-generation.ts")], {
+      cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/TASK4_VERIFIED_EVIDENCE_FILE.*required/i);
+  }, 10_000);
 
   it("keeps old generations after source content changes", async () => {
     const { pixelleRoot, sourceDir, stagingDir } = await makeTree();
@@ -500,23 +553,34 @@ describe("immutable Pixelle workflow preparation", () => {
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxOrphanTemps: 0 })).rejects.toThrow(/orphan.*limit|quota/i);
   });
 
-  it("manually garbage-collects only a confirmed, verified, non-current generation", async () => {
+  it("quarantines verified non-current generations and detects audit tampering/truncation", async () => {
     const tree = await makeTree();
     const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
     const changed = indexWorkflow();
     (changed["3"] as { inputs: { value: string } }).inputs.value = "second";
     await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
     const second = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const auditKey = Buffer.alloc(32, 7);
     await expect(garbageCollectPixelleGeneration({
-      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest, actor: "operator",
-    })).resolves.toMatchObject({ generationDigest: first.generationDigest, deleted: true });
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest,
+      confirmGenerationDigest: first.generationDigest, actor: "operator", auditKey,
+    })).resolves.toMatchObject({ generationDigest: first.generationDigest, quarantined: true });
     await expect(fs.stat(path.join(tree.stagingDir, "generations", first.generationDigest))).rejects.toThrow();
+    expect(await fs.stat(path.join(tree.stagingDir, "quarantine", first.generationDigest))).toBeTruthy();
     expect(JSON.parse(await fs.readFile(path.join(tree.stagingDir, "current.json"), "utf8")).generationDigest).toBe(second.generationDigest);
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).resolves.toMatchObject({ valid: true, entries: 1 });
+    const auditDir = path.join(tree.stagingDir, "audit");
+    const entry = (await fs.readdir(auditDir)).find((name) => name.startsWith("gc-"))!;
+    const original = await fs.readFile(path.join(auditDir, entry));
+    await fs.writeFile(path.join(auditDir, entry), Buffer.concat([original, Buffer.from(" ")]));
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).rejects.toThrow(/audit|signature|digest/i);
+    await fs.writeFile(path.join(auditDir, entry), original);
+    await fs.unlink(path.join(auditDir, entry));
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).rejects.toThrow(/audit|truncat|head/i);
     await expect(garbageCollectPixelleGeneration({
-      stagingDir: tree.stagingDir, generationDigest: second.generationDigest, confirmGenerationDigest: second.generationDigest, actor: "operator",
+      stagingDir: tree.stagingDir, generationDigest: second.generationDigest,
+      confirmGenerationDigest: second.generationDigest, actor: "operator", auditKey,
     })).rejects.toThrow(/current/i);
-    await expect(garbageCollectPixelleGeneration({
-      stagingDir: tree.stagingDir, generationDigest: "f".repeat(64), confirmGenerationDigest: "0".repeat(64), actor: "operator",
-    })).rejects.toThrow(/confirmation/i);
   });
+
 });

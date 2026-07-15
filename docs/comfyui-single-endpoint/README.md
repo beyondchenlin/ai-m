@@ -36,6 +36,8 @@ prepare lock 使用 schema 2，同时绑定 PID、process identity（系统 boot
 
 Task 4 必须在目标 `8000` ComfyUI 的同一进程生命周期内完成 live probe、真实执行、数据库绑定检查，并产生与 `generationDigest`/`packageDigest` 绑定的 verified evidence。完成后还要整体重启 ComfyUI，等待健康检查通过，再重连并复验；在这份 verified evidence 出现以前，禁止 import/promote。
 
+严格入口只信任固定路径 `$HOME/.ai-m/trust/pixelle-task4-ed25519-public.pem` 的本地 Ed25519 公钥，不接受环境变量替换 trust root。Task 4 的签名 evidence 必须包含有效期、backend fingerprint、目标 listener 的 PID/process identity/connection ID、每次 live run 及 artifact 摘要，以及整体重启前后的不同 process identity/connection ID；签名覆盖全部字段。缺文件、字段、签名、时效或任一绑定不匹配都会 fail closed。对应私钥必须由 Task 4 进程从受限的本机密钥存储读取，不能放进仓库、staging 或 evidence 文件。
+
 当前已知 blocker 只作为 Task 4 排查线索：
 
 - `tts-omnivoice-clone-duration-bf16` 需要实际注册的 `PixelleDurationInput` 节点。
@@ -53,7 +55,6 @@ $env:WORKFLOW_PACKAGE_NAME = 'tts-index2'
 $env:EXPECTED_GENERATION_DIGEST = '<generationDigest>'
 $env:EXPECTED_PACKAGE_DIGEST = '<packageDigest>'
 $env:TASK4_VERIFIED_EVIDENCE_FILE = 'D:\demo1\ai-m-workflow-staging\evidence\tts-index2.json'
-$env:REQUIRE_TASK4_VERIFIED_EVIDENCE = 'true'
 $env:WORKFLOW_IMPORTER_ID = 'local-importer'
 $env:PROFILE_KEY = 'pixelle.tts.index2.local'
 $env:PROFILE_DISPLAY_NAME = 'Pixelle IndexTTS2 Local'
@@ -62,14 +63,18 @@ Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue
 
 $logDir = "$env:PIXELLE_WORKFLOW_STAGING_DIR\logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
-corepack pnpm workflow:import | Tee-Object -FilePath (Join-Path $logDir 'import-tts-index2.log')
+corepack pnpm workflow:import:verified-generation | Tee-Object -FilePath (Join-Path $logDir 'import-tts-index2.log')
 ```
+
+通用 `workflow:import` 与 `WORKFLOW_PACKAGE_DIR` 继续兼容既有非 Pixelle 工作流；它不是 Pixelle verified-generation 入口，不得用于绕过上面的 Task 4 证据要求。
 
 日志应保留到单机验收完成，并设置明确的保留期限；日志可能含 workflow digest、profile/backend 标识和错误上下文等敏感信息，不应提交进仓库或随意共享。完成真实生成、整体重启、重连复验和独立 review 后，才可参考现有 `workflow:promote` 命令，逐包人工 promote。
 
 ## 安全人工 GC
 
-只能删除已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。GC 与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要，先写不可变审计记录，再将目标原子改名为 GC tombstone，最后只逐项删除已验证的固定文件；不会使用递归删除。
+在线 GC 不删除文件，只隔离已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。命令与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要，写入 HMAC 签名 hash-chain 审计记录后，把目标原子改名到受控 `quarantine/<generationDigest>`。quarantine 的数量和字节仍计入 fail-closed 配额，因此命令不会虚假声称已释放空间。
+
+审计只信任固定路径 `$HOME/.ai-m/trust/pixelle-gc-audit-hmac.key` 的本机受限密钥。普通 JSON 不是不可变记录；必须用 `workflow:audit:verify:pixelle-single` 校验每项签名、previous digest 和签名 head，篡改、重排或截断都会失败。
 
 ```powershell
 $env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
@@ -77,6 +82,7 @@ $env:GC_GENERATION_DIGEST = '<non-current generationDigest>'
 $env:CONFIRM_GC_GENERATION_DIGEST = $env:GC_GENERATION_DIGEST
 $env:GC_ACTOR_ID = 'local-operator'
 corepack pnpm workflow:gc:pixelle-single
+corepack pnpm workflow:audit:verify:pixelle-single
 ```
 
-如果出现 `.gc-generation-*`，说明 GC 在原子改名后中断。prepare 会阻止继续；保留 `gc-audit-*.json` 和 tombstone，执行 manual recovery audit，逐项核对后再决定恢复或完成清理，禁止直接递归删除。
+quarantine 只能在 ComfyUI、ai-m worker 和 prepare 全部停机后，由操作者先验证 audit chain、确认不被 `current.json` 或数据库引用，再使用操作系统离线工具人工清除。在线 Node 命令不会遍历或删除可能被 junction 替换的目录树。
