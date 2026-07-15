@@ -177,6 +177,11 @@ export async function loadProductionTask4PublicKey(): Promise<Buffer> {
   return readRegularBounded(PIXELLE_TRUST_PATHS.publicKey);
 }
 
+export async function loadProductionTask4PrivateKey(): Promise<Buffer> {
+  await verifyPixelleTrustStore();
+  return readRegularBounded(PIXELLE_TRUST_PATHS.privateKey);
+}
+
 export async function loadProductionPixelleAuditKey(): Promise<Buffer> {
   await verifyPixelleTrustStore();
   return readRegularBounded(PIXELLE_TRUST_PATHS.auditKey, 32);
