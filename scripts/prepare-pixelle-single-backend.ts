@@ -11,6 +11,7 @@ import {
   productionPixelleGcAuditAnchor,
   recoverPixelleGcAuditJournal,
   type AuditDurabilityEvent,
+  type AuditRecoveryDurabilityEvent,
   type SqlitePixelleGcAuditAnchor,
   verifyPixelleGcAuditChain,
 } from "./pixelle-gc-audit";
@@ -68,6 +69,7 @@ export interface GarbageCollectOptions {
   auditAnchor?: SqlitePixelleGcAuditAnchor;
   renameGeneration?: typeof fs.rename;
   afterAuditDurabilityEvent?: (phase: "intent" | "committed", event: AuditDurabilityEvent) => Promise<void>;
+  afterAuditRecoveryDurabilityEvent?: (event: AuditRecoveryDurabilityEvent) => Promise<void>;
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -1065,7 +1067,12 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
       if (pending.payload.generationDigest !== options.generationDigest || pending.payload.currentGenerationDigest !== current.generationDigest) {
         throw new Error("A different or stale Pixelle GC database intent requires manual recovery");
       }
-      await recoverPixelleGcAuditJournal({ stagingDir, auditKey: options.auditKey, pending });
+      await recoverPixelleGcAuditJournal({
+        stagingDir,
+        auditKey: options.auditKey,
+        pending,
+        afterDurabilityEvent: options.afterAuditRecoveryDurabilityEvent,
+      });
       const entries = await getPixelleGcAuditEntries({ stagingDir, auditKey: options.auditKey });
       if (!entries.some((entry) => entry.transactionId === pending.transactionId && entry.phase === "intent")) {
         await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload: pending.payload, phase: "intent", transactionId: pending.transactionId });

@@ -122,6 +122,7 @@ export async function productionPixelleGcAuditAnchor(): Promise<SqlitePixelleGcA
 export interface AuditOptions { stagingDir: string; auditKey?: Buffer; auditAnchor?: SqlitePixelleGcAuditAnchor }
 type FileEntry = GcAuditPayload & { schemaVersion: 2; sequence: number; previousDigest: string | null; phase: Phase; transactionId: string; producer: string; entryDigest: string; signature: string };
 export type AuditDurabilityEvent = "entry-fsync" | "head-temp-fsync" | "head-rename";
+export type AuditRecoveryDurabilityEvent = "before-head-publish";
 
 function jsonBytes(value: unknown): Buffer { return Buffer.from(`${canonicalize(value)}\n`, "utf8"); }
 function digest(value: unknown): string { return createHash("sha256").update(canonicalize(value)).digest("hex"); }
@@ -192,15 +193,28 @@ async function isolateAuditRecoveryTail(
   throw new Error("GC audit recovery isolated an inconsistent tail and is blocked for manual review", { cause });
 }
 
-export async function recoverPixelleGcAuditJournal(options: Omit<AuditOptions, "auditAnchor"> & { pending: GcAnchorEvent }): Promise<void> {
+export async function recoverPixelleGcAuditJournal(options: Omit<AuditOptions, "auditAnchor"> & {
+  pending: GcAnchorEvent;
+  afterDurabilityEvent?: (event: AuditRecoveryDurabilityEvent) => Promise<void>;
+}): Promise<void> {
   const key = await keyFor(options.auditKey);
   const auditDir = path.join(path.resolve(options.stagingDir), "audit");
   const names: string[] = await fs.readdir(auditDir).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] as string[] : Promise.reject(error));
   if (!names.length) return;
   const entryNames = names.filter((name) => /^gc-\d{8}-[a-f0-9]{32}\.json$/.test(name)).sort();
-  const tempNames = names.filter((name) => /^head\.[a-f0-9]{32}\.tmp$/.test(name));
+  let tempNames = names.filter((name) => /^head\.[a-f0-9]{32}\.tmp$/.test(name)).sort();
   const unknown = names.filter((name) => name !== "head.json" && !entryNames.includes(name) && !tempNames.includes(name));
-  if (unknown.length || tempNames.length > 1) throw new Error("GC audit recovery found unfamiliar or ambiguous journal files");
+  if (unknown.length) throw new Error("GC audit recovery found unfamiliar journal files");
+  if (tempNames.length > 1) {
+    const bytes = await Promise.all(tempNames.map((name) => fs.readFile(path.join(auditDir, name))));
+    if (!bytes.every((value) => value.equals(bytes[0]))) {
+      await isolateAuditRecoveryTail(options.stagingDir, auditDir, entryNames, tempNames, options.pending,
+        new Error("GC audit recovery found different-content head temp files"));
+    }
+    const duplicates = tempNames.slice(1);
+    tempNames = tempNames.slice(0, 1);
+    for (const duplicate of duplicates) await fs.unlink(path.join(auditDir, duplicate));
+  }
   const entries: FileEntry[] = [];
   let previousDigest: string | null = null;
   try {
@@ -247,11 +261,18 @@ export async function recoverPixelleGcAuditJournal(options: Omit<AuditOptions, "
     }
   }
   if (trailing) {
-    const token = randomBytes(16).toString("hex");
-    const headPayload = { schemaVersion: 2, count: entries.length, lastDigest: previousDigest };
-    const rollForwardTemp = path.join(auditDir, `head.${token}.tmp`);
-    await fs.writeFile(rollForwardTemp, jsonBytes({ ...headPayload, signature: signature(headPayload, key) }), { flag: "wx" });
-    await syncFile(rollForwardTemp);
+    let rollForwardTemp: string;
+    if (tempNames.length) {
+      rollForwardTemp = path.join(auditDir, tempNames[0]);
+    } else {
+      const token = randomBytes(16).toString("hex");
+      const headPayload = { schemaVersion: 2, count: entries.length, lastDigest: previousDigest };
+      rollForwardTemp = path.join(auditDir, `head.${token}.tmp`);
+      await fs.writeFile(rollForwardTemp, jsonBytes({ ...headPayload, signature: signature(headPayload, key) }), { flag: "wx" });
+      await syncFile(rollForwardTemp);
+      tempNames = [path.basename(rollForwardTemp)];
+    }
+    await options.afterDurabilityEvent?.("before-head-publish");
     await fs.rename(rollForwardTemp, path.join(auditDir, "head.json"));
   }
   for (const tempName of tempNames) await fs.unlink(path.join(auditDir, tempName)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });

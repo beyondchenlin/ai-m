@@ -751,4 +751,71 @@ describe("immutable Pixelle workflow preparation", () => {
     sqlite.close();
   });
 
+  it("reuses the validated existing head temp across a second recovery crash", async () => {
+    const tree = await makeTree();
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
+    const auditKey = Buffer.alloc(32, 11);
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "double-recovery-crash";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      afterAuditDurabilityEvent: async (phase, event) => {
+        if (phase === "intent" && event === "head-temp-fsync") throw new Error("primary audit crash");
+      },
+    })).rejects.toThrow(/primary audit crash/);
+    const auditDir = path.join(tree.stagingDir, "audit");
+    expect((await fs.readdir(auditDir)).filter((name) => name.endsWith(".tmp"))).toHaveLength(1);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      afterAuditRecoveryDurabilityEvent: async (event) => {
+        if (event === "before-head-publish") throw new Error("secondary recovery crash");
+      },
+    })).rejects.toThrow(/secondary recovery crash/);
+    expect((await fs.readdir(auditDir)).filter((name) => name.endsWith(".tmp"))).toHaveLength(1);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).resolves.toMatchObject({ quarantined: true, recovered: true });
+    expect((await fs.readdir(auditDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    sqlite.close();
+  });
+
+  it("blocks and isolates different-content double head temps", async () => {
+    const tree = await makeTree();
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
+    const auditKey = Buffer.alloc(32, 12);
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "double-temp-conflict";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      afterAuditDurabilityEvent: async (phase, event) => {
+        if (phase === "intent" && event === "head-temp-fsync") throw new Error("leave first temp");
+      },
+    })).rejects.toThrow(/leave first temp/);
+    const auditDir = path.join(tree.stagingDir, "audit");
+    const firstTemp = (await fs.readdir(auditDir)).find((name) => name.endsWith(".tmp"))!;
+    const secondTemp = `head.${"f".repeat(32)}.tmp`;
+    await fs.writeFile(path.join(auditDir, secondTemp), Buffer.concat([await fs.readFile(path.join(auditDir, firstTemp)), Buffer.from(" ")]));
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).rejects.toThrow(/isolat|ambiguous|blocked/i);
+    const quarantined = await fs.readdir(path.join(tree.stagingDir, "audit-recovery-quarantine"), { recursive: true });
+    expect(quarantined.filter((name) => String(name).endsWith(".tmp"))).toHaveLength(2);
+    sqlite.close();
+  });
+
 });

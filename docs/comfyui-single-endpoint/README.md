@@ -81,7 +81,7 @@ corepack pnpm workflow:import:verified-generation | Tee-Object -FilePath (Join-P
 
 ## 安全人工 GC
 
-在线 GC 不删除文件，只隔离已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。命令与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要。它先在现有 `audit_events` 数据库写入单调 `intent` anchor，再写 signed-chain intent，之后才把目标原子改名到受控 `quarantine/<generationDigest>`，最后写 signed-chain 与数据库 `committed`。数据库不可用时 fail closed 且不改名。启动重试会同时核对数据库 intent、signed chain、可能存在的唯一 trailing entry/`head.*.tmp`，以及 `generations`/`quarantine` 两侧状态；entry fsync、head temp fsync 或 head rename 后的崩溃都只能按 pending transaction、sequence、signature 和 previous digest 幂等 roll-forward。不一致尾记录会移入 `audit-recovery-quarantine` 并写 recovery-blocked 标记，要求人工 review；双存在或双缺失也不会自动处理。quarantine 的数量和字节仍计入 fail-closed 配额，因此命令不会虚假声称已释放空间。
+在线 GC 不删除文件，只隔离已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。命令与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要。它先在现有 `audit_events` 数据库写入单调 `intent` anchor，再写 signed-chain intent，之后才把目标原子改名到受控 `quarantine/<generationDigest>`，最后写 signed-chain 与数据库 `committed`。数据库不可用时 fail closed 且不改名。启动重试会同时核对数据库 intent、signed chain、可能存在的唯一 trailing entry/`head.*.tmp`，以及 `generations`/`quarantine` 两侧状态；entry fsync、head temp fsync 或 head rename 后的崩溃都只能按 pending transaction、sequence、signature 和 previous digest 幂等 roll-forward。已验证的 existing head temp 会被直接发布，不会再创建第二个；字节完全相同的重复 temp 可确定性去重，不同内容则视为不一致。不一致尾记录会移入 `audit-recovery-quarantine` 并写 recovery-blocked 标记，要求人工 review；双存在或双缺失也不会自动处理。quarantine 的数量和字节仍计入 fail-closed 配额，因此命令不会虚假声称已释放空间。
 
 审计只信任固定路径 `$HOME/.ai-m/trust/pixelle-gc-audit-hmac.key` 的本机受限密钥。普通 JSON 不是不可变记录，signed 文件链也只是辅助证据；`audit_events` 是链外单调 anchor。必须用 `workflow:audit:verify:pixelle-single` 同时校验数据库 intent/committed、每项签名、previous digest 和签名 head。单文件篡改、重排、截断，或把完整 entries/head 一起回滚到旧快照都会失败。数据库本身的离线管理员级回滚不在该机制的防护边界内。
 
