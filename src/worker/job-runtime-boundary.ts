@@ -8,6 +8,10 @@ export interface JobRuntimeBoundaryDependencies<TJob, TResult extends JobRuntime
   execute(job: TJob, signal: AbortSignal): Promise<TResult>;
   closeConnections(): Promise<void> | void;
   restart(signal: AbortSignal): Promise<void>;
+  policy?: {
+    restartAfterJob: boolean;
+    blockOnExecutionError: boolean;
+  };
 }
 
 export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
@@ -47,18 +51,20 @@ export class JobRuntimeBoundary<TJob, TResult extends JobRuntimeResult> {
   }
 
   private async runWithinBoundary(job: TJob, controller: AbortController): Promise<TResult> {
+    const restartAfterJob = this.dependencies.policy?.restartAfterJob ?? true;
+    const blockOnExecutionError = this.dependencies.policy?.blockOnExecutionError ?? true;
     let result: TResult;
     try {
       result = await this.dependencies.execute(job, controller.signal);
     } catch (error) {
-      await this.resetRuntime(controller.signal).catch(() => undefined);
-      if (this.currentState !== "stopped") this.currentState = "blocked";
+      if (restartAfterJob) await this.resetRuntime(controller.signal).catch(() => undefined);
+      if (this.currentState !== "stopped") this.currentState = blockOnExecutionError ? "blocked" : "ready";
       throw error;
     }
 
-    await this.resetRuntime(controller.signal);
+    if (restartAfterJob) await this.resetRuntime(controller.signal);
     if (this.currentState !== "stopped") {
-      this.currentState = result.claimDisposition === "release-terminal" ? "ready" : "blocked";
+      this.currentState = !restartAfterJob || result.claimDisposition === "release-terminal" ? "ready" : "blocked";
     }
     return result;
   }

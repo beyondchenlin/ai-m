@@ -23,6 +23,7 @@ import {
   ManagedComfyUIRuntime,
   parseManagedComfyUIRuntimeConfig,
   type ManagedProbeTransport,
+  type ManagedRuntimeConfig,
 } from "@/lib/generation/runtime/managed-comfyui-runtime";
 import { createComfyUITransport, type ComfyUITransport } from "@/lib/generation/transports/comfyui";
 import { JobRuntimeBoundary } from "./job-runtime-boundary";
@@ -90,11 +91,37 @@ export function createManagedProbeFactory(createTransport: ProbeTransportCreator
   };
 }
 
-const managedRuntime = managedRuntimeConfig.enabled
-  ? new ManagedComfyUIRuntime(managedRuntimeConfig, {
-      probeFactory: createManagedProbeFactory(createComfyUITransport),
-    })
-  : null;
+type ManagedRuntimeController = Pick<ManagedComfyUIRuntime, "restartAfterJob" | "getEndpointState">;
+
+export function initializeManagedRuntime<TJob, TResult extends { claimDisposition: "release-terminal" | "retain-recovery" }>(input: {
+  config: ManagedRuntimeConfig;
+  execute(job: TJob, signal: AbortSignal): Promise<TResult>;
+  closeConnections(): Promise<void> | void;
+  runtimeFactory?: (config: Extract<ManagedRuntimeConfig, { enabled: true }>) => ManagedRuntimeController;
+}): { runtime: ManagedRuntimeController | null; boundary: JobRuntimeBoundary<TJob, TResult> } {
+  if (!input.config.enabled) {
+    return {
+      runtime: null,
+      boundary: new JobRuntimeBoundary({
+        execute: input.execute,
+        closeConnections: async () => undefined,
+        restart: async () => undefined,
+        policy: { restartAfterJob: false, blockOnExecutionError: false },
+      }),
+    };
+  }
+  const runtime = (input.runtimeFactory ?? ((config) => new ManagedComfyUIRuntime(config, {
+    probeFactory: createManagedProbeFactory(createComfyUITransport),
+  })))(input.config);
+  return {
+    runtime,
+    boundary: new JobRuntimeBoundary({
+      execute: input.execute,
+      closeConnections: input.closeConnections,
+      restart: (signal) => runtime.restartAfterJob(signal),
+    }),
+  };
+}
 
 // 运行状态
 let running = true;
@@ -217,21 +244,42 @@ function safeErrorSummary(error: unknown): string {
   return raw.replace(/[\r\n\t]+/g, " ").slice(0, 512);
 }
 
-const jobRuntimeBoundary = new JobRuntimeBoundary<ClaimedJob, Awaited<ReturnType<typeof executeClaimedJob>>>({
-  execute: executeClaimedJob,
-  closeConnections: async () => {
-    if (managedRuntime) connectionManagerRegistry.closeAll();
-  },
-  restart: async (signal) => {
-    if (managedRuntime) await managedRuntime.restartAfterJob(signal);
-  },
-});
+let managedRuntime: ManagedRuntimeController | null = null;
+let jobRuntimeBoundary: JobRuntimeBoundary<ClaimedJob, Awaited<ReturnType<typeof executeClaimedJob>>> | null = null;
 
-async function processJob(job: ClaimedJob) {
+async function processJob(
+  job: ClaimedJob,
+  boundary: JobRuntimeBoundary<ClaimedJob, Awaited<ReturnType<typeof executeClaimedJob>>>,
+) {
   try {
-    await jobRuntimeBoundary.run(job);
+    await boundary.run(job);
   } catch (error) {
-    console.error(`[${WORKER_ID}] Job runtime boundary blocked: ${safeErrorSummary(error)}`);
+    const scope = managedRuntimeConfig.enabled ? "Job runtime boundary blocked" : "Error processing job";
+    console.error(`[${WORKER_ID}] ${scope}: ${safeErrorSummary(error)}`);
+  }
+}
+
+export async function pollWorkerJobs<TJob, TResult extends { claimDisposition: "release-terminal" | "retain-recovery" }>(input: {
+  boundary: JobRuntimeBoundary<TJob, TResult>;
+  claim(): Promise<TJob | null>;
+  process(job: TJob): Promise<void>;
+  shouldContinue(): boolean;
+  wait(): Promise<void>;
+  onLoopError?: (error: unknown) => void;
+  waitAfterError?: () => Promise<void>;
+}): Promise<void> {
+  while (input.shouldContinue()) {
+    if (input.boundary.state === "blocked" || input.boundary.state === "stopped") return;
+    try {
+      input.boundary.assertReadyToClaim();
+      const job = await input.claim();
+      if (job) await input.process(job);
+      else await input.wait();
+    } catch (error) {
+      if (!input.shouldContinue()) return;
+      input.onLoopError?.(error);
+      await input.waitAfterError?.();
+    }
   }
 }
 
@@ -253,10 +301,17 @@ async function mainLoop() {
     }).from(executionBackends);
     const pools = await db.select({ id: resourcePools.id, capacity: resourcePools.capacity }).from(resourcePools);
     validateManagedWorkerBackendConfiguration(managedRuntimeConfig.baseUrl, backends, pools);
-    if (managedRuntime?.getEndpointState().state === "blocked") {
-      throw new Error("managed_comfyui_worker_registry_blocked");
-    }
     console.log(`[${WORKER_ID}] Managed ComfyUI single-endpoint configuration validated`);
+  }
+  const initializedRuntime = initializeManagedRuntime({
+    config: managedRuntimeConfig,
+    execute: executeClaimedJob,
+    closeConnections: async () => { connectionManagerRegistry.closeAll(); },
+  });
+  managedRuntime = initializedRuntime.runtime;
+  jobRuntimeBoundary = initializedRuntime.boundary;
+  if (managedRuntime?.getEndpointState().state === "blocked") {
+    throw new Error("managed_comfyui_worker_registry_blocked");
   }
   console.log(`[${WORKER_ID}] Platform schema ready, polling for jobs...`);
 
@@ -285,35 +340,33 @@ async function mainLoop() {
   // 启动恢复扫描
   startRecoveryScanner();
 
-  while (running) {
-    try {
-      jobRuntimeBoundary.assertReadyToClaim();
+  const boundary = jobRuntimeBoundary;
+  await pollWorkerJobs({
+    boundary,
+    shouldContinue: () => running,
+    claim: async () => {
       // 按优先级轮询能力
       let job = null;
       for (const capability of SUPPORTED_CAPABILITIES) {
         job = await claimJob(WORKER_ID, capability);
         if (job) break;
       }
-
-      if (job) {
-        currentJobPromise = processJob(job);
-        try {
-          await currentJobPromise;
-        } finally {
-          currentJobPromise = null;
-        }
-        if (jobRuntimeBoundary.state === "blocked") {
-          console.error(`[${WORKER_ID}] Polling blocked by job runtime boundary`);
-          break;
-        }
-      } else {
-        // 没有任务，等待
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      return job;
+    },
+    process: async (job) => {
+      currentJobPromise = processJob(job, boundary);
+      try {
+        await currentJobPromise;
+      } finally {
+        currentJobPromise = null;
       }
-    } catch (err) {
-      console.error(`[${WORKER_ID}] Main loop error:`, err);
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    }
+    },
+    wait: () => new Promise((resolve) => setTimeout(resolve, 1000)),
+    onLoopError: (error) => console.error(`[${WORKER_ID}] Main loop error: ${safeErrorSummary(error)}`),
+    waitAfterError: () => new Promise((resolve) => setTimeout(resolve, 5000)),
+  });
+  if (boundary.state === "blocked") {
+    console.error(`[${WORKER_ID}] Polling blocked by job runtime boundary`);
   }
 }
 
@@ -335,7 +388,7 @@ async function gracefulShutdown(signal: string) {
   const graceMs = Number.isSafeInteger(configuredGraceMs) && configuredGraceMs >= 5_000 && configuredGraceMs <= 120_000
     ? configuredGraceMs
     : 25_000;
-  await jobRuntimeBoundary.stop(graceMs);
+  await jobRuntimeBoundary?.stop(graceMs);
   connectionManagerRegistry.closeAll();
   stopHeartbeat();
   console.log(`[${WORKER_ID}] Shutdown coordination complete`);

@@ -3,6 +3,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { settleClaimedJob } from "../claim-settlement";
+import { JobRuntimeBoundary } from "../job-runtime-boundary";
+import type { JobExecutionResult } from "@/lib/generation/jobs/worker-finalization";
 
 const isEnabledMock = vi.fn();
 const closeAllConnectionsMock = vi.fn();
@@ -181,4 +184,133 @@ describe("managed single-endpoint worker startup", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(closeResolved).toBe(true);
   });
+
+  it("does not construct the managed controller until explicit post-validation initialization", async () => {
+    const { initializeManagedRuntime } = await import("../index");
+    const runtime = { restartAfterJob: vi.fn(async () => undefined), getEndpointState: () => ({ state: "idle" as const }) };
+    const runtimeFactory = vi.fn(() => runtime);
+
+    expect(runtimeFactory).not.toHaveBeenCalled();
+    const initialized = initializeManagedRuntime({
+      config: {
+        enabled: true,
+        baseUrl: "http://127.0.0.1:8000",
+        pixelleRoot: "C:\\pixelle",
+        dataRoot: "C:\\data",
+        pythonExe: "C:\\python.exe",
+        commandTimeoutMs: 1,
+        readyTimeoutMs: 1,
+      },
+      runtimeFactory,
+      execute: async () => ({ claimDisposition: "release-terminal" as const }),
+      closeConnections: async () => undefined,
+    });
+
+    expect(runtimeFactory).toHaveBeenCalledOnce();
+    expect(initialized.runtime).toBe(runtime);
+  });
+
+  it("gates the second managed claim through execute, terminal release, close, stop/start, and readiness", async () => {
+    const { pollWorkerJobs } = await import("../index");
+    type Settled = JobExecutionResult;
+    type Job = { id: string; execute: () => Promise<Settled>; release: () => Promise<boolean> };
+    const execution = deferred<Settled>();
+    const release = deferred<boolean>();
+    const readiness = deferred<void>();
+    const events: string[] = [];
+    let keepPolling = true;
+    const releaseFirstClaim = vi.fn(() => release.promise);
+    const jobs: Job[] = [
+      { id: "one", execute: () => execution.promise, release: releaseFirstClaim },
+      {
+        id: "two",
+        execute: async () => ({
+          success: true,
+          finalPhase: "SUCCEEDED",
+          needsAttention: false,
+          claimDisposition: "release-terminal",
+        }),
+        release: async () => { keepPolling = false; return true; },
+      },
+    ];
+    const claim = vi.fn(async () => jobs.shift() ?? null);
+    const boundary = new JobRuntimeBoundary<Job, Settled>({
+      execute: (job) => settleClaimedJob({ execute: job.execute, release: job.release }),
+      closeConnections: async () => { events.push("close"); },
+      restart: async () => {
+        events.push("stop");
+        events.push("start");
+        await readiness.promise;
+        events.push("ready");
+      },
+    });
+
+    const polling = pollWorkerJobs({
+      boundary,
+      claim,
+      process: async (job) => { await boundary.run(job); },
+      shouldContinue: () => keepPolling,
+      wait: async () => undefined,
+    });
+
+    await vi.waitFor(() => expect(claim).toHaveBeenCalledTimes(1));
+    expect(events).toEqual([]);
+    execution.resolve({
+      success: true,
+      finalPhase: "SUCCEEDED",
+      needsAttention: false,
+      claimDisposition: "release-terminal",
+    });
+    await vi.waitFor(() => expect(releaseFirstClaim).toHaveBeenCalledOnce());
+    expect(boundary.state).toBe("running-job");
+    expect(events).toEqual([]);
+    release.resolve(true);
+    await vi.waitFor(() => expect(events).toEqual(["close", "stop", "start"]));
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(() => boundary.assertReadyToClaim()).toThrow(/restarting/);
+
+    readiness.resolve();
+    await polling;
+    expect(claim).toHaveBeenCalledTimes(2);
+    expect(events).toEqual(["close", "stop", "start", "ready", "close", "stop", "start", "ready"]);
+  });
+
+  it("continues to the next unmanaged claim after an unexpected execution exception without reset", async () => {
+    const { pollWorkerJobs } = await import("../index");
+    const closeConnections = vi.fn(async () => undefined);
+    const restart = vi.fn(async () => undefined);
+    let keepPolling = true;
+    const claim = vi.fn()
+      .mockResolvedValueOnce("job-1")
+      .mockResolvedValueOnce("job-2");
+    const boundary = new JobRuntimeBoundary<string, { claimDisposition: "release-terminal" }>({
+      execute: async (job) => {
+        if (job === "job-1") throw new Error("unexpected");
+        keepPolling = false;
+        return { claimDisposition: "release-terminal" };
+      },
+      closeConnections,
+      restart,
+      policy: { restartAfterJob: false, blockOnExecutionError: false },
+    });
+
+    await pollWorkerJobs({
+      boundary,
+      claim,
+      process: async (job) => { await boundary.run(job).catch(() => undefined); },
+      shouldContinue: () => keepPolling,
+      wait: async () => undefined,
+    });
+
+    expect(claim).toHaveBeenCalledTimes(2);
+    expect(boundary.state).toBe("ready");
+    expect(closeConnections).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}

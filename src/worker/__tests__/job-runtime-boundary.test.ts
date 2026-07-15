@@ -99,4 +99,21 @@ describe("JobRuntimeBoundary", () => {
     expect(boundary.state).toBe("stopped");
     vi.useRealTimers();
   });
+
+  it("preserves legacy polling after an unmanaged execution error without closing or restarting", async () => {
+    const closeConnections = vi.fn(async () => undefined);
+    const restart = vi.fn(async () => undefined);
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => { throw new Error("legacy executor failure"); },
+      closeConnections,
+      restart,
+      policy: { restartAfterJob: false, blockOnExecutionError: false },
+    });
+
+    await expect(boundary.run("job-1")).rejects.toThrow("legacy executor failure");
+    expect(boundary.state).toBe("ready");
+    expect(() => boundary.assertReadyToClaim()).not.toThrow();
+    expect(closeConnections).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
 });
