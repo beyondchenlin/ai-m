@@ -19,7 +19,7 @@ $env:TASK4_MODE = 'inventory-only'
 corepack pnpm workflow:verify:pixelle-single
 ```
 
-真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包、限时轮询 history、限额下载并 fsync 归档，关闭旧连接，停止并启动整个 8000 后端，确认 PID/process creation/connection identity 全部变化，重新探测并为每个包写入签名 evidence：
+真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包。每个包都执行：submit 前持久化 restart-required marker、限时轮询 history、流式限额下载并 fsync 临时归档、关闭旧连接、停止并启动整个 8000 后端、确认 PID/process creation/connection identity 全部变化、重新探测并生成签名 evidence。上一包的 `restart.after` 必须精确等于下一包的 `listener.before`；六包全部通过后，CLI 在当前时间重验全部 evidence/TTL，并把最后一包 `restart.after` 记录为最终 endpoint，随后一次原子 rename 发布整个 committed set：
 
 ```powershell
 $env:TASK4_MODE = 'verify'
@@ -33,6 +33,8 @@ corepack pnpm workflow:verify:pixelle-single
 任何未知执行状态、提交结果不确定、节点/模型/schema 缺失、输出超限、重启超时或身份未变化都会 fail closed，且不会生成可导入的 evidence。完成后仍需单独执行人工 review/import/promote；本命令不会代替这些步骤。
 
 如果 stop/start 或重连 readiness 结果不确定，CLI 会保留 `PIXELLE_WORKFLOW_STAGING_DIR/task4-restart-blocked.json` 并拒绝后续运行。操作员必须先从系统外部核对 8000 listener、PID、启动时间及健康探测，再用当前 generation digest 明确解除；例如 `$env:TASK4_RECOVERY_CONFIRM = 'RECOVER-<generationDigest>'`。恢复流程会再次建立新 WebSocket、核对 OS listener 并执行两项 readiness probe，全部成功后才删除 marker。
+
+整个 recovery、连接、六包运行、重启和 committed 发布都由 identity-bound `task4.lock` 跨进程独占。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复，身份不确定时必须人工处理。
 
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 
@@ -97,7 +99,7 @@ $env:WORKFLOW_GENERATION_ROOT = 'D:\demo1\ai-m-workflow-staging\pixelle-single\g
 $env:WORKFLOW_PACKAGE_NAME = 'tts-index2'
 $env:EXPECTED_GENERATION_DIGEST = '<generationDigest>'
 $env:EXPECTED_PACKAGE_DIGEST = '<packageDigest>'
-$env:TASK4_VERIFIED_EVIDENCE_FILE = 'D:\demo1\ai-m-workflow-staging\evidence\tts-index2.json'
+$env:TASK4_VERIFIED_EVIDENCE_FILE = 'D:\task4\committed-generation\evidence\tts-index2.json'
 $env:WORKFLOW_IMPORTER_ID = 'local-importer'
 $env:PROFILE_KEY = 'pixelle.tts.index2.local'
 $env:PROFILE_DISPLAY_NAME = 'Pixelle IndexTTS2 Local'
