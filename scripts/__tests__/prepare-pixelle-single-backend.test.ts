@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
 import { parseCompiledBindings } from "../../src/lib/generation/workflows/compiled";
-import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
+import { garbageCollectPixelleGeneration, preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 import { verifyGenerationPackageForImport } from "../verify-generation-package";
 
 const temporaryDirectories: string[] = [];
@@ -95,6 +95,9 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(readme).toContain("EXPECTED_GENERATION_DIGEST");
     expect(readme).toContain("EXPECTED_PACKAGE_DIGEST");
     expect(readme).toContain("REQUIRE_TASK4_VERIFIED_EVIDENCE");
+    expect(readme).toContain("workflow:gc:pixelle-single");
+    expect(readme).toMatch(/directory fsync[\s\S]*Windows/i);
+    expect(readme).toMatch(/process identity[\s\S]*manual recovery audit/i);
     expect(readme).toContain("prepared-environment-unverified");
     expect(readme).toMatch(/Task 4[\s\S]*verified evidence[\s\S]*import\/promote/i);
     expect(readme).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
@@ -356,14 +359,37 @@ describe("immutable Pixelle workflow preparation", () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     const lockPath = path.join(stagingDir, "prepare.lock");
-    const stale = { schemaVersion: 1, pid: 999999, token: "a".repeat(32), startedAtMs: 1_000 };
+    const stale = { schemaVersion: 2, pid: 999999, processIdentity: "boot-a:created-a", token: "a".repeat(32), startedAtMs: 1_000 };
     await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => false })).resolves.toBeTruthy();
     expect((await fs.readdir(stagingDir)).some((name) => name.startsWith("prepare.lock.stale."))).toBe(true);
 
     await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => true })).rejects.toThrow(/locked|alive/i);
-    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000, isProcessAlive: async () => "unknown" })).rejects.toThrow(/locked|uncertain/i);
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
+      isProcessAlive: async () => true, getProcessIdentity: async () => "boot-a:created-a",
+    })).rejects.toThrow(/locked|alive/i);
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
+      isProcessAlive: async () => true, getProcessIdentity: async () => "unknown",
+    })).rejects.toThrow(/locked|uncertain|manual recovery/i);
+
+    await fs.writeFile(lockPath, JSON.stringify(stale), "utf8");
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot, stagingDir, nowMs: 1_000_000, lockStaleMs: 10_000,
+      isProcessAlive: async () => true, getProcessIdentity: async () => "boot-a:created-reused-pid",
+    })).resolves.toBeTruthy();
+  });
+
+  it("writes a process-creation and boot-session identity into prepare.lock", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    let observed: unknown;
+    await preparePixelleSingleBackendPackages({
+      pixelleRoot, stagingDir,
+      getProcessIdentity: async () => "boot-session-1:created-123",
+      afterLockAcquired: async () => { observed = JSON.parse(await fs.readFile(path.join(stagingDir, "prepare.lock"), "utf8")); },
+    });
+    expect(observed).toMatchObject({ schemaVersion: 2, pid: process.pid, processIdentity: "boot-session-1:created-123" });
   });
 
   it("stops publishing and releases a lock only when its token still matches", async () => {
@@ -472,5 +498,25 @@ describe("immutable Pixelle workflow preparation", () => {
     await fs.mkdir(orphan);
     await fs.writeFile(path.join(orphan, TEMP_MARKER), JSON.stringify({ schemaVersion: 1, producer: "ai-m/pixelle-single-backend", token }), "utf8");
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxOrphanTemps: 0 })).rejects.toThrow(/orphan.*limit|quota/i);
+  });
+
+  it("manually garbage-collects only a confirmed, verified, non-current generation", async () => {
+    const tree = await makeTree();
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "second";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+    const second = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest, actor: "operator",
+    })).resolves.toMatchObject({ generationDigest: first.generationDigest, deleted: true });
+    await expect(fs.stat(path.join(tree.stagingDir, "generations", first.generationDigest))).rejects.toThrow();
+    expect(JSON.parse(await fs.readFile(path.join(tree.stagingDir, "current.json"), "utf8")).generationDigest).toBe(second.generationDigest);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: second.generationDigest, confirmGenerationDigest: second.generationDigest, actor: "operator",
+    })).rejects.toThrow(/current/i);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: "f".repeat(64), confirmGenerationDigest: "0".repeat(64), actor: "operator",
+    })).rejects.toThrow(/confirmation/i);
   });
 });

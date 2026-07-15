@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,7 @@ export interface PrepareOptions {
   maxStagingBytes?: number;
   minimumFreeBytes?: number;
   getAvailableBytes?: (directory: string) => Promise<number>;
+  getProcessIdentity?: (pid: number) => Promise<string | "unknown">;
 }
 
 interface PreparedPackage {
@@ -45,6 +47,14 @@ export interface PrepareResult {
   generationDigest: string;
   orphanTempCount: number;
   durability: { fileFsync: true; directoryFsync: boolean };
+}
+
+export interface GarbageCollectOptions {
+  stagingDir: string;
+  generationDigest: string;
+  confirmGenerationDigest: string;
+  actor: string;
+  getProcessIdentity?: PrepareOptions["getProcessIdentity"];
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -469,15 +479,55 @@ function makeManifest(definition: CandidateDefinition, workflow: ComfyWorkflow):
   return parseWorkflowManifest(manifest);
 }
 
-function lockRecord(pid: number, token: string, startedAtMs: number) {
-  return { schemaVersion: 1, pid, token, startedAtMs };
+function lockRecord(pid: number, processIdentity: string, token: string, startedAtMs: number) {
+  return { schemaVersion: 2, pid, processIdentity, token, startedAtMs };
 }
 
 function parseLock(value: unknown): ReturnType<typeof lockRecord> {
-  if (!isRecord(value) || value.schemaVersion !== 1 || !Number.isInteger(value.pid) || (value.pid as number) <= 0
+  if (!isRecord(value) || value.schemaVersion !== 2 || !Number.isInteger(value.pid) || (value.pid as number) <= 0
+    || typeof value.processIdentity !== "string" || !/^[A-Za-z0-9._:-]{3,300}$/.test(value.processIdentity)
     || typeof value.token !== "string" || !/^[a-f0-9]{32}$/.test(value.token)
     || !Number.isFinite(value.startedAtMs)) throw new Error("prepare.lock is invalid; lock ownership is uncertain");
-  return lockRecord(value.pid as number, value.token, value.startedAtMs as number);
+  return lockRecord(value.pid as number, value.processIdentity, value.token, value.startedAtMs as number);
+}
+
+function runIdentityCommand(command: string, args: string[]): Promise<string | "unknown"> {
+  return new Promise((resolve) => {
+    execFile(command, args, { windowsHide: true, timeout: 10_000 }, (error, stdout) => {
+      const value = stdout.trim();
+      resolve(error || !value || value.length > 300 ? "unknown" : value);
+    });
+  });
+}
+
+async function defaultProcessIdentity(pid: number): Promise<string | "unknown"> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "unknown";
+  if (process.platform === "win32") {
+    const script = `$p=Get-Process -Id ${pid} -ErrorAction Stop; $o=Get-CimInstance Win32_OperatingSystem -ErrorAction Stop; [Console]::Out.Write('win:'+$o.LastBootUpTime.ToFileTimeUtc().ToString()+':'+$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString())`;
+    return runIdentityCommand("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
+  }
+  try {
+    const [bootId, stat] = await Promise.all([
+      fs.readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+      fs.readFile(`/proc/${pid}/stat`, "utf8"),
+    ]);
+    const close = stat.lastIndexOf(")");
+    const fields = stat.slice(close + 2).split(" ");
+    const startTicks = fields[19];
+    if (!/^[a-f0-9-]+$/i.test(bootId.trim()) || !/^\d+$/.test(startTicks)) return "unknown";
+    return `linux:${bootId.trim()}:${startTicks}`;
+  } catch {
+    return "unknown";
+  }
+}
+
+let ownProcessIdentity: Promise<string | "unknown"> | undefined;
+
+function processIdentityFor(pid: number, options: PrepareOptions): Promise<string | "unknown"> {
+  if (options.getProcessIdentity) return options.getProcessIdentity(pid);
+  if (pid !== process.pid) return defaultProcessIdentity(pid);
+  ownProcessIdentity ??= defaultProcessIdentity(pid);
+  return ownProcessIdentity;
 }
 
 async function defaultIsProcessAlive(pid: number): Promise<boolean | "unknown"> {
@@ -498,9 +548,11 @@ async function acquireLock(stagingDir: string, options: PrepareOptions, token: s
   if (!Number.isFinite(staleMs) || staleMs < 1_000) throw new Error("lockStaleMs must be at least 1000");
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
+      const identity = await processIdentityFor(process.pid, options);
+      if (identity === "unknown") throw new Error("Cannot establish process creation/boot identity; manual recovery audit is required");
       const handle = await fs.open(lockPath, "wx");
       try {
-        await handle.writeFile(jsonBytes(lockRecord(process.pid, token, nowMs)));
+        await handle.writeFile(jsonBytes(lockRecord(process.pid, identity, token, nowMs)));
         await handle.sync();
       } finally {
         await handle.close();
@@ -520,8 +572,12 @@ async function acquireLock(stagingDir: string, options: PrepareOptions, token: s
     }
     if (nowMs - existing.startedAtMs <= staleMs) throw new Error("Staging is locked by an active prepare.lock");
     const alive = await (options.isProcessAlive ?? defaultIsProcessAlive)(existing.pid);
-    if (alive === true) throw new Error("Staging is locked by a live process");
     if (alive === "unknown") throw new Error("Staging is locked because process liveness is uncertain");
+    if (alive === true) {
+      const identity = await processIdentityFor(existing.pid, options);
+      if (identity === "unknown") throw new Error("Staging lock identity is uncertain; manual recovery audit is required");
+      if (identity === existing.processIdentity) throw new Error("Staging is locked by the original live process");
+    }
     const currentRaw = await fs.readFile(lockPath);
     const current = parseLock(JSON.parse(currentRaw.toString("utf8")));
     if (current.token !== existing.token || !currentRaw.equals(raw)) throw new Error("Staging lock changed during stale-lock recovery");
@@ -698,6 +754,11 @@ async function recoverCleanupTombstones(stagingDir: string): Promise<void> {
   }
 }
 
+async function assertNoGcOrphans(stagingDir: string): Promise<void> {
+  const orphans = (await fs.readdir(stagingDir)).filter((name) => name.startsWith(".gc-generation-")).sort();
+  if (orphans.length) throw new Error(`GC tombstone requires manual recovery audit: ${orphans.join(", ")}`);
+}
+
 type PackageFiles = Record<string, Buffer>;
 
 async function verifyGeneration(directory: string, expected: Map<string, PackageFiles>, generationBytes: Buffer): Promise<void> {
@@ -833,6 +894,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     await options.afterLockAcquired?.();
     await assertLockOwned(stagingDir, token);
     await recoverCleanupTombstones(stagingDir);
+    await assertNoGcOrphans(stagingDir);
     await validateCurrentPointer(stagingDir);
     const orphanTempCount = await countMarkedTempOrphans(stagingDir);
     const maxGenerations = positiveLimit(options.maxGenerations, DEFAULT_MAX_GENERATIONS, "maxGenerations");
@@ -943,6 +1005,73 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     await options.afterDurabilityEvent?.("staging-directory");
     await removeCurrentTempWrapper(tempDir, stagingDir, token);
     return { packages, state: "prepared-environment-unverified", generationDigest, orphanTempCount, durability: { fileFsync: true, directoryFsync: directoryFsyncSupported } };
+  } finally {
+    await releaseLock(stagingDir, token);
+  }
+}
+
+export async function garbageCollectPixelleGeneration(options: GarbageCollectOptions): Promise<{ generationDigest: string; deleted: true; deletedBytes: number; auditFile: string }> {
+  if (!/^[a-f0-9]{64}$/.test(options.generationDigest)) throw new Error("GC generation digest is invalid");
+  if (options.confirmGenerationDigest !== options.generationDigest) throw new Error("GC confirmation digest must exactly match the target generation");
+  if (!/^[A-Za-z0-9._@-]{1,200}$/.test(options.actor)) throw new Error("GC actor is invalid");
+  const stagingDir = path.resolve(options.stagingDir);
+  await assertNoSymlinkComponents(stagingDir, "staging directory");
+  await assertOwnedStaging(stagingDir, stagingDir);
+  const token = randomBytes(16).toString("hex");
+  const lockOptions: PrepareOptions = {
+    pixelleRoot: stagingDir,
+    stagingDir,
+    ...(options.getProcessIdentity ? { getProcessIdentity: options.getProcessIdentity } : {}),
+  };
+  await acquireLock(stagingDir, lockOptions, token);
+  try {
+    await recoverCleanupTombstones(stagingDir);
+    await assertNoGcOrphans(stagingDir);
+    await validateCurrentPointer(stagingDir);
+    const currentPath = path.join(stagingDir, "current.json");
+    const currentBytes = await fs.readFile(currentPath);
+    const current = JSON.parse(currentBytes.toString("utf8")) as { generationDigest: string };
+    if (current.generationDigest === options.generationDigest) throw new Error("Refusing to garbage-collect the current generation");
+    const generationRoot = path.join(stagingDir, "generations", options.generationDigest);
+    const generationRaw = JSON.parse(await fs.readFile(path.join(generationRoot, "generation.json"), "utf8")) as unknown;
+    if (!isRecord(generationRaw) || !isRecord(generationRaw.packageDigests) || generationRaw.generationDigest !== options.generationDigest) {
+      throw new Error("GC target generation metadata is invalid");
+    }
+    const packageDigests: Record<string, string> = {};
+    for (const [packageName, digest] of Object.entries(generationRaw.packageDigests)) {
+      if (typeof digest !== "string") throw new Error("GC target package digest is invalid");
+      await verifyGenerationPackageForImport({
+        generationRoot, packageName, expectedGenerationDigest: options.generationDigest, expectedPackageDigest: digest,
+      });
+      packageDigests[packageName] = digest;
+    }
+    if (!(await fs.readFile(currentPath)).equals(currentBytes)) throw new Error("current.json changed during GC review");
+    const deletedBytes = await measureSafeTree(generationRoot);
+    const auditFile = `gc-audit-${Date.now()}-${token}.json`;
+    const auditPath = path.join(stagingDir, auditFile);
+    await fs.writeFile(auditPath, jsonBytes({
+      schemaVersion: 1, producer: STAGING_MARKER_PRODUCER, action: "delete-non-current-generation",
+      actor: options.actor, generationDigest: options.generationDigest, packageDigests, currentGenerationDigest: current.generationDigest,
+      reviewedAtMs: Date.now(), deletedBytes,
+    }), { flag: "wx" });
+    await syncFile(auditPath);
+    const gcDir = path.join(stagingDir, `.gc-generation-${options.generationDigest}-${token}`);
+    await fs.rename(generationRoot, gcDir);
+    await syncDirectory(path.join(stagingDir, "generations"));
+    await syncDirectory(stagingDir);
+    for (const packageName of Object.keys(packageDigests)) {
+      const packageDir = path.join(gcDir, packageName);
+      for (const filename of ["compiled-bindings.json", "manifest.json", "package.lock.json", "workflow.api.json"]) {
+        const stat = await fs.lstat(path.join(packageDir, filename));
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("GC target changed after verification; tombstone retained for audit");
+        await fs.unlink(path.join(packageDir, filename));
+      }
+      await fs.rmdir(packageDir);
+    }
+    await fs.unlink(path.join(gcDir, "generation.json"));
+    await fs.rmdir(gcDir);
+    await syncDirectory(stagingDir);
+    return { generationDigest: options.generationDigest, deleted: true, deletedBytes, auditFile };
   } finally {
     await releaseLock(stagingDir, token);
   }

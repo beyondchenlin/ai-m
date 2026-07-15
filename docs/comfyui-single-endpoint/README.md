@@ -15,6 +15,12 @@ corepack pnpm workflow:prepare:pixelle-single
 
 相同输入会复用同一代际；输入变化会增加新代际，旧代际不会删除或覆盖。崩溃留下的、可识别的 `.tmp-generation-*` 会被报告为 orphan，不会自动递归清理。已有 unmanaged 目录、危险路径、symlink/junction、异常 lock 或无法确认归属的临时内容都会拒绝处理。
 
+prepare lock 使用 schema 2，同时绑定 PID、process identity（系统 boot session 与进程 creation time）和随机 token。陈旧 lock 只有在原进程明确不存在，或 PID 已被创建时间不同的新进程复用时才可恢复；身份无法确认时必须停止并进行 manual recovery audit，禁止直接删 lock。
+
+发布会 fsync 每个文件，并在平台支持时 fsync 目录。directory fsync 在 Windows/文件系统不支持时，CLI 的 `durability.directoryFsync` 会明确为 `false`；此时依靠原子 rename、文件 fsync，以及下次启动对 `current.json`、generation 和每个 package digest 的完整复验，任何不完整状态都会拒绝继续。
+
+默认保护阈值为 32 个 generations、16 个 temp orphans、4 GiB staging 字节和 256 MiB 磁盘低水位。超过任一 generation/orphan/byte/free-space 限制都会停止发布，旧代际不会被自动删除。
+
 每个代际包含六个包：
 
 - `tts-index2`
@@ -60,3 +66,17 @@ corepack pnpm workflow:import | Tee-Object -FilePath (Join-Path $logDir 'import-
 ```
 
 日志应保留到单机验收完成，并设置明确的保留期限；日志可能含 workflow digest、profile/backend 标识和错误上下文等敏感信息，不应提交进仓库或随意共享。完成真实生成、整体重启、重连复验和独立 review 后，才可参考现有 `workflow:promote` 命令，逐包人工 promote。
+
+## 安全人工 GC
+
+只能删除已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。GC 与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要，先写不可变审计记录，再将目标原子改名为 GC tombstone，最后只逐项删除已验证的固定文件；不会使用递归删除。
+
+```powershell
+$env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
+$env:GC_GENERATION_DIGEST = '<non-current generationDigest>'
+$env:CONFIRM_GC_GENERATION_DIGEST = $env:GC_GENERATION_DIGEST
+$env:GC_ACTOR_ID = 'local-operator'
+corepack pnpm workflow:gc:pixelle-single
+```
+
+如果出现 `.gc-generation-*`，说明 GC 在原子改名后中断。prepare 会阻止继续；保留 `gc-audit-*.json` 和 tombstone，执行 manual recovery audit，逐项核对后再决定恢复或完成清理，禁止直接递归删除。
