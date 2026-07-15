@@ -155,6 +155,23 @@ describe("single-endpoint Task 4 verifier", () => {
     expect(closes).toBe(1);
   });
 
+  it("preserves both initial listener and session close failures", async () => {
+    const f = await fixture(); let thrown: unknown;
+    try {
+      await verifySingleComfyUI({
+        baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot,
+        generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest,
+        evidenceDir: path.join(f.root, "evidence"), archiveDir: path.join(f.root, "archive"), parameters: {},
+      }, {
+        expectedPackageNames: [f.packageName], connect: async () => fakeSession([], { close: async () => { throw new Error("initial close failed"); } }),
+        observeListener: async () => { throw new Error("initial listener failed"); }, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+      });
+    } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as Error).message).toMatch(/initial listener failed[\s\S]*initial close failed/i);
+    expect((thrown as AggregateError).errors.map((error) => (error as Error).message)).toEqual(["initial listener failed", "initial close failed"]);
+  });
+
   it("lets a real Node process exit promptly after closing a local WebSocket session", async () => {
     const f = await fixture(); const sockets = new Set<import("node:stream").Duplex>();
     const server = createServer();

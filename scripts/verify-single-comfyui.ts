@@ -546,7 +546,10 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   let session = await dependencies.connect();
   let currentIdentity: Task4ListenerIdentity;
   try { currentIdentity = await dependencies.observeListener(); assertIdentity(currentIdentity, "initial"); session.assertHealthy(); }
-  catch (error) { await session.close().catch(() => undefined); throw error; }
+  catch (error) {
+    const cleanup: unknown[] = []; try { await session.close(); } catch (closeError) { cleanup.push(closeError); }
+    throw combinedError(error, cleanup, "Initial Task 4 session validation failed and close was not fully verified");
+  }
   let system: Record<string, unknown>; let objects: Record<string, unknown>;
   try {
     system = await session.systemStats(); objects = await session.objectInfo(); assertProbeSchemas(system, objects);
