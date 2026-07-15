@@ -8,7 +8,7 @@ import { db } from "@/lib/db";
 import { generationProfileRevisions, generationProfileStates } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { canonicalize, compileWorkflowBindings, importWorkflowPackage, normalizeComfyWorkflow, parseCompiledBindings, parseWorkflowManifest, parseWorkflowPackageLock, sha256 } from "@/lib/generation/workflows";
-import { verifyGenerationPackageForImport } from "./verify-generation-package";
+import { readTask4EvidenceFile, verifyGenerationPackageForImport } from "./verify-generation-package";
 
 async function readJson(file: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(file, "utf8")) as unknown;
@@ -32,7 +32,7 @@ export async function main(): Promise<void> {
   if (!evidenceFile) throw new Error("TASK4_VERIFIED_EVIDENCE_FILE is required for every verified generation import");
   const verified = await verifyGenerationPackageForImport({
     generationRoot, packageName, expectedGenerationDigest, expectedPackageDigest,
-    verifiedEvidence: await readJson(path.resolve(evidenceFile)),
+    verifiedEvidence: await readTask4EvidenceFile(path.resolve(evidenceFile)),
   });
   const manifestRaw = parseJsonBytes(verified.files["manifest.json"], "manifest.json");
   const manifest = parseWorkflowManifest(manifestRaw);

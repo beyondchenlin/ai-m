@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { generationProfileRevisions, generationProfileStates } from "@/lib/db/schema";
@@ -25,6 +26,15 @@ async function main(): Promise<void> {
   if (!process.env.WORKFLOW_PACKAGE_DIR && !process.argv[2]) throw new Error("WORKFLOW_PACKAGE_DIR or a package directory argument is required");
   const manifestRaw = await readJson(path.join(packageDir, "manifest.json"));
   const manifest = parseWorkflowManifest(manifestRaw);
+  const packageNames = await fs.readdir(packageDir);
+  const generationRoot = path.dirname(packageDir);
+  const pixelleGenerationLayout = packageNames.includes("compiled-bindings.json")
+    && path.basename(path.dirname(generationRoot)) === "generations"
+    && await fs.lstat(path.join(generationRoot, "generation.json")).then((stat) => stat.isFile() && !stat.isSymbolicLink(), () => false);
+  if (manifest.workflowId.toLowerCase().startsWith("pixelle.")
+    || pixelleGenerationLayout) {
+    throw new Error("Pixelle generation packages require the strict workflow:import:verified-generation entry point");
+  }
   const packageLockRaw = await readJson(path.join(packageDir, "package.lock.json"));
   const packageLock = parseWorkflowPackageLock(packageLockRaw, manifest);
   const verifiedFileDigests: Record<string, string> = {};
@@ -60,4 +70,6 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({ profileRevisionId: id, profileKey, revisionNo, state: "disabled" }, null, 2));
 }
 
-main().catch((error) => { console.error(error instanceof Error ? error.message : error); process.exit(1); });
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => { console.error(error instanceof Error ? error.message : error); process.exit(1); });
+}

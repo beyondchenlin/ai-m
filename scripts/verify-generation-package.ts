@@ -1,14 +1,16 @@
 import { createHash, createPrivateKey, createPublicKey, sign as signBytes, verify as verifySignature } from "node:crypto";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { canonicalize } from "../src/lib/generation/workflows/canonical";
+import { loadProductionTask4PublicKey, PIXELLE_TRUST_PATHS } from "./pixelle-trust-store";
 
 const DIGEST = /^[a-f0-9]{64}$/;
 const PACKAGE_NAME = /^[a-z0-9][a-z0-9._-]*$/;
 const PACKAGE_FILES = ["compiled-bindings.json", "manifest.json", "package.lock.json", "workflow.api.json"] as const;
 const MAX_PACKAGE_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_GENERATION_METADATA_BYTES = 64 * 1024;
+const MAX_EVIDENCE_BYTES = 256 * 1024;
+const MAX_TRUST_ROOT_BYTES = 16 * 1024;
 
 export interface VerifyGenerationPackageOptions {
   generationRoot: string;
@@ -23,7 +25,7 @@ export interface VerifyGenerationPackageForImportOptions extends VerifyGeneratio
   nowMs?: number;
 }
 
-export const TASK4_TRUST_ROOT_PATH = path.join(os.homedir(), ".ai-m", "trust", "pixelle-task4-ed25519-public.pem");
+export const TASK4_TRUST_ROOT_PATH = PIXELLE_TRUST_PATHS.publicKey;
 const TASK4_KEY_ID = "pixelle-task4-local-ed25519-v1";
 
 /** Used by Task 4 after it has collected the complete live/restart payload. */
@@ -52,15 +54,52 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function readRegularBounded(file: string, maximum: number, label: string): Promise<Buffer> {
-  const stat = await fs.lstat(file);
+  const resolved = path.resolve(file);
+  const parsed = path.parse(resolved);
+  let cursor = parsed.root;
+  for (const component of resolved.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    const componentStat = await fs.lstat(cursor);
+    if (componentStat.isSymbolicLink()) throw new Error(`${label} path contains links or reparse points`);
+  }
+  const stat = await fs.lstat(resolved);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file without links`);
   if (stat.size > maximum) throw new Error(`${label} exceeds its size limit`);
-  const bytes = await fs.readFile(file);
-  const after = await fs.lstat(file);
+  const bytes = await fs.readFile(resolved);
+  const after = await fs.lstat(resolved);
   if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
     throw new Error(`${label} changed while being verified`);
   }
   return bytes;
+}
+
+export async function readTask4EvidenceFile(file: string): Promise<unknown> {
+  const bytes = await readRegularBounded(path.resolve(file), MAX_EVIDENCE_BYTES, "Task 4 evidence file");
+  try { return JSON.parse(bytes.toString("utf8")) as unknown; }
+  catch { throw new Error("Task 4 evidence file is invalid JSON"); }
+}
+
+function assertBoundedValue(value: unknown, label: string): void {
+  const encoded = Buffer.from(canonicalize(value), "utf8");
+  if (encoded.length > MAX_EVIDENCE_BYTES) throw new Error(`${label} exceeds its bounded size limit`);
+  let nodes = 0;
+  const visit = (candidate: unknown, depth: number): void => {
+    nodes += 1;
+    if (nodes > 2_048 || depth > 12) throw new Error(`${label} exceeds its structural bounds`);
+    if (typeof candidate === "string" && Buffer.byteLength(candidate, "utf8") > 4_096) throw new Error(`${label} string exceeds its length limit`);
+    if (Array.isArray(candidate)) {
+      if (candidate.length > 64) throw new Error(`${label} array exceeds its length limit`);
+      for (const item of candidate) visit(item, depth + 1);
+    } else if (isRecord(candidate)) {
+      const entries = Object.entries(candidate);
+      if (entries.length > 64) throw new Error(`${label} object exceeds its field limit`);
+      for (const [key, item] of entries) {
+        if (Buffer.byteLength(key, "utf8") > 128) throw new Error(`${label} key exceeds its length limit`);
+        visit(item, depth + 1);
+      }
+    }
+  };
+  visit(value, 0);
 }
 
 function parseGeneration(bytes: Buffer): { generationDigest: string; packageDigests: Record<string, string> } {
@@ -80,13 +119,15 @@ function parseGeneration(bytes: Buffer): { generationDigest: string; packageDige
   return { generationDigest: value.generationDigest, packageDigests };
 }
 
-function safeIdentity(value: unknown, label: string): { pid: number; processIdentity: string; connectionId: string } {
+function safeIdentity(value: unknown, label: string): { pid: number; processCreatedAtMs: number; bootId: string; processIdentity: string; connectionId: string } {
   if (!isRecord(value) || !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0
+    || !Number.isSafeInteger(value.processCreatedAtMs) || (value.processCreatedAtMs as number) <= 0
+    || typeof value.bootId !== "string" || !/^[A-Za-z0-9._:-]{3,200}$/.test(value.bootId)
     || typeof value.processIdentity !== "string" || !/^[A-Za-z0-9._:-]{3,300}$/.test(value.processIdentity)
     || typeof value.connectionId !== "string" || !/^[A-Za-z0-9._:-]{8,200}$/.test(value.connectionId)) {
     throw new Error(`Task 4 verified evidence ${label} identity is invalid`);
   }
-  return { pid: value.pid as number, processIdentity: value.processIdentity, connectionId: value.connectionId };
+  return { pid: value.pid as number, processCreatedAtMs: value.processCreatedAtMs as number, bootId: value.bootId, processIdentity: value.processIdentity, connectionId: value.connectionId };
 }
 
 async function verifyEvidence(
@@ -98,9 +139,10 @@ async function verifyEvidence(
   nowMs: number,
 ): Promise<string> {
   if (!isRecord(value)) throw new Error("Task 4 verified evidence is required");
+  assertBoundedValue(value, "Task 4 verified evidence");
   const allowed = [
-    "schemaVersion", "producer", "issuedAtMs", "expiresAtMs", "generationDigest", "packageName", "packageDigest",
-    "backendFingerprint", "listener", "liveRuns", "restart", "signature",
+    "schemaVersion", "producer", "windowStartedAtMs", "issuedAtMs", "expiresAtMs", "generationDigest", "packageName", "packageDigest",
+    "backendFingerprint", "listener", "liveRuns", "restart", "readiness", "signature",
   ];
   if (Object.keys(value).some((key) => !allowed.includes(key)) || value.schemaVersion !== 1 || value.producer !== "ai-m/task4-comfyui-live-verify-v1") {
     throw new Error("Task 4 verified evidence contract is invalid");
@@ -108,39 +150,65 @@ async function verifyEvidence(
   if (value.generationDigest !== generationDigest || value.packageName !== packageName || value.packageDigest !== packageDigest) {
     throw new Error("Task 4 verified evidence does not bind the selected generation package");
   }
-  if (!Number.isSafeInteger(value.issuedAtMs) || !Number.isSafeInteger(value.expiresAtMs)
-    || (value.issuedAtMs as number) > nowMs + 60_000 || (value.expiresAtMs as number) < nowMs
-    || (value.expiresAtMs as number) - (value.issuedAtMs as number) > 24 * 60 * 60 * 1000) {
+  if (!Number.isSafeInteger(value.windowStartedAtMs) || !Number.isSafeInteger(value.issuedAtMs) || !Number.isSafeInteger(value.expiresAtMs)
+    || (value.windowStartedAtMs as number) >= (value.issuedAtMs as number) || (value.issuedAtMs as number) > nowMs
+    || nowMs > (value.expiresAtMs as number) || (value.expiresAtMs as number) - (value.windowStartedAtMs as number) > 24 * 60 * 60 * 1000) {
     throw new Error("Task 4 verified evidence is stale or has an invalid validity window");
   }
   if (typeof value.backendFingerprint !== "string" || !DIGEST.test(value.backendFingerprint)) throw new Error("Task 4 backend fingerprint is invalid");
   if (!isRecord(value.listener) || value.listener.baseUrl !== "http://127.0.0.1:8000") throw new Error("Task 4 listener contract is invalid");
   const listener = safeIdentity(value.listener, "listener");
+  let latestRunCompletion = value.windowStartedAtMs as number;
   if (!Array.isArray(value.liveRuns) || value.liveRuns.length < 1 || value.liveRuns.length > 32) throw new Error("Task 4 evidence requires bounded live runs");
   for (const [index, runValue] of value.liveRuns.entries()) {
     if (!isRecord(runValue) || typeof runValue.runId !== "string" || !/^[A-Za-z0-9._:-]{8,200}$/.test(runValue.runId)
       || !Number.isSafeInteger(runValue.startedAtMs) || !Number.isSafeInteger(runValue.completedAtMs)
+      || (runValue.startedAtMs as number) < (value.windowStartedAtMs as number)
       || (runValue.completedAtMs as number) < (runValue.startedAtMs as number) || !isRecord(runValue.artifact)
       || typeof runValue.artifact.sha256 !== "string" || !DIGEST.test(runValue.artifact.sha256)
       || !["audio", "image", "video"].includes(String(runValue.artifact.mediaKind))
       || !Number.isSafeInteger(runValue.artifact.byteLength) || (runValue.artifact.byteLength as number) <= 0) {
       throw new Error(`Task 4 live run ${index} is invalid`);
     }
+    const runListener = safeIdentity(runValue.listener, `live run ${index} listener`);
+    if (runValue.backendFingerprint !== value.backendFingerprint) throw new Error(`Task 4 live run ${index} backend binding is invalid`);
+    const beforeCandidate = isRecord(value.restart) ? safeIdentity(value.restart.before, "restart.before") : null;
+    if (!beforeCandidate || canonicalize(runListener) !== canonicalize(beforeCandidate)) throw new Error(`Task 4 live run ${index} listener binding is invalid`);
+    latestRunCompletion = Math.max(latestRunCompletion, runValue.completedAtMs as number);
   }
-  if (!isRecord(value.restart) || !Number.isSafeInteger(value.restart.restartedAtMs) || !Number.isSafeInteger(value.restart.reconnectedAtMs)
-    || (value.restart.reconnectedAtMs as number) < (value.restart.restartedAtMs as number)) throw new Error("Task 4 restart evidence is invalid");
+  if (!isRecord(value.restart) || !Number.isSafeInteger(value.restart.stoppedAtMs) || !Number.isSafeInteger(value.restart.restartedAtMs)
+    || !Number.isSafeInteger(value.restart.readinessAtMs) || !Number.isSafeInteger(value.restart.reconnectedAtMs)) throw new Error("Task 4 restart evidence is invalid");
   const before = safeIdentity(value.restart.before, "restart.before");
   const after = safeIdentity(value.restart.after, "restart.after");
   if (before.processIdentity === after.processIdentity || before.connectionId === after.connectionId
-    || listener.processIdentity !== after.processIdentity || listener.connectionId !== after.connectionId || listener.pid !== after.pid) {
+    || listener.processIdentity !== after.processIdentity || listener.connectionId !== after.connectionId || listener.pid !== after.pid
+    || listener.processCreatedAtMs !== after.processCreatedAtMs || listener.bootId !== after.bootId) {
     throw new Error("Task 4 restart/listener identities are not independently bound");
   }
+  const stoppedAtMs = value.restart.stoppedAtMs as number;
+  const restartedAtMs = value.restart.restartedAtMs as number;
+  const readinessAtMs = value.restart.readinessAtMs as number;
+  const reconnectedAtMs = value.restart.reconnectedAtMs as number;
+  if (!(latestRunCompletion < stoppedAtMs && stoppedAtMs < restartedAtMs && restartedAtMs < readinessAtMs
+    && readinessAtMs <= reconnectedAtMs && reconnectedAtMs <= (value.issuedAtMs as number))) {
+    throw new Error("Task 4 evidence timeline order is invalid");
+  }
+  if (!isRecord(value.readiness) || value.readiness.checkedAtMs !== readinessAtMs) throw new Error("Task 4 readiness summary is invalid");
+  for (const [name, expectedPath] of [["systemStats", "/system_stats"], ["objectInfo", "/object_info"]] as const) {
+    const check = value.readiness[name];
+    if (!isRecord(check) || check.path !== expectedPath || check.statusCode !== 200
+      || typeof check.responseSha256 !== "string" || !DIGEST.test(check.responseSha256)) {
+      throw new Error(`Task 4 readiness ${expectedPath} success summary is invalid`);
+    }
+  }
   if (!isRecord(value.signature) || value.signature.algorithm !== "Ed25519" || value.signature.keyId !== TASK4_KEY_ID
-    || typeof value.signature.value !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(value.signature.value)) {
+    || typeof value.signature.value !== "string" || value.signature.value.length > 128 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value.signature.value)
+    || Buffer.from(value.signature.value, "base64").length !== 64) {
     throw new Error("Task 4 evidence signature metadata is invalid");
   }
   const { signature, ...payload } = value;
-  const publicKeyBytes = trustRootPublicKey ?? await fs.readFile(TASK4_TRUST_ROOT_PATH);
+  const publicKeyBytes = trustRootPublicKey ?? await loadProductionTask4PublicKey();
+  if (Buffer.byteLength(publicKeyBytes) > MAX_TRUST_ROOT_BYTES) throw new Error("Task 4 trust root exceeds its size limit");
   let valid = false;
   try {
     valid = verifySignature(null, Buffer.from(canonicalize(payload), "utf8"), createPublicKey(publicKeyBytes), Buffer.from(signature.value as string, "base64"));

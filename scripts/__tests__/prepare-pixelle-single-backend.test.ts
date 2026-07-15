@@ -1,16 +1,17 @@
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
-import { generateKeyPairSync, sign as signBytes } from "node:crypto";
+import { generateKeyPairSync, sign as signBytes, type KeyObject } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
 import { canonicalize } from "../../src/lib/generation/workflows/canonical";
 import { parseCompiledBindings } from "../../src/lib/generation/workflows/compiled";
 import { garbageCollectPixelleGeneration, preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 import { verifyGenerationPackageForImport, verifyPreparedGenerationPackage } from "../verify-generation-package";
-import { verifyPixelleGcAuditChain } from "../pixelle-gc-audit";
+import { SqlitePixelleGcAuditAnchor, verifyPixelleGcAuditChain } from "../pixelle-gc-audit";
 
 const temporaryDirectories: string[] = [];
 const ROOT_MARKER = ".ai-m-pixelle-staging.json";
@@ -18,6 +19,17 @@ const TEMP_MARKER = ".ai-m-generation-temp.json";
 
 function node(classType: string, title: string, inputs: Record<string, unknown>) {
   return { class_type: classType, _meta: { title }, inputs };
+}
+
+function signTask4Payload(payload: Record<string, unknown>, privateKey: KeyObject): Record<string, unknown> {
+  return {
+    ...payload,
+    signature: {
+      algorithm: "Ed25519",
+      keyId: "pixelle-task4-local-ed25519-v1",
+      value: signBytes(null, Buffer.from(canonicalize(payload), "utf8"), privateKey).toString("base64"),
+    },
+  };
 }
 
 function indexWorkflow(lowVram = false): Record<string, unknown> {
@@ -211,15 +223,27 @@ describe("immutable Pixelle workflow preparation", () => {
     const nowMs = 2_000_000_000_000;
     const { publicKey, privateKey } = generateKeyPairSync("ed25519");
     const payload = {
-      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", issuedAtMs: nowMs - 1_000, expiresAtMs: nowMs + 60_000,
+      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs: nowMs - 2_000,
+      issuedAtMs: nowMs - 100, expiresAtMs: nowMs + 60_000,
       generationDigest: prepared.generationDigest, packageName: selected.packageName, packageDigest: selected.packageDigest,
       backendFingerprint: "1".repeat(64),
-      listener: { baseUrl: "http://127.0.0.1:8000", pid: 102, processIdentity: "boot-1:process-after", connectionId: "connection-after" },
-      liveRuns: [{ runId: "run-0001", startedAtMs: nowMs - 900, completedAtMs: nowMs - 800, artifact: { sha256: "2".repeat(64), mediaKind: "audio", byteLength: 123 } }],
+      listener: { baseUrl: "http://127.0.0.1:8000", pid: 102, processCreatedAtMs: 1_002, bootId: "boot-session-1", processIdentity: "boot-1:process-after", connectionId: "connection-after" },
+      liveRuns: [{
+        runId: "run-0001", startedAtMs: nowMs - 1_800, completedAtMs: nowMs - 1_700,
+        backendFingerprint: "1".repeat(64),
+        listener: { pid: 101, processCreatedAtMs: 1_001, bootId: "boot-session-1", processIdentity: "boot-1:process-before", connectionId: "connection-before" },
+        artifact: { sha256: "2".repeat(64), mediaKind: "audio", byteLength: 123 },
+      }],
       restart: {
-        before: { pid: 101, processIdentity: "boot-1:process-before", connectionId: "connection-before" },
-        after: { pid: 102, processIdentity: "boot-1:process-after", connectionId: "connection-after" },
-        restartedAtMs: nowMs - 700, reconnectedAtMs: nowMs - 600,
+        before: { pid: 101, processCreatedAtMs: 1_001, bootId: "boot-session-1", processIdentity: "boot-1:process-before", connectionId: "connection-before" },
+        after: { pid: 102, processCreatedAtMs: 1_002, bootId: "boot-session-1", processIdentity: "boot-1:process-after", connectionId: "connection-after" },
+        stoppedAtMs: nowMs - 1_600, restartedAtMs: nowMs - 1_500,
+        readinessAtMs: nowMs - 1_400, reconnectedAtMs: nowMs - 1_300,
+      },
+      readiness: {
+        checkedAtMs: nowMs - 1_400,
+        systemStats: { path: "/system_stats", statusCode: 200, responseSha256: "3".repeat(64) },
+        objectInfo: { path: "/object_info", statusCode: 200, responseSha256: "4".repeat(64) },
       },
     };
     const evidence = {
@@ -229,18 +253,42 @@ describe("immutable Pixelle workflow preparation", () => {
     const trustRootPublicKey = publicKey.export({ type: "spki", format: "pem" });
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs })).resolves.toMatchObject({ packageName: "tts-index2" });
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, packageDigest: "f".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/verified evidence/i);
-    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, backendFingerprint: "3".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/signature/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, backendFingerprint: "3".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/signature|binding/i);
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs: nowMs + 120_000 })).rejects.toThrow(/stale/i);
     const noRunsPayload = { ...payload, liveRuns: [] };
     const noRunsEvidence = { ...noRunsPayload, signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(noRunsPayload), "utf8"), privateKey).toString("base64") } };
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: noRunsEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/live runs/i);
     const badRestartPayload = { ...payload, restart: { ...payload.restart, before: payload.restart.after } };
     const badRestartEvidence = { ...badRestartPayload, signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(badRestartPayload), "utf8"), privateKey).toString("base64") } };
-    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: badRestartEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/restart.*identit/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: badRestartEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/restart.*identit|listener binding/i);
+    const unboundRunPayload = { ...payload, liveRuns: payload.liveRuns.map((run) => ({ ...run, connectionId: undefined, backendFingerprint: "5".repeat(64) })) };
+    const unboundRunEvidence = signTask4Payload(unboundRunPayload, privateKey);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: unboundRunEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/live run.*backend|bind/i);
+    const badOrderPayload = { ...payload, restart: { ...payload.restart, stoppedAtMs: nowMs - 1_900 } };
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(badOrderPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/timeline|order/i);
+    const missingHealthPayload = { ...payload, readiness: { ...payload.readiness, objectInfo: undefined } };
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(missingHealthPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/object_info|readiness/i);
+    const oversizedPayload = { ...payload, liveRuns: [{ ...payload.liveRuns[0], runId: "x".repeat(100_000) }] };
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(oversizedPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/size|bounded|length/i);
 
     await fs.writeFile(path.join(generationRoot, selected.packageName, "workflow.api.json"), "{}\n", "utf8");
     await expect(verifyPreparedGenerationPackage(base)).rejects.toThrow(/package digest|bytes/i);
   });
+
+  it("fails legacy workflow:import closed for Pixelle manifests before touching the database", async () => {
+    const { root, pixelleRoot, stagingDir } = await makeTree();
+    const prepared = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const packageDir = path.join(stagingDir, "generations", prepared.generationDigest, prepared.packages[0].packageName);
+    const child = spawn(process.execPath, ["--import", "tsx", path.resolve("scripts/import-workflow-package.ts"), packageDir], {
+      cwd: process.cwd(), env: { ...process.env, DATABASE_URL: `file:${path.join(root, "must-not-be-created.db")}` }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const code = await new Promise<number | null>((resolve) => child.once("close", resolve));
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/Pixelle.*verified-generation|strict/i);
+  }, 10_000);
 
   it("fails the real verified-generation CLI closed when Task 4 evidence is absent", async () => {
     const { pixelleRoot, stagingDir } = await makeTree();
@@ -561,14 +609,17 @@ describe("immutable Pixelle workflow preparation", () => {
     await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
     const second = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
     const auditKey = Buffer.alloc(32, 7);
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
     await expect(garbageCollectPixelleGeneration({
       stagingDir: tree.stagingDir, generationDigest: first.generationDigest,
-      confirmGenerationDigest: first.generationDigest, actor: "operator", auditKey,
+      confirmGenerationDigest: first.generationDigest, actor: "operator", auditKey, auditAnchor,
     })).resolves.toMatchObject({ generationDigest: first.generationDigest, quarantined: true });
     await expect(fs.stat(path.join(tree.stagingDir, "generations", first.generationDigest))).rejects.toThrow();
     expect(await fs.stat(path.join(tree.stagingDir, "quarantine", first.generationDigest))).toBeTruthy();
     expect(JSON.parse(await fs.readFile(path.join(tree.stagingDir, "current.json"), "utf8")).generationDigest).toBe(second.generationDigest);
-    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).resolves.toMatchObject({ valid: true, entries: 1 });
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).resolves.toMatchObject({ valid: true, entries: 2 });
     const auditDir = path.join(tree.stagingDir, "audit");
     const entry = (await fs.readdir(auditDir)).find((name) => name.startsWith("gc-"))!;
     const original = await fs.readFile(path.join(auditDir, entry));
@@ -579,8 +630,56 @@ describe("immutable Pixelle workflow preparation", () => {
     await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey })).rejects.toThrow(/audit|truncat|head/i);
     await expect(garbageCollectPixelleGeneration({
       stagingDir: tree.stagingDir, generationDigest: second.generationDigest,
-      confirmGenerationDigest: second.generationDigest, actor: "operator", auditKey,
+      confirmGenerationDigest: second.generationDigest, actor: "operator", auditKey, auditAnchor,
     })).rejects.toThrow(/current/i);
+    sqlite.close();
+  });
+
+  it("anchors two-phase quarantine in audit_events and recovers rename failure while rejecting a whole-chain rollback", async () => {
+    const tree = await makeTree();
+    const sqlite = new Database(":memory:");
+    sqlite.exec("CREATE TABLE audit_events (id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, details_safe_json TEXT NOT NULL, created_at_ms INTEGER NOT NULL)");
+    const auditAnchor = new SqlitePixelleGcAuditAnchor(sqlite);
+    const auditKey = Buffer.alloc(32, 8);
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "second-anchor";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    const second = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    let failed = false;
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+      renameGeneration: async () => { failed = true; throw new Error("injected rename failure"); },
+    })).rejects.toThrow(/injected rename failure/);
+    expect(failed).toBe(true);
+    expect(await fs.stat(path.join(tree.stagingDir, "generations", first.generationDigest))).toBeTruthy();
+    const recoveryWorkflow = path.join(tree.stagingDir, "generations", first.generationDigest, "tts-index2", "workflow.api.json");
+    const recoveryBytes = await fs.readFile(recoveryWorkflow);
+    await fs.writeFile(recoveryWorkflow, "{}\n");
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).rejects.toThrow(/digest|bytes|integrity/i);
+    await fs.writeFile(recoveryWorkflow, recoveryBytes);
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: first.generationDigest, confirmGenerationDigest: first.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).resolves.toMatchObject({ generationDigest: first.generationDigest, quarantined: true, recovered: true });
+    const oldAudit = path.join(tree.root, "old-audit");
+    await fs.cp(path.join(tree.stagingDir, "audit"), oldAudit, { recursive: true });
+
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "third-anchor";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed));
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await expect(garbageCollectPixelleGeneration({
+      stagingDir: tree.stagingDir, generationDigest: second.generationDigest, confirmGenerationDigest: second.generationDigest,
+      actor: "operator", auditKey, auditAnchor,
+    })).resolves.toMatchObject({ quarantined: true });
+    await fs.rm(path.join(tree.stagingDir, "audit"), { recursive: true });
+    await fs.cp(oldAudit, path.join(tree.stagingDir, "audit"), { recursive: true });
+    await expect(verifyPixelleGcAuditChain({ stagingDir: tree.stagingDir, auditKey, auditAnchor })).rejects.toThrow(/database|anchor|rollback/i);
+    sqlite.close();
   });
 
 });

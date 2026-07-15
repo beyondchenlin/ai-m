@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { verifyPreparedGenerationPackage } from "./verify-generation-package";
-import { appendPixelleGcAudit } from "./pixelle-gc-audit";
+import {
+  appendPixelleGcAudit,
+  getPixelleGcAuditEntries,
+  productionPixelleGcAuditAnchor,
+  type SqlitePixelleGcAuditAnchor,
+  verifyPixelleGcAuditChain,
+} from "./pixelle-gc-audit";
 import { canonicalize, sha256 } from "../src/lib/generation/workflows/canonical";
 import { compileWorkflowBindings } from "../src/lib/generation/workflows/compiler";
 import { parseWorkflowManifest } from "../src/lib/generation/workflows/manifest";
@@ -57,6 +63,8 @@ export interface GarbageCollectOptions {
   actor: string;
   getProcessIdentity?: PrepareOptions["getProcessIdentity"];
   auditKey?: Buffer;
+  auditAnchor?: SqlitePixelleGcAuditAnchor;
+  renameGeneration?: typeof fs.rename;
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -1021,7 +1029,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   }
 }
 
-export async function garbageCollectPixelleGeneration(options: GarbageCollectOptions): Promise<{ generationDigest: string; quarantined: true; quarantinedBytes: number; auditFile: string }> {
+export async function garbageCollectPixelleGeneration(options: GarbageCollectOptions): Promise<{ generationDigest: string; quarantined: true; quarantinedBytes: number; auditFile: string; recovered: boolean }> {
   if (!/^[a-f0-9]{64}$/.test(options.generationDigest)) throw new Error("GC generation digest is invalid");
   if (options.confirmGenerationDigest !== options.generationDigest) throw new Error("GC confirmation digest must exactly match the target generation");
   if (!/^[A-Za-z0-9._@-]{1,200}$/.test(options.actor)) throw new Error("GC actor is invalid");
@@ -1044,6 +1052,42 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
     const current = JSON.parse(currentBytes.toString("utf8")) as { generationDigest: string };
     if (current.generationDigest === options.generationDigest) throw new Error("Refusing to garbage-collect the current generation");
     const generationRoot = path.join(stagingDir, "generations", options.generationDigest);
+    const quarantineDir = path.join(stagingDir, "quarantine");
+    const quarantineTarget = path.join(quarantineDir, options.generationDigest);
+    const auditAnchor = options.auditAnchor ?? await productionPixelleGcAuditAnchor();
+    const anchorEvents = auditAnchor.list();
+    const pending = anchorEvents.find((event) => event.phase === "intent"
+      && !anchorEvents.some((candidate) => candidate.phase === "committed" && candidate.transactionId === event.transactionId));
+    if (pending) {
+      if (pending.payload.generationDigest !== options.generationDigest || pending.payload.currentGenerationDigest !== current.generationDigest) {
+        throw new Error("A different or stale Pixelle GC database intent requires manual recovery");
+      }
+      const entries = await getPixelleGcAuditEntries({ stagingDir, auditKey: options.auditKey });
+      if (!entries.some((entry) => entry.transactionId === pending.transactionId && entry.phase === "intent")) {
+        await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload: pending.payload, phase: "intent", transactionId: pending.transactionId });
+      }
+      const sourceExists = Boolean(await lstatOrNull(generationRoot));
+      const targetExists = Boolean(await lstatOrNull(quarantineTarget));
+      if (sourceExists === targetExists) throw new Error("Pending Pixelle GC intent has an ambiguous source/quarantine state");
+      const recoveryRoot = sourceExists ? generationRoot : quarantineTarget;
+      for (const [packageName, expectedPackageDigest] of Object.entries(pending.payload.packageDigests)) {
+        await verifyPreparedGenerationPackage({
+          generationRoot: recoveryRoot,
+          packageName,
+          expectedGenerationDigest: pending.payload.generationDigest,
+          expectedPackageDigest,
+        });
+      }
+      if (await measureSafeTree(recoveryRoot) !== pending.payload.quarantinedBytes) throw new Error("Pending Pixelle GC target bytes changed after intent review");
+      if (sourceExists) await (options.renameGeneration ?? fs.rename)(generationRoot, quarantineTarget);
+      const committedAudit = await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload: pending.payload, phase: "committed", transactionId: pending.transactionId });
+      auditAnchor.commit(pending, committedAudit.entryDigest);
+      await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
+      await syncDirectory(path.join(stagingDir, "generations"));
+      await syncDirectory(quarantineDir);
+      await syncDirectory(stagingDir);
+      return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes: pending.payload.quarantinedBytes, auditFile: committedAudit.auditFile, recovered: true };
+    }
     const generationRaw = JSON.parse(await fs.readFile(path.join(generationRoot, "generation.json"), "utf8")) as unknown;
     if (!isRecord(generationRaw) || !isRecord(generationRaw.packageDigests) || generationRaw.generationDigest !== options.generationDigest) {
       throw new Error("GC target generation metadata is invalid");
@@ -1058,22 +1102,24 @@ export async function garbageCollectPixelleGeneration(options: GarbageCollectOpt
     }
     if (!(await fs.readFile(currentPath)).equals(currentBytes)) throw new Error("current.json changed during GC review");
     const quarantinedBytes = await measureSafeTree(generationRoot);
-    const quarantineDir = path.join(stagingDir, "quarantine");
-    const quarantineTarget = path.join(quarantineDir, options.generationDigest);
     if (await lstatOrNull(quarantineTarget)) throw new Error("GC quarantine target already exists");
-    const audit = await appendPixelleGcAudit({
-      stagingDir, auditKey: options.auditKey,
-      payload: {
-        actor: options.actor, generationDigest: options.generationDigest, packageDigests,
-        currentGenerationDigest: current.generationDigest, quarantinedBytes,
-        quarantineName: options.generationDigest, reviewedAtMs: Date.now(),
-      },
-    });
-    await fs.rename(generationRoot, quarantineTarget);
+    const payload = {
+      actor: options.actor, generationDigest: options.generationDigest, packageDigests,
+      currentGenerationDigest: current.generationDigest, quarantinedBytes,
+      quarantineName: options.generationDigest, reviewedAtMs: Date.now(),
+    };
+    const chain = await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
+    const transactionId = randomBytes(16).toString("hex");
+    const intent = auditAnchor.begin(payload, chain.lastDigest, transactionId);
+    await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "intent", transactionId: intent.transactionId });
+    await (options.renameGeneration ?? fs.rename)(generationRoot, quarantineTarget);
+    const audit = await appendPixelleGcAudit({ stagingDir, auditKey: options.auditKey, payload, phase: "committed", transactionId: intent.transactionId });
+    auditAnchor.commit(intent, audit.entryDigest);
+    await verifyPixelleGcAuditChain({ stagingDir, auditKey: options.auditKey, auditAnchor });
     await syncDirectory(path.join(stagingDir, "generations"));
     await syncDirectory(quarantineDir);
     await syncDirectory(stagingDir);
-    return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes, auditFile: audit.auditFile };
+    return { generationDigest: options.generationDigest, quarantined: true, quarantinedBytes, auditFile: audit.auditFile, recovered: false };
   } finally {
     await releaseLock(stagingDir, token);
   }

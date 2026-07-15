@@ -38,6 +38,15 @@ Task 4 必须在目标 `8000` ComfyUI 的同一进程生命周期内完成 live 
 
 严格入口只信任固定路径 `$HOME/.ai-m/trust/pixelle-task4-ed25519-public.pem` 的本地 Ed25519 公钥，不接受环境变量替换 trust root。Task 4 的签名 evidence 必须包含有效期、backend fingerprint、目标 listener 的 PID/process identity/connection ID、每次 live run 及 artifact 摘要，以及整体重启前后的不同 process identity/connection ID；签名覆盖全部字段。缺文件、字段、签名、时效或任一绑定不匹配都会 fail closed。对应私钥必须由 Task 4 进程从受限的本机密钥存储读取，不能放进仓库、staging 或 evidence 文件。
 
+首次使用前必须由当前 Windows 用户在本机配置固定 trust store；脚本不会接受环境变量替换路径，也不会自动补全或覆盖残缺的 key set：
+
+```powershell
+corepack pnpm workflow:trust:provision:pixelle-single
+corepack pnpm workflow:trust:verify:pixelle-single
+```
+
+配置与验证会检查 private/public Ed25519 key、32-byte audit HMAC key 和公钥 fingerprint metadata。目录与文件必须属于当前 SID、禁用 DACL 继承、ACL 只能包含当前 SID 与 SYSTEM，并且不能是 symlink、junction 或其他 reparse point。evidence 的每个 live run 必须绑定同一个 backend fingerprint 和重启前 listener 的 PID、process creation time、boot ID、process identity、connection ID。时间线必须满足 run 完成早于 stopped/restarted，随后 `/system_stats` 与 `/object_info` 成功 readiness 摘要、reconnected、issued、当前验证时间和 expires 的严格顺序；超长字段、对象、签名、公钥或链接路径会直接拒绝。
+
 当前已知 blocker 只作为 Task 4 排查线索：
 
 - `tts-omnivoice-clone-duration-bf16` 需要实际注册的 `PixelleDurationInput` 节点。
@@ -72,9 +81,9 @@ corepack pnpm workflow:import:verified-generation | Tee-Object -FilePath (Join-P
 
 ## 安全人工 GC
 
-在线 GC 不删除文件，只隔离已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。命令与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要，写入 HMAC 签名 hash-chain 审计记录后，把目标原子改名到受控 `quarantine/<generationDigest>`。quarantine 的数量和字节仍计入 fail-closed 配额，因此命令不会虚假声称已释放空间。
+在线 GC 不删除文件，只隔离已经完成摘要复验、且不是 `current.json` 指向目标的旧代际。命令与 prepare 使用同一把 lock，要求操作者身份和两次完全一致的目标摘要。它先在现有 `audit_events` 数据库写入单调 `intent` anchor，再写 signed-chain intent，之后才把目标原子改名到受控 `quarantine/<generationDigest>`，最后写 signed-chain 与数据库 `committed`。数据库不可用时 fail closed 且不改名。启动重试会同时核对数据库 intent、signed chain、`generations`/`quarantine` 两侧状态；只允许恢复唯一明确状态，双存在或双缺失需要人工处理。quarantine 的数量和字节仍计入 fail-closed 配额，因此命令不会虚假声称已释放空间。
 
-审计只信任固定路径 `$HOME/.ai-m/trust/pixelle-gc-audit-hmac.key` 的本机受限密钥。普通 JSON 不是不可变记录；必须用 `workflow:audit:verify:pixelle-single` 校验每项签名、previous digest 和签名 head，篡改、重排或截断都会失败。
+审计只信任固定路径 `$HOME/.ai-m/trust/pixelle-gc-audit-hmac.key` 的本机受限密钥。普通 JSON 不是不可变记录，signed 文件链也只是辅助证据；`audit_events` 是链外单调 anchor。必须用 `workflow:audit:verify:pixelle-single` 同时校验数据库 intent/committed、每项签名、previous digest 和签名 head。单文件篡改、重排、截断，或把完整 entries/head 一起回滚到旧快照都会失败。数据库本身的离线管理员级回滚不在该机制的防护边界内。
 
 ```powershell
 $env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
