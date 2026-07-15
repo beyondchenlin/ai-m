@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalize } from "../../src/lib/generation/workflows/canonical";
 import { compileWorkflowBindings } from "../../src/lib/generation/workflows/compiler";
@@ -20,6 +21,7 @@ async function fixture(kind: "image" | "speech" | "video" = "image", requestedPa
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "task4-single-")); roots.push(root);
   const pixelleRoot = path.join(root, "Pixelle");
   await fs.mkdir(path.join(pixelleRoot, "scripts", "comfyui"), { recursive: true });
+  await fs.mkdir(path.join(pixelleRoot, "workflows", "selfhost"), { recursive: true });
   await fs.writeFile(path.join(pixelleRoot, "scripts", "comfyui", "start_backend.ps1"), "# fixed start");
   await fs.writeFile(path.join(pixelleRoot, "scripts", "comfyui", "stop_backend.ps1"), "# fixed stop");
   const workflow: ComfyWorkflow = kind === "image" ? {
@@ -77,6 +79,8 @@ async function fixture(kind: "image" | "speech" | "video" = "image", requestedPa
     await Promise.all(Object.entries(files).map(([filename, bytes]) => fs.writeFile(path.join(generationRoot, name, filename), bytes)));
   }
   await fs.writeFile(path.join(generationRoot, "generation.json"), `${canonicalize({ schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified" })}\n`);
+  await fs.writeFile(path.join(root, "staging", ".ai-m-pixelle-staging.json"), `${canonicalize({ schemaVersion: 2, producer: "ai-m/pixelle-single-backend", canonicalStagingPath: path.join(root, "staging") })}\n`);
+  await fs.writeFile(path.join(root, "staging", "current.json"), `${canonicalize({ schemaVersion: 1, generationDigest })}\n`);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   return {
     root, pixelleRoot, generationRoot, generationDigest, packageDigest, packageName, packageNames,
@@ -138,6 +142,7 @@ describe("single-endpoint Task 4 verifier", () => {
     });
     expect(events).toEqual(["/system_stats", "/object_info", "submit", "history", "download", "close", "stop", "start", "/system_stats", "/object_info", "close"]);
     const evidence = JSON.parse(await fs.readFile(result.evidenceFiles[0], "utf8"));
+    expect(evidence.expiresAtMs - evidence.issuedAtMs).toBe(60 * 60_000);
     await expect(verifyGenerationPackageForImport({
       generationRoot: f.generationRoot, packageName: "image-test", expectedGenerationDigest: f.generationDigest,
       expectedPackageDigest: f.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: f.publicKey, nowMs: evidence.issuedAtMs,
@@ -414,6 +419,23 @@ describe("single-endpoint Task 4 verifier", () => {
     } finally { child.kill(); }
   });
 
+  it("rejects Task 4 while a second OS process owns the shared prepare.lock", async () => {
+    const f = await fixture(); const prepareLock = path.join(f.root, "staging", "prepare.lock"); const ready = path.join(f.root, "prepare-ready");
+    const helper = path.join(f.root, "prepare-owner.mts");
+    const prepareModule = pathToFileURL(path.resolve("scripts/prepare-pixelle-single-backend.ts")).href;
+    await fs.writeFile(helper, `import { promises as fs } from "node:fs"; import { preparePixelleSingleBackendPackages } from ${JSON.stringify(prepareModule)}; await preparePixelleSingleBackendPackages({ pixelleRoot: process.env.PIXELLE_ROOT!, stagingDir: process.env.STAGING_DIR!, afterLockAcquired: async () => { await fs.writeFile(process.env.READY_FILE!, "ready"); await new Promise(() => {}); } });\n`);
+    const child = spawn(process.execPath, ["--import", "tsx", helper], { cwd: process.cwd(), env: { ...process.env, PIXELLE_ROOT: f.pixelleRoot, STAGING_DIR: path.join(f.root, "staging"), READY_FILE: ready }, windowsHide: true, stdio: "ignore" });
+    const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    try {
+      for (let attempt = 0; attempt < 100; attempt += 1) { try { await fs.lstat(ready); break; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); } }
+      await expect(fs.lstat(ready)).resolves.toBeDefined(); let connected = false;
+      await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "inventory-only", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: {} }, {
+        expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connected = true; return fakeSession([]); }, observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+      })).rejects.toThrow(/locked by an active prepare.lock/i);
+      expect(connected).toBe(false);
+    } finally { child.kill(); await childClosed; }
+  });
+
   it("recovers a stale reused-PID lock only when the old identity is conclusively different", async () => {
     const f = await fixture(); const lockFile = path.join(f.root, "task4.lock"); const now = 2_000_000_900_000;
     const old = { schemaVersion: 2, pid: 424242, processIdentity: "old-boot:424242:1000", token: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", startedAtMs: now - 10_000 };
@@ -454,6 +476,44 @@ describe("single-endpoint Task 4 verifier", () => {
     await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey, evidenceTtlMs: 1 }, {
       now: () => (now += 2), expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); }, observeListener: async () => connections === 1 ? identityBefore : identityAfter, restart: async () => ({ stoppedAtMs: (now += 2), restartedAtMs: (now += 2) }),
     })).rejects.toThrow(/stale/i);
+    await expect(fs.lstat(committedDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects evidence TTL above the strict 24 hour maximum", async () => {
+    const f = await fixture();
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: path.join(f.root, "e"), archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, evidenceTtlMs: 7 * 24 * 60 * 60_000 }, {
+      expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => fakeSession([]), observeListener: async () => identityBefore, restart: async () => ({ stoppedAtMs: 1, restartedAtMs: 2 }),
+    })).rejects.toThrow(/evidence TTL.*bounded range/i);
+  });
+
+  it("freshly re-signs every package together after a long six-package run", async () => {
+    const names = ["tts-index2", "tts-index2-8g", "tts-omnivoice-longform-bf16", "tts-omnivoice-clone-duration-bf16", "image-z-image-turbo", "video-wan2.1-fusionx"];
+    const f = await fixture("image", names); let connections = 0; let now = 2_000_003_000_000; const committedDir = path.join(f.root, "committed");
+    const result = await verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters: Object.fromEntries(names.map((name) => [name, { prompt: name }])), privateKey: f.privateKey, publicKey: f.publicKey }, {
+      now: () => ++now, processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); },
+      observeListener: async () => ({ pid: 100 + connections, processCreatedAtMs: 1_000 + connections, bootId: "boot-1", processIdentity: `boot-1:${connections}` }), restart: async () => { const stoppedAtMs = ++now; now += 2 * 60 * 60_000; return { stoppedAtMs, restartedAtMs: ++now }; },
+    });
+    const evidence = await Promise.all(result.evidenceFiles.map(async (file) => JSON.parse(await fs.readFile(file, "utf8"))));
+    expect(new Set(evidence.map((item) => item.issuedAtMs)).size).toBe(1);
+    expect(evidence.every((item) => item.expiresAtMs - item.issuedAtMs === 60 * 60_000)).toBe(true);
+    expect(evidence[0].issuedAtMs).toBeGreaterThan(evidence.at(-1).liveRuns[0].completedAtMs);
+  });
+
+  it("fails without commit when the run window plus fresh TTL exceeds 24 hours", async () => {
+    const f = await fixture(); let connections = 0; let now = 2_000_004_000_000; const committedDir = path.join(f.root, "committed");
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey }, {
+      now: () => ++now, expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); }, observeListener: async () => connections === 1 ? identityBefore : identityAfter,
+      restart: async () => { const stoppedAtMs = ++now; now += 24 * 60 * 60_000; return { stoppedAtMs, restartedAtMs: ++now }; },
+    })).rejects.toThrow(/execution window is too long/i);
+    await expect(fs.lstat(committedDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a current.json switch at final commit while both locks are held", async () => {
+    const f = await fixture(); let connections = 0; let now = 2_000_005_000_000; const committedDir = path.join(f.root, "committed");
+    await expect(verifySingleComfyUI({ baseUrl: "http://127.0.0.1:8000", mode: "verify", pixelleRoot: f.pixelleRoot, generationRoot: f.generationRoot, expectedGenerationDigest: f.generationDigest, evidenceDir: committedDir, archiveDir: path.join(f.root, "a"), parameters: { "image-test": { prompt: "x" } }, privateKey: f.privateKey, publicKey: f.publicKey }, {
+      now: () => ++now, expectedPackageNames: [f.packageName], processIdentityForPid: async () => "current-process-identity", connect: async () => { connections += 1; return fakeSession([], { connectionId: `connection-${connections}-fresh` }); }, observeListener: async () => connections === 1 ? identityBefore : identityAfter, restart: async () => ({ stoppedAtMs: ++now, restartedAtMs: ++now }),
+      beforeFinalCurrentCheck: async () => { await fs.writeFile(path.join(f.root, "staging", "current.json"), `${canonicalize({ schemaVersion: 1, generationDigest: "0".repeat(64) })}\n`); },
+    })).rejects.toThrow(/current\.json changed away/i);
     await expect(fs.lstat(committedDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

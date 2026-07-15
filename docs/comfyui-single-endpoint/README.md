@@ -19,7 +19,7 @@ $env:TASK4_MODE = 'inventory-only'
 corepack pnpm workflow:verify:pixelle-single
 ```
 
-真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包。每个包都执行：submit 前持久化 restart-required marker、限时轮询 history、流式限额下载并 fsync 临时归档、关闭旧连接、停止并启动整个 8000 后端、确认 PID/process creation/connection identity 全部变化、重新探测并生成签名 evidence。上一包的 `restart.after` 必须精确等于下一包的 `listener.before`；六包全部通过后，CLI 在当前时间重验全部 evidence/TTL，并把最后一包 `restart.after` 记录为最终 endpoint，随后一次原子 rename 发布整个 committed set：
+真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包。每个包都执行：submit 前持久化 restart-required marker、限时轮询 history、流式限额下载并 fsync 临时归档、关闭旧连接、停止并启动整个 8000 后端、确认 PID/process creation/connection identity 全部变化、重新探测并收集 evidence 事实。上一包的 `restart.after` 必须精确等于下一包的 `listener.before`；六包全部通过后，CLI 使用同一个新鲜 `issuedAt` 对全部 evidence 重新签名，默认有效期为 1 小时且绝不允许超过 24 小时。运行窗口到 `expiresAt` 超过 24 小时会 fail closed。CLI 随后在当前时间严格重验磁盘上的全部 evidence，把最后一包 `restart.after` 记录为最终 endpoint，再一次原子 rename 发布整个 committed set：
 
 ```powershell
 $env:TASK4_MODE = 'verify'
@@ -34,7 +34,7 @@ corepack pnpm workflow:verify:pixelle-single
 
 如果 stop/start 或重连 readiness 结果不确定，CLI 会保留 `PIXELLE_WORKFLOW_STAGING_DIR/task4-restart-blocked.json` 并拒绝后续运行。操作员必须先从系统外部核对 8000 listener、PID、启动时间及健康探测，再用当前 generation digest 明确解除；例如 `$env:TASK4_RECOVERY_CONFIRM = 'RECOVER-<generationDigest>'`。恢复流程会再次建立新 WebSocket、核对 OS listener 并执行两项 readiness probe，全部成功后才删除 marker。
 
-整个 recovery、连接、六包运行、重启和 committed 发布都由 identity-bound `task4.lock` 跨进程独占。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复，身份不确定时必须人工处理。
+整个 recovery、连接、六包运行、重启和 committed 发布都先取得 staging 共用的 identity-bound `prepare.lock`，再取得 `task4.lock`，并按相反顺序释放。固定顺序避免死锁，也让 prepare/GC 与 Task 4 互斥。两把锁覆盖锁内读取 `current.json`、六包执行和最终 committed 发布；签名和发布前都会再次确认 current digest 未切换。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复，身份不确定时必须人工处理。
 
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 

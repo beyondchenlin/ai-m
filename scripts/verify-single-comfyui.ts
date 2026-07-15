@@ -64,6 +64,7 @@ export interface VerifySingleOptions {
   blockedMarkerFile?: string;
   recoveryConfirmation?: string;
   lockFile?: string;
+  prepareLockFile?: string;
 }
 
 export interface Task4Dependencies {
@@ -79,6 +80,7 @@ export interface Task4Dependencies {
   afterRestartMarker?: () => Promise<void>;
   processIdentityForPid?: (pid: number) => Promise<string | "missing" | "unknown">;
   lockStaleMs?: number;
+  beforeFinalCurrentCheck?: () => Promise<void>;
 }
 
 const PIXELLE_PACKAGE_NAMES = ["tts-index2", "tts-index2-8g", "tts-omnivoice-longform-bf16", "tts-omnivoice-clone-duration-bf16", "image-z-image-turbo", "video-wan2.1-fusionx"] as const;
@@ -229,6 +231,14 @@ async function inventoryGeneration(options: VerifySingleOptions): Promise<Packag
   return packages;
 }
 
+async function assertCurrentGeneration(options: VerifySingleOptions): Promise<void> {
+  const stagingDir = path.dirname(path.dirname(path.resolve(options.generationRoot)));
+  const currentFile = path.join(stagingDir, "current.json"); const stat = await fs.lstat(currentFile);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) throw new Error("current.json is unsafe or oversized");
+  const current = record(parseJson(await fs.readFile(currentFile), "current.json"), "current.json");
+  if (current.generationDigest !== options.expectedGenerationDigest) throw new Error("current.json changed away from the locked Task 4 generation");
+}
+
 function historyOutcome(history: Task4History | undefined): "completed" | "cancelled" | "failed" | "unknown" {
   if (!history) return "unknown";
   const status = (history.status?.status_str ?? history.status?.statusStr)?.trim().toLowerCase();
@@ -274,7 +284,7 @@ function combinedError(primary: unknown, cleanup: unknown[], label: string): Err
 }
 
 interface Task4LockRecord { schemaVersion: 2; pid: number; processIdentity: string; token: string; startedAtMs: number }
-async function defaultProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
+async function queryProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
   if (process.platform !== "win32") {
     try { process.kill(pid, 0); return pid === process.pid ? `process-${pid}-${process.uptime()}` : "unknown"; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "missing" : "unknown"; }
@@ -283,38 +293,44 @@ async function defaultProcessIdentityForPid(pid: number): Promise<string | "miss
   try { const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 }); return stdout.trim() || "unknown"; }
   catch { return "unknown"; }
 }
-function parseTask4Lock(value: unknown): Task4LockRecord {
-  const lock = record(value, "task4.lock");
+let currentTask4ProcessIdentity: Promise<string | "missing" | "unknown"> | undefined;
+function defaultProcessIdentityForPid(pid: number): Promise<string | "missing" | "unknown"> {
+  if (pid !== process.pid) return queryProcessIdentityForPid(pid);
+  currentTask4ProcessIdentity ??= queryProcessIdentityForPid(pid);
+  return currentTask4ProcessIdentity;
+}
+function parseTask4Lock(value: unknown, lockName = "task4.lock"): Task4LockRecord {
+  const lock = record(value, lockName);
   if (lock.schemaVersion !== 2 || !Number.isSafeInteger(lock.pid) || (lock.pid as number) <= 0 || typeof lock.processIdentity !== "string"
     || !/^[A-Za-z0-9._:-]{3,300}$/.test(lock.processIdentity) || typeof lock.token !== "string" || !/^[a-f0-9-]{20,100}$/.test(lock.token)
-    || !Number.isSafeInteger(lock.startedAtMs) || (lock.startedAtMs as number) <= 0) throw new Error("task4.lock is invalid; ownership is uncertain");
+    || !Number.isSafeInteger(lock.startedAtMs) || (lock.startedAtMs as number) <= 0) throw new Error(`${lockName} is invalid; ownership is uncertain`);
   return lock as unknown as Task4LockRecord;
 }
 async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): Promise<Task4LockRecord> {
-  const target = path.resolve(file); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 6 * 60 * 60_000;
+  const target = path.resolve(file); const lockName = path.basename(target); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 6 * 60 * 60_000;
   if (!Number.isSafeInteger(staleMs) || staleMs < 1_000) throw new Error("Task 4 lock stale threshold is invalid");
   const identityFor = dependencies.processIdentityForPid ?? defaultProcessIdentityForPid;
   const processIdentity = await identityFor(process.pid); if (processIdentity === "missing" || processIdentity === "unknown") throw new Error("Current Task 4 process identity is uncertain");
-  const owned = { schemaVersion: 2 as const, pid: process.pid, processIdentity, token: randomUUID(), startedAtMs: now() };
+  const owned = { schemaVersion: 2 as const, pid: process.pid, processIdentity, token: randomUUID().replace(/-/g, ""), startedAtMs: now() };
   await fs.mkdir(path.dirname(target), { recursive: true });
   for (;;) {
     try { await archiveBytes(target, Buffer.from(`${canonicalize(owned)}\n`)); await syncDirectory(path.dirname(target)); return owned; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const stat = await fs.lstat(target); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_096) throw new Error("task4.lock is unsafe");
-      const raw = await fs.readFile(target); const existing = parseTask4Lock(parseJson(raw, "task4.lock"));
-      if (now() - existing.startedAtMs <= staleMs) throw new Error("Task 4 is locked by an active task4.lock");
+      const stat = await fs.lstat(target); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_096) throw new Error(`${lockName} is unsafe`);
+      const raw = await fs.readFile(target); const existing = parseTask4Lock(parseJson(raw, lockName), lockName);
+      if (now() - existing.startedAtMs <= staleMs) throw new Error(`Task 4 is locked by an active ${lockName}`);
       const observed = await identityFor(existing.pid);
       if (observed === "unknown") throw new Error("Stale Task 4 lock owner identity is uncertain");
       if (observed === existing.processIdentity) throw new Error("Task 4 is locked by the original live process");
-      if (!(await fs.readFile(target)).equals(raw)) throw new Error("task4.lock changed during stale recovery");
+      if (!(await fs.readFile(target)).equals(raw)) throw new Error(`${lockName} changed during stale recovery`);
       await fs.rename(target, `${target}.stale.${existing.token}`); await syncDirectory(path.dirname(target));
     }
   }
 }
 async function releaseTask4Lock(file: string, owned: Task4LockRecord): Promise<void> {
-  const target = path.resolve(file); const current = parseTask4Lock(parseJson(await fs.readFile(target), "task4.lock"));
-  if (canonicalize(current) !== canonicalize(owned)) throw new Error("task4.lock ownership was lost");
+  const target = path.resolve(file); const lockName = path.basename(target); const current = parseTask4Lock(parseJson(await fs.readFile(target), lockName), lockName);
+  if (canonicalize(current) !== canonicalize(owned)) throw new Error(`${lockName} ownership was lost`);
   await fs.rm(target); await syncDirectory(path.dirname(target));
 }
 
@@ -468,9 +484,10 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
 }> {
   if (options.baseUrl !== BASE_URL) throw new Error("Task 4 only permits http://127.0.0.1:8000");
   await assertFixedScripts(options.pixelleRoot);
+  await assertCurrentGeneration(options);
   const completionTimeoutMs = safeInteger(options.completionTimeoutMs, 10 * 60_000, 30 * 60_000, "completion timeout");
   const pollIntervalMs = safeInteger(options.pollIntervalMs, 250, 10_000, "poll interval");
-  const evidenceTtlMs = safeInteger(options.evidenceTtlMs, 7 * 24 * 60 * 60_000, 7 * 24 * 60 * 60_000, "evidence TTL");
+  const evidenceTtlMs = safeInteger(options.evidenceTtlMs, 60 * 60_000, 24 * 60 * 60_000, "evidence TTL");
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const packages = await inventoryGeneration(options);
@@ -521,7 +538,7 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   const runDir = path.join(path.dirname(committedDir), `.${path.basename(committedDir)}.run-${runToken}`);
   await fs.mkdir(runDir, { recursive: false }); await fs.mkdir(path.join(runDir, "artifacts"), { recursive: false }); await fs.mkdir(path.join(runDir, "evidence"), { recursive: false });
   const windowStartedAtMs = now(); const archiveRelative: string[] = []; const evidenceRelative: string[] = [];
-  const stagedEvidence: Array<{ pkg: PackageInventory; relativePath: string }> = [];
+  const evidenceFacts: Array<{ pkg: PackageInventory; payload: Record<string, unknown> }> = [];
   let previousAfter: (Task4ListenerIdentity & { connectionId: string }) | undefined;
   let referenceAudioName: string | undefined; const privateKey = options.privateKey ?? await loadProductionTask4PrivateKey();
   try {
@@ -605,29 +622,35 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
       }
       if (primaryError || cleanupErrors.length) throw combinedError(primaryError, cleanupErrors, `${pkg.packageName} failed and cleanup/restart was not fully verified`);
       if (!artifact || !restart || !afterIdentity || !afterSystem || !afterObjects) throw new Error(`${pkg.packageName} verification state is incomplete`);
-      const issuedAtMs = now();
       const beforeEvidence = packageBefore;
       const afterEvidence = { ...afterIdentity, connectionId: session.connectionId };
       const run = { runId: promptId, startedAtMs, completedAtMs, backendFingerprint, listener: { ...packageIdentity, connectionId: beforeEvidence.connectionId }, artifact };
-      const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs, issuedAtMs, expiresAtMs: Math.min(issuedAtMs + evidenceTtlMs, windowStartedAtMs + 7 * 24 * 60 * 60_000),
+      const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs,
         generationDigest: options.expectedGenerationDigest, packageName: pkg.packageName, packageDigest: pkg.packageDigest, backendFingerprint,
         listener: { baseUrl: BASE_URL, ...afterEvidence }, liveRuns: [run], restart: { before: beforeEvidence, after: afterEvidence, ...restart, readinessAtMs, reconnectedAtMs },
         readiness: { checkedAtMs: readinessAtMs, systemStats: { path: "/system_stats", statusCode: 200, responseSha256: hash(canonicalize(afterSystem)) }, objectInfo: { path: "/object_info", statusCode: 200, responseSha256: hash(canonicalize(afterObjects)) } } };
-      const evidence = signTask4Evidence(payload, privateKey);
-      await verifyGenerationPackageForImport({ generationRoot: options.generationRoot, packageName: pkg.packageName, expectedGenerationDigest: options.expectedGenerationDigest, expectedPackageDigest: pkg.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: options.publicKey, nowMs: issuedAtMs });
-      const evidenceRelativePath = path.join("evidence", `${pkg.packageName}.json`); await archiveBytes(path.join(runDir, evidenceRelativePath), Buffer.from(`${canonicalize(evidence)}\n`));
-      archiveRelative.push(artifactRelative); evidenceRelative.push(evidenceRelativePath); stagedEvidence.push({ pkg, relativePath: evidenceRelativePath }); previousAfter = afterEvidence;
+      archiveRelative.push(artifactRelative); evidenceFacts.push({ pkg, payload }); previousAfter = afterEvidence;
     }
     if (!previousAfter) throw new Error("Task 4 package chain is empty");
     session.assertHealthy(); const finalIdentity = await dependencies.observeListener(); assertIdentity(finalIdentity, "final endpoint");
     if (canonicalize({ ...finalIdentity, connectionId: session.connectionId }) !== canonicalize(previousAfter)) throw new Error("Final endpoint is not the last package restart.after identity");
     await session.close();
+    await dependencies.beforeFinalCurrentCheck?.(); await assertCurrentGeneration(options);
+    const issuedAtMs = now(); const expiresAtMs = issuedAtMs + evidenceTtlMs;
+    if (expiresAtMs - windowStartedAtMs > 24 * 60 * 60_000) throw new Error("Task 4 execution window is too long for the maximum evidence validity window");
+    for (const { pkg, payload } of evidenceFacts) {
+      const evidence = signTask4Evidence({ ...payload, issuedAtMs, expiresAtMs }, privateKey);
+      await verifyGenerationPackageForImport({ generationRoot: options.generationRoot, packageName: pkg.packageName, expectedGenerationDigest: options.expectedGenerationDigest, expectedPackageDigest: pkg.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: options.publicKey, nowMs: issuedAtMs });
+      const relativePath = path.join("evidence", `${pkg.packageName}.json`); await archiveBytes(path.join(runDir, relativePath), Buffer.from(`${canonicalize(evidence)}\n`)); evidenceRelative.push(relativePath);
+    }
     const finalVerificationAtMs = now(); const evidenceDigests: Record<string, string> = {};
-    for (const { pkg, relativePath } of stagedEvidence) {
+    for (const { pkg } of evidenceFacts) {
+      const relativePath = path.join("evidence", `${pkg.packageName}.json`);
       const bytes = await fs.readFile(path.join(runDir, relativePath)); const evidence = parseJson(bytes, `${pkg.packageName} final evidence`);
       await verifyGenerationPackageForImport({ generationRoot: options.generationRoot, packageName: pkg.packageName, expectedGenerationDigest: options.expectedGenerationDigest, expectedPackageDigest: pkg.packageDigest, verifiedEvidence: evidence, trustRootPublicKey: options.publicKey, nowMs: finalVerificationAtMs });
       evidenceDigests[pkg.packageName] = hash(bytes);
     }
+    await assertCurrentGeneration(options);
     await archiveBytes(path.join(runDir, "commit.json"), Buffer.from(`${canonicalize({ schemaVersion: 1, generationDigest: options.expectedGenerationDigest, packageOrder: packages.map((pkg) => pkg.packageName), finalEndpoint: previousAfter, finalVerificationAtMs, evidenceDigests })}\n`));
     await syncDirectory(path.join(runDir, "artifacts")); await syncDirectory(path.join(runDir, "evidence")); await syncDirectory(runDir);
     await fs.rename(runDir, committedDir); await syncDirectory(path.dirname(committedDir));
@@ -643,12 +666,22 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
   archiveFiles: string[];
   evidenceFiles: string[];
 }> {
-  const lockFile = path.resolve(options.lockFile ?? path.join(path.dirname(path.dirname(options.generationRoot)), "task4.lock"));
-  const owned = await acquireTask4Lock(lockFile, dependencies);
+  const stagingDir = path.dirname(path.dirname(path.resolve(options.generationRoot)));
+  const prepareLockFile = path.resolve(options.prepareLockFile ?? path.join(stagingDir, "prepare.lock"));
+  const lockFile = path.resolve(options.lockFile ?? path.join(stagingDir, "task4.lock"));
+  if (prepareLockFile === lockFile) throw new Error("prepare.lock and task4.lock must be distinct");
+  const prepareOwned = await acquireTask4Lock(prepareLockFile, dependencies);
+  let owned: Task4LockRecord;
+  try { owned = await acquireTask4Lock(lockFile, dependencies); }
+  catch (error) {
+    const cleanup: unknown[] = []; try { await releaseTask4Lock(prepareLockFile, prepareOwned); } catch (releaseError) { cleanup.push(releaseError); }
+    throw combinedError(error, cleanup, "Task 4 lock acquisition failed and prepare.lock release was not fully verified");
+  }
   let result: Awaited<ReturnType<typeof verifySingleComfyUILocked>> | undefined; let primary: unknown;
   try { result = await verifySingleComfyUILocked(options, dependencies); } catch (error) { primary = error; }
   const cleanup: unknown[] = [];
   try { await releaseTask4Lock(lockFile, owned); } catch (error) { cleanup.push(error); }
+  try { await releaseTask4Lock(prepareLockFile, prepareOwned); } catch (error) { cleanup.push(error); }
   if (primary || cleanup.length) throw combinedError(primary, cleanup, "Task 4 failed and lock release was not fully verified");
   return result!;
 }
