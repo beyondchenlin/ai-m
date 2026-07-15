@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { verifyGenerationPackageForImport } from "./verify-generation-package";
 import { canonicalize, sha256 } from "../src/lib/generation/workflows/canonical";
 import { compileWorkflowBindings } from "../src/lib/generation/workflows/compiler";
 import { parseWorkflowManifest } from "../src/lib/generation/workflows/manifest";
@@ -22,6 +23,12 @@ export interface PrepareOptions {
   writeBytes?: typeof fs.writeFile;
   writeInitMarker?: typeof fs.writeFile;
   renameInitDir?: typeof fs.rename;
+  afterDurabilityEvent?: (event: "generation-payload" | "generations-directory" | "current-file" | "staging-directory") => Promise<void>;
+  maxGenerations?: number;
+  maxOrphanTemps?: number;
+  maxStagingBytes?: number;
+  minimumFreeBytes?: number;
+  getAvailableBytes?: (directory: string) => Promise<number>;
 }
 
 interface PreparedPackage {
@@ -37,6 +44,7 @@ export interface PrepareResult {
   state: "prepared-environment-unverified";
   generationDigest: string;
   orphanTempCount: number;
+  durability: { fileFsync: true; directoryFsync: boolean };
 }
 
 const STAGING_MARKER_FILENAME = ".ai-m-pixelle-staging.json";
@@ -47,6 +55,10 @@ const MAX_WORKFLOW_BYTES = 5 * 1024 * 1024;
 const MAX_TOTAL_WORKFLOW_BYTES = 30 * 1024 * 1024;
 const MAX_JSON_DEPTH = 64;
 const DEFAULT_LOCK_STALE_MS = 15 * 60 * 1000;
+const DEFAULT_MAX_GENERATIONS = 32;
+const DEFAULT_MAX_ORPHAN_TEMPS = 16;
+const DEFAULT_MAX_STAGING_BYTES = 4 * 1024 * 1024 * 1024;
+const DEFAULT_MINIMUM_FREE_BYTES = 256 * 1024 * 1024;
 
 interface CandidateDefinition {
   sourceFile: string;
@@ -625,6 +637,67 @@ async function countMarkedTempOrphans(stagingDir: string): Promise<number> {
   return count;
 }
 
+async function measureSafeTree(directory: string, depth = 0): Promise<number> {
+  if (depth > 4) throw new Error("Staging tree exceeds the supported depth");
+  let bytes = 0;
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  if (entries.length > 1_000) throw new Error("Staging tree has too many entries");
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    const stat = await fs.lstat(target);
+    if (stat.isSymbolicLink()) throw new Error(`Staging quota scan found a linked entry: ${entry.name}`);
+    if (stat.isFile()) bytes += stat.size;
+    else if (stat.isDirectory()) bytes += await measureSafeTree(target, depth + 1);
+    else throw new Error(`Staging quota scan found an unsupported entry: ${entry.name}`);
+  }
+  return bytes;
+}
+
+function positiveLimit(value: number | undefined, fallback: number, name: string, allowZero = false): number {
+  const result = value ?? fallback;
+  if (!Number.isSafeInteger(result) || result < (allowZero ? 0 : 1)) throw new Error(`${name} is invalid`);
+  return result;
+}
+
+async function availableBytes(directory: string): Promise<number> {
+  const stat = await fs.statfs(directory);
+  return Number(stat.bavail) * Number(stat.bsize);
+}
+
+async function inspectGenerationQuota(stagingDir: string): Promise<{ generationCount: number; bytes: number }> {
+  const generationsDir = path.join(stagingDir, "generations");
+  const generations = await fs.readdir(generationsDir, { withFileTypes: true });
+  for (const entry of generations) {
+    if (!/^[a-f0-9]{64}$/.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`Generations directory has an unsafe entry: ${entry.name}`);
+    }
+  }
+  return { generationCount: generations.length, bytes: await measureSafeTree(stagingDir) };
+}
+
+async function recoverCleanupTombstones(stagingDir: string): Promise<void> {
+  const prefix = ".tombstone-generation-";
+  for (const entry of await fs.readdir(stagingDir, { withFileTypes: true })) {
+    if (!entry.name.startsWith(prefix)) continue;
+    const token = entry.name.slice(prefix.length);
+    if (!/^[a-f0-9]{32}$/.test(token) || !entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Unsafe tombstone: ${entry.name}`);
+    const directory = path.join(stagingDir, entry.name);
+    const names = await fs.readdir(directory);
+    if (names.length === 0) {
+      await fs.rmdir(directory);
+      continue;
+    }
+    if (names.length !== 1 || names[0] !== TEMP_MARKER_FILENAME) throw new Error(`Tombstone has unfamiliar content: ${entry.name}`);
+    let marker: unknown;
+    try { marker = JSON.parse(await fs.readFile(path.join(directory, TEMP_MARKER_FILENAME), "utf8")); } catch { throw new Error(`Unsafe tombstone marker: ${entry.name}`); }
+    if (!isRecord(marker) || marker.schemaVersion !== 1 || marker.producer !== STAGING_MARKER_PRODUCER || marker.token !== token) {
+      throw new Error(`Unsafe tombstone marker: ${entry.name}`);
+    }
+    await fs.unlink(path.join(directory, TEMP_MARKER_FILENAME));
+    await fs.rmdir(directory);
+  }
+}
+
 type PackageFiles = Record<string, Buffer>;
 
 async function verifyGeneration(directory: string, expected: Map<string, PackageFiles>, generationBytes: Buffer): Promise<void> {
@@ -654,9 +727,60 @@ async function removeCurrentDuplicatePayload(payloadDir: string, expected: Map<s
   await fs.rmdir(payloadDir);
 }
 
-async function removeCurrentTempWrapper(tempDir: string): Promise<void> {
-  await fs.unlink(path.join(tempDir, TEMP_MARKER_FILENAME));
-  await fs.rmdir(tempDir);
+async function removeCurrentTempWrapper(tempDir: string, stagingDir: string, token: string): Promise<void> {
+  const tombstone = path.join(stagingDir, `.tombstone-generation-${token}`);
+  await fs.rename(tempDir, tombstone);
+  await recoverCleanupTombstones(stagingDir);
+}
+
+async function syncFile(file: string): Promise<void> {
+  const handle = await fs.open(file, "r+");
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function syncDirectory(directory: string): Promise<boolean> {
+  const handle = await fs.open(directory, "r");
+  try {
+    await handle.sync();
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EINVAL" || code === "ENOTSUP")) return false;
+    throw error;
+  } finally { await handle.close(); }
+}
+
+async function validateCurrentPointer(stagingDir: string): Promise<void> {
+  const currentPath = path.join(stagingDir, "current.json");
+  const stat = await lstatOrNull(currentPath);
+  if (!stat) return;
+  try {
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) throw new Error("current.json is not a bounded regular file");
+    const current = JSON.parse(await fs.readFile(currentPath, "utf8")) as unknown;
+    if (!isRecord(current) || current.schemaVersion !== 1 || current.state !== "prepared-environment-unverified"
+      || typeof current.generationDigest !== "string" || !/^[a-f0-9]{64}$/.test(current.generationDigest)
+      || !isRecord(current.packageDigests)) throw new Error("current.json contract is invalid");
+    const allowed = ["schemaVersion", "generationDigest", "packageDigests", "state"];
+    if (Object.keys(current).some((key) => !allowed.includes(key))) throw new Error("current.json has unknown fields");
+    const packageNames = Object.keys(current.packageDigests).sort();
+    if (packageNames.join("\0") !== candidates.map((item) => item.packageName).sort().join("\0")) throw new Error("current.json package set is invalid");
+    const packageDigests: Record<string, string> = {};
+    for (const packageName of packageNames) {
+      const digest = current.packageDigests[packageName];
+      if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) throw new Error("current.json package digest is invalid");
+      packageDigests[packageName] = digest;
+    }
+    const recomputed = digestBytes(Buffer.from(canonicalize({ schemaVersion: 1, packageDigests }), "utf8"));
+    if (recomputed !== current.generationDigest) throw new Error("current generation digest does not match package digests");
+    const generationRoot = path.join(stagingDir, "generations", current.generationDigest);
+    for (const [packageName, packageDigest] of Object.entries(packageDigests)) {
+      await verifyGenerationPackageForImport({
+        generationRoot, packageName, expectedGenerationDigest: current.generationDigest, expectedPackageDigest: packageDigest,
+      });
+    }
+  } catch (error) {
+    throw new Error(`Current pointer integrity check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 async function writeCurrentPointer(stagingDir: string, token: string, pointer: unknown): Promise<void> {
@@ -665,6 +789,7 @@ async function writeCurrentPointer(stagingDir: string, token: string, pointer: u
   try {
     await fs.writeFile(tempPath, bytes, { flag: "wx" });
     if (!(await fs.readFile(tempPath)).equals(bytes)) throw new Error("current pointer write verification failed");
+    await syncFile(tempPath);
     await assertLockOwned(stagingDir, token);
     await fs.rename(tempPath, path.join(stagingDir, "current.json"));
   } catch (error) {
@@ -704,9 +829,22 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   const token = randomBytes(16).toString("hex");
   await acquireLock(stagingDir, options, token);
   try {
+    let directoryFsyncSupported = true;
     await options.afterLockAcquired?.();
     await assertLockOwned(stagingDir, token);
+    await recoverCleanupTombstones(stagingDir);
+    await validateCurrentPointer(stagingDir);
     const orphanTempCount = await countMarkedTempOrphans(stagingDir);
+    const maxGenerations = positiveLimit(options.maxGenerations, DEFAULT_MAX_GENERATIONS, "maxGenerations");
+    const maxOrphanTemps = positiveLimit(options.maxOrphanTemps, DEFAULT_MAX_ORPHAN_TEMPS, "maxOrphanTemps", true);
+    const maxStagingBytes = positiveLimit(options.maxStagingBytes, DEFAULT_MAX_STAGING_BYTES, "maxStagingBytes");
+    const minimumFreeBytes = positiveLimit(options.minimumFreeBytes, DEFAULT_MINIMUM_FREE_BYTES, "minimumFreeBytes", true);
+    if (orphanTempCount > maxOrphanTemps) throw new Error("Generation orphan limit exceeded; manual review/GC is required");
+    const quota = await inspectGenerationQuota(stagingDir);
+    if (quota.generationCount > maxGenerations) throw new Error("Generation count limit exceeded; manual GC is required");
+    if (quota.bytes > maxStagingBytes) throw new Error("Staging byte limit exceeded; manual GC is required");
+    const freeBytes = await (options.getAvailableBytes ?? availableBytes)(stagingDir);
+    if (!Number.isFinite(freeBytes) || freeBytes < minimumFreeBytes) throw new Error("Staging free space is below the configured low-water mark");
     const sourceBytes = await snapshotSources(workflowDir, options.afterSourceFileRead);
     const tempDir = path.join(stagingDir, `.tmp-generation-${token}`);
     await fs.mkdir(tempDir);
@@ -755,7 +893,9 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
         const destination = path.join(tempPackageDir, filename);
         await writeBytes(destination, bytes);
         if (!(await fs.readFile(destination)).equals(bytes)) throw new Error(`Staging write verification failed: ${filename}`);
+        await syncFile(destination);
       }
+      if (!await syncDirectory(tempPackageDir)) directoryFsyncSupported = false;
       const packageDigest = digestBytes(Buffer.from(canonicalize(Object.fromEntries(Object.entries(files).map(([name, bytes]) => [name, digestBytes(bytes)]))), "utf8"));
       packageDigests[definition.packageName] = packageDigest;
       expected.set(definition.packageName, files);
@@ -770,9 +910,16 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     const generationDigest = digestBytes(Buffer.from(canonicalize({ schemaVersion: 1, packageDigests }), "utf8"));
     const generationBytes = jsonBytes({ schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified" });
     await writeBytes(path.join(payloadDir, "generation.json"), generationBytes);
+    await syncFile(path.join(payloadDir, "generation.json"));
+    if (!await syncDirectory(payloadDir)) directoryFsyncSupported = false;
+    await options.afterDurabilityEvent?.("generation-payload");
     await assertLockOwned(stagingDir, token);
     const generationDir = path.join(stagingDir, "generations", generationDigest);
-    if (await lstatOrNull(generationDir)) {
+    const generationExists = Boolean(await lstatOrNull(generationDir));
+    if (!generationExists && quota.generationCount >= maxGenerations) throw new Error("Generation count limit would be exceeded; manual GC is required");
+    const payloadBytes = await measureSafeTree(payloadDir);
+    if (!generationExists && quota.bytes + payloadBytes > maxStagingBytes) throw new Error("Staging byte limit would be exceeded; manual GC is required");
+    if (generationExists) {
       await verifyGeneration(generationDir, expected, generationBytes);
       await removeCurrentDuplicatePayload(payloadDir, expected);
     } else {
@@ -785,11 +932,17 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
       }
     }
     await verifyGeneration(generationDir, expected, generationBytes);
+    if (!await syncDirectory(generationDir)) directoryFsyncSupported = false;
+    if (!await syncDirectory(path.join(stagingDir, "generations"))) directoryFsyncSupported = false;
+    await options.afterDurabilityEvent?.("generations-directory");
     await writeCurrentPointer(stagingDir, token, {
       schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified",
     });
-    await removeCurrentTempWrapper(tempDir);
-    return { packages, state: "prepared-environment-unverified", generationDigest, orphanTempCount };
+    await options.afterDurabilityEvent?.("current-file");
+    if (!await syncDirectory(stagingDir)) directoryFsyncSupported = false;
+    await options.afterDurabilityEvent?.("staging-directory");
+    await removeCurrentTempWrapper(tempDir, stagingDir, token);
+    return { packages, state: "prepared-environment-unverified", generationDigest, orphanTempCount, durability: { fileFsync: true, directoryFsync: directoryFsyncSupported } };
   } finally {
     await releaseLock(stagingDir, token);
   }
@@ -804,6 +957,7 @@ async function main(): Promise<void> {
     state: result.state,
     generationDigest: result.generationDigest,
     orphanTempCount: result.orphanTempCount,
+    durability: result.durability,
     packages: result.packages,
   }, null, 2));
 }

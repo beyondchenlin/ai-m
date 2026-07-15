@@ -397,4 +397,80 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(next.orphanTempCount).toBe(1);
     expect((await fs.readdir(stagingDir)).filter((name) => name.startsWith(".tmp-generation-"))).toEqual(temps);
   });
+
+  it("idempotently recovers marked and empty cleanup tombstones but rejects unfamiliar tombstone content", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const markedToken = "b".repeat(32);
+    const marked = path.join(stagingDir, `.tombstone-generation-${markedToken}`);
+    await fs.mkdir(marked);
+    await fs.writeFile(path.join(marked, TEMP_MARKER), JSON.stringify({
+      schemaVersion: 1, producer: "ai-m/pixelle-single-backend", token: markedToken, pid: 1, startedAtMs: 1,
+    }), "utf8");
+    const empty = path.join(stagingDir, `.tombstone-generation-${"c".repeat(32)}`);
+    await fs.mkdir(empty);
+    await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    await expect(fs.stat(marked)).rejects.toThrow();
+    await expect(fs.stat(empty)).rejects.toThrow();
+
+    const unsafe = path.join(stagingDir, `.tombstone-generation-${"d".repeat(32)}`);
+    await fs.mkdir(unsafe);
+    await fs.writeFile(path.join(unsafe, "unknown"), "keep", "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir })).rejects.toThrow(/tombstone.*unfamiliar|unsafe tombstone/i);
+    expect(await fs.readFile(path.join(unsafe, "unknown"), "utf8")).toBe("keep");
+  });
+
+  it("validates current.json and every selected generation package before publishing again", async () => {
+    let tree = await makeTree();
+    let prepared = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const currentPath = path.join(tree.stagingDir, "current.json");
+    const current = JSON.parse(await fs.readFile(currentPath, "utf8"));
+    await fs.writeFile(currentPath, JSON.stringify({ ...current, generationDigest: "0".repeat(64) }), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir })).rejects.toThrow(/current.*generation digest|current.*integrity/i);
+
+    tree = await makeTree();
+    prepared = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    await fs.writeFile(path.join(tree.stagingDir, "generations", prepared.generationDigest, "tts-index2", "workflow.api.json"), "{}\n", "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir })).rejects.toThrow(/current.*integrity|package digest/i);
+  });
+
+  it("fsyncs payload, generation directory, current file and staging directory in publication order", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const events: string[] = [];
+    await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir, afterDurabilityEvent: async (event) => { events.push(event); } });
+    const payload = events.indexOf("generation-payload");
+    const generations = events.indexOf("generations-directory");
+    const currentFile = events.indexOf("current-file");
+    const staging = events.indexOf("staging-directory");
+    expect(payload).toBeGreaterThanOrEqual(0);
+    expect(generations).toBeGreaterThan(payload);
+    expect(currentFile).toBeGreaterThan(generations);
+    expect(staging).toBeGreaterThan(currentFile);
+  });
+
+  it("enforces generation, orphan, byte and free-space publication limits", async () => {
+    let tree = await makeTree();
+    const first = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxGenerations: 1 });
+    const changed = indexWorkflow();
+    (changed["3"] as { inputs: { value: string } }).inputs.value = "new generation";
+    await fs.writeFile(path.join(tree.sourceDir, "tts_index2.json"), JSON.stringify(changed), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxGenerations: 1 })).rejects.toThrow(/generation.*limit|quota/i);
+    expect(await fs.stat(path.join(tree.stagingDir, "generations", first.generationDigest))).toBeTruthy();
+
+    tree = await makeTree();
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxStagingBytes: 1 })).rejects.toThrow(/byte.*limit|quota/i);
+
+    tree = await makeTree();
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, minimumFreeBytes: 100, getAvailableBytes: async () => 99,
+    })).rejects.toThrow(/free space|low-water/i);
+
+    tree = await makeTree();
+    await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const token = "e".repeat(32);
+    const orphan = path.join(tree.stagingDir, `.tmp-generation-${token}`);
+    await fs.mkdir(orphan);
+    await fs.writeFile(path.join(orphan, TEMP_MARKER), JSON.stringify({ schemaVersion: 1, producer: "ai-m/pixelle-single-backend", token }), "utf8");
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir, maxOrphanTemps: 0 })).rejects.toThrow(/orphan.*limit|quota/i);
+  });
 });
