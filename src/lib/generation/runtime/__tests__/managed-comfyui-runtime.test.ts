@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
   ManagedComfyUIRuntime,
+  ManagedComfyUIEndpointRegistry,
   ManagedProcessCleanupError,
   createPowerShellCommandRunner,
   parseManagedComfyUIRuntimeConfig,
@@ -16,6 +18,12 @@ import {
 } from "../managed-comfyui-runtime";
 
 const temporaryPaths: string[] = [];
+const powershellTest = process.platform === "win32" && spawnSync("where.exe", ["powershell.exe"], { windowsHide: true }).status === 0 ? test : test.skip;
+
+function readyProbeResponse(path: string, status = 200): Response {
+  const payload = path === "/system_stats" ? { system: { os: "test" }, devices: [] } : { TestNode: {} };
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
+}
 
 afterEach(async () => {
   await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -113,9 +121,11 @@ function runtimeConfig(fixture: { root: string; dataRoot: string; pythonExe: str
 }
 
 class FakeChildProcess extends EventEmitter {
-  readonly pid = 4242;
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  readonly pid: number | undefined;
+
+  constructor(pid: number | null = 4242) { super(); this.pid = pid ?? undefined; }
 }
 
 describe("ManagedComfyUIRuntime", () => {
@@ -135,8 +145,8 @@ describe("ManagedComfyUIRuntime", () => {
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), {
       commandRunner,
       probeFactory: () => ({
-        async get(path) { events.push(path); return new Response("{}", { status: 200 }); },
-        close() { events.push("close"); },
+        async get(path) { events.push(path); return readyProbeResponse(path); },
+        async close() { await Promise.resolve(); events.push("close"); },
       }),
       readinessPollMs: 1,
     });
@@ -150,7 +160,7 @@ describe("ManagedComfyUIRuntime", () => {
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), {
       commandRunner: async () => { await blocked; return { exitCode: 0, stdout: "", stderr: "", truncated: false }; },
-      probeFactory: () => ({ get: async () => new Response("{}"), close() {} }),
+      probeFactory: () => ({ get: async (path: "/system_stats" | "/object_info") => readyProbeResponse(path), close() {} }),
     });
     const first = runtime.restartAfterJob();
     await expect(runtime.restartAfterJob()).rejects.toThrow(/already in progress/);
@@ -164,7 +174,7 @@ describe("ManagedComfyUIRuntime", () => {
     const blocked = new Promise<void>((resolve) => { release = resolve; });
     const dependencies = {
       commandRunner: async () => { await blocked; return { exitCode: 0, stdout: "", stderr: "", truncated: false }; },
-      probeFactory: () => ({ get: async () => new Response("{}"), close() {} }),
+      probeFactory: () => ({ get: async (path: "/system_stats" | "/object_info") => readyProbeResponse(path), close() {} }),
     };
     const firstRuntime = new ManagedComfyUIRuntime(runtimeConfig(fixture), dependencies);
     const secondRuntime = new ManagedComfyUIRuntime(runtimeConfig(fixture), dependencies);
@@ -177,7 +187,7 @@ describe("ManagedComfyUIRuntime", () => {
   test("stops immediately on non-zero command exit without leaking captured output", async () => {
     const fixture = await makePixelleFixture();
     const runner = vi.fn(async () => ({ exitCode: 17, stdout: "secret".repeat(1000), stderr: "token".repeat(1000), truncated: true }));
-    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), { commandRunner: runner, probeFactory: () => ({ get: async () => new Response("{}"), close() {} }) });
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), { commandRunner: runner, probeFactory: () => ({ get: async (path) => readyProbeResponse(path), close() {} }) });
     await expect(runtime.restartAfterJob()).rejects.toThrow(/stop.*17/i);
     await expect(runtime.restartAfterJob()).rejects.not.toThrow(/secret|token/);
     expect(runner).toHaveBeenCalledTimes(2);
@@ -190,7 +200,7 @@ describe("ManagedComfyUIRuntime", () => {
     const server = createServer((request, response) => {
       response.setHeader("content-type", "application/json");
       if (++attempts < 3) { response.statusCode = 503; response.end("{}"); return; }
-      response.end("{}");
+      response.end(request.url === "/system_stats" ? JSON.stringify({ system: { os: "test" }, devices: [] }) : JSON.stringify({ TestNode: {} }));
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
@@ -215,6 +225,57 @@ describe("ManagedComfyUIRuntime", () => {
     });
     await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
     expect(closes).toBeGreaterThan(0);
+  });
+
+  test.each([
+    ["empty", ""],
+    ["html", "<html>ok</html>"],
+    ["schema-free JSON", "{}"],
+  ])("rejects %s HTTP 200 system probes", async (_label, body) => {
+    const fixture = await makePixelleFixture();
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
+      commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+      probeFactory: () => ({ get: async (path) => path === "/system_stats" ? new Response(body, { status: 200 }) : readyProbeResponse(path), close() {} }),
+      readinessPollMs: 1,
+    });
+    await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
+  });
+
+  test("cancels an oversized failed response body and awaits async transport close", async () => {
+    const fixture = await makePixelleFixture();
+    let cancels = 0;
+    let closeFinished = false;
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
+      commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+      probeFactory: () => ({
+        get: async () => new Response(new ReadableStream({
+          pull(controller) { controller.enqueue(new Uint8Array(70 * 1024)); },
+          cancel() { cancels++; },
+        }), { status: 503 }),
+        async close() { await new Promise((resolve) => setTimeout(resolve, 5)); closeFinished = true; },
+      }),
+      readinessPollMs: 1,
+    });
+    await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
+    expect(cancels).toBeGreaterThan(0);
+    expect(closeFinished).toBe(true);
+  });
+
+  test("attempts to cancel a response body when bounded reading fails", async () => {
+    const fixture = await makePixelleFixture();
+    const cancel = vi.fn(async () => {});
+    const failedResponse = {
+      ok: true,
+      status: 200,
+      body: { getReader: () => ({ read: async () => { throw new Error("read failed"); }, cancel }) },
+    } as unknown as Response;
+    const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { readyTimeoutMs: 20 }), {
+      commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
+      probeFactory: () => ({ get: async () => failedResponse, close() {} }),
+      readinessPollMs: 1,
+    });
+    await expect(runtime.restartAfterJob()).rejects.toThrow(/readiness.*timed out/i);
+    expect(cancel).toHaveBeenCalled();
   });
 
   test("aborts a hanging probe at the readiness deadline", async () => {
@@ -257,7 +318,7 @@ describe("ManagedComfyUIRuntime", () => {
     let attempt = 0;
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), {
       commandRunner: async () => ({ exitCode: 0, stdout: "", stderr: "", truncated: false }),
-      probeFactory: () => ({ get: async () => new Response("{}", { status: ++attempt === 1 ? 503 : 200 }), close() {} }),
+      probeFactory: () => ({ get: async (path) => readyProbeResponse(path, ++attempt === 1 ? 503 : 200), close() {} }),
       readinessPollMs: 1,
     });
     await runtime.restartAfterJob(controller.signal);
@@ -284,14 +345,14 @@ describe("ManagedComfyUIRuntime", () => {
     expect(remove.mock.calls.filter(([type]) => type === "abort").length).toBe(add.mock.calls.filter(([type]) => type === "abort").length);
   });
 
-  test("executes the exact fixed PowerShell scripts with canonical arguments and cwd", async () => {
+  powershellTest("executes the exact fixed PowerShell scripts with canonical arguments and cwd", async () => {
     const fixture = await makePixelleFixture();
     const marker = join(fixture.root, "calls.txt");
     const scriptBody = (action: string) => `param([string]$DataRoot,[string]$PythonExe,[string]$HostAddress,[int]$Port,[int]$ReadyTimeoutSeconds,[switch]$Json)\nAdd-Content -LiteralPath '${marker.replace(/'/g, "''")}' -Value ('${action}|' + $HostAddress + '|' + $Port + '|' + $PWD.Path + '|' + $PSCommandPath + '|' + $DataRoot + '|' + $PythonExe)\n`;
     await writeFile(join(fixture.root, "scripts", "comfyui", "stop_backend.ps1"), scriptBody("stop"));
     await writeFile(join(fixture.root, "scripts", "comfyui", "start_backend.ps1"), scriptBody("start"));
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { commandTimeoutMs: 5_000 }), {
-      probeFactory: () => ({ get: async () => new Response("{}"), close() {} }),
+      probeFactory: () => ({ get: async (path) => readyProbeResponse(path), close() {} }),
     });
     await runtime.restartAfterJob();
     const calls = (await readFile(marker, "utf8")).trim().split(/\r?\n/);
@@ -301,19 +362,19 @@ describe("ManagedComfyUIRuntime", () => {
     ]);
   });
 
-  test("propagates a real fixed stop script non-zero exit and never starts", async () => {
+  powershellTest("propagates a real fixed stop script non-zero exit and never starts", async () => {
     const fixture = await makePixelleFixture();
     const marker = join(fixture.root, "started.txt");
     await writeFile(join(fixture.root, "scripts", "comfyui", "stop_backend.ps1"), "exit 17");
     await writeFile(join(fixture.root, "scripts", "comfyui", "start_backend.ps1"), `Set-Content -LiteralPath '${marker.replace(/'/g, "''")}' -Value started`);
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { commandTimeoutMs: 5_000 }), {
-      probeFactory: () => ({ get: async () => new Response("{}"), close() {} }),
+      probeFactory: () => ({ get: async (path) => readyProbeResponse(path), close() {} }),
     });
     await expect(runtime.restartAfterJob()).rejects.toThrow(/stop.*17/i);
     await expect(readFile(marker)).rejects.toThrow();
   });
 
-  test("aborts and cleans up a real PowerShell stop process during shutdown", async () => {
+  powershellTest("aborts and cleans up a real PowerShell stop process during shutdown", async () => {
     const fixture = await makePixelleFixture();
     const stopping = join(fixture.root, "stopping.txt");
     const started = join(fixture.root, "started.txt");
@@ -322,7 +383,7 @@ describe("ManagedComfyUIRuntime", () => {
     await writeFile(join(fixture.root, "scripts", "comfyui", "start_backend.ps1"), `${parameters}\nSet-Content -LiteralPath '${started.replace(/'/g, "''")}' -Value started`);
     const controller = new AbortController();
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture, { commandTimeoutMs: 60_000 }), {
-      probeFactory: () => ({ get: async () => new Response("{}"), close() {} }),
+      probeFactory: () => ({ get: async (path) => readyProbeResponse(path), close() {} }),
     });
     const began = Date.now();
     const restart = runtime.restartAfterJob(controller.signal);
@@ -350,13 +411,22 @@ describe("ManagedComfyUIRuntime", () => {
     expect(closes).toBeGreaterThan(0);
   });
 
-  test("permanently blocks the endpoint in-process when child-tree cleanup is unconfirmed", async () => {
+  test("tracks blocked endpoint state and requires token plus external verification to recover", async () => {
     const fixture = await makePixelleFixture();
-    const runner = vi.fn(async () => { throw new ManagedProcessCleanupError("cleanup failed"); });
-    const dependencies = { commandRunner: runner, probeFactory: () => ({ get: async () => new Response("{}"), close() {} }) };
+    const registry = new ManagedComfyUIEndpointRegistry("operator-secret");
+    const runner = vi.fn()
+      .mockRejectedValueOnce(new ManagedProcessCleanupError("cleanup failed"))
+      .mockResolvedValue({ exitCode: 0, stdout: "", stderr: "", truncated: false });
+    const dependencies = { endpointRegistry: registry, commandRunner: runner, probeFactory: () => ({ get: async (path: "/system_stats" | "/object_info") => readyProbeResponse(path), close() {} }) };
     await expect(new ManagedComfyUIRuntime(runtimeConfig(fixture), dependencies).restartAfterJob()).rejects.toThrow(/cleanup failed/);
+    expect(registry.getState("http://127.0.0.1:8000")).toEqual({ state: "blocked", reasonCode: "process-cleanup-unconfirmed" });
     await expect(new ManagedComfyUIRuntime(runtimeConfig(fixture), dependencies).restartAfterJob()).rejects.toThrow(/endpoint.*blocked/i);
     expect(runner).toHaveBeenCalledTimes(1);
+    await expect(registry.acknowledgeRecovery("http://127.0.0.1:8000", { recoveryToken: "wrong", externallyVerified: true })).rejects.toThrow(/token/i);
+    await expect(registry.acknowledgeRecovery("http://127.0.0.1:8000", { recoveryToken: "operator-secret", externallyVerified: false })).rejects.toThrow(/verification/i);
+    await registry.acknowledgeRecovery("http://127.0.0.1:8000", { recoveryToken: "operator-secret", externallyVerified: true });
+    expect(registry.getState("http://127.0.0.1:8000")).toEqual({ state: "idle" });
+    await new ManagedComfyUIRuntime(runtimeConfig(fixture), dependencies).restartAfterJob();
   });
 });
 
@@ -374,6 +444,33 @@ describe("createPowerShellCommandRunner", () => {
     child.stderr.end("tail-error");
     child.emit("close", 0);
     await expect(resultPromise).resolves.toMatchObject({ exitCode: 0, stdout: "tail-out", stderr: "tail-error" });
+  });
+
+  test("uses a separate bounded stdio drain deadline after exit and never terminates an exited PID", async () => {
+    const child = new FakeChildProcess();
+    const terminator = vi.fn(async () => {});
+    const runner = createPowerShellCommandRunner({
+      spawnProcess: () => child,
+      terminateProcessTree: terminator,
+      cleanupTimeoutMs: 20,
+      stdioDrainTimeoutMs: 20,
+    });
+    const result = runner({ executable: "powershell.exe", args: [], cwd: tmpdir(), timeoutMs: 5, maxOutputBytes: 128, windowsHide: true });
+    child.emit("exit", 0);
+    await expect(result).rejects.toThrow(/stdio.*drain.*timed out/i);
+    expect(terminator).not.toHaveBeenCalled();
+  });
+
+  test("preserves spawn ENOENT without cleanup or endpoint-poison semantics when no PID exists", async () => {
+    const child = new FakeChildProcess(null);
+    const terminator = vi.fn(async () => {});
+    const runner = createPowerShellCommandRunner({ spawnProcess: () => child, terminateProcessTree: terminator, cleanupTimeoutMs: 20 });
+    const result = runner({ executable: "powershell.exe", args: [], cwd: tmpdir(), timeoutMs: 100, maxOutputBytes: 128, windowsHide: true });
+    const error = Object.assign(new Error("spawn powershell.exe ENOENT"), { code: "ENOENT" });
+    child.emit("error", error);
+    await expect(result).rejects.toThrow(/failed to launch.*ENOENT/i);
+    await expect(result).rejects.not.toBeInstanceOf(ManagedProcessCleanupError);
+    expect(terminator).not.toHaveBeenCalled();
   });
 
   test("bounds cleanup when process-tree termination hangs", async () => {
@@ -398,7 +495,7 @@ describe("createPowerShellCommandRunner", () => {
     await expect(runner({ executable: "powershell.exe", args: [], cwd: tmpdir(), timeoutMs: 5, maxOutputBytes: 128, windowsHide: true })).rejects.toThrow(/cleanup failed.*taskkill exited 1/i);
   });
 
-  test("bounds stdout and stderr capture", async () => {
+  powershellTest("bounds stdout and stderr capture", async () => {
     const root = await mkdtemp(join(tmpdir(), "ai-m-powershell-"));
     temporaryPaths.push(root);
     const script = join(root, "output.ps1");
@@ -408,7 +505,7 @@ describe("createPowerShellCommandRunner", () => {
     expect(result.truncated).toBe(true);
   });
 
-  test("kills the entire child process tree on timeout", async () => {
+  powershellTest("kills the entire child process tree on timeout", async () => {
     const root = await mkdtemp(join(tmpdir(), "ai-m-powershell-"));
     temporaryPaths.push(root);
     const marker = join(root, "child-survived.txt");

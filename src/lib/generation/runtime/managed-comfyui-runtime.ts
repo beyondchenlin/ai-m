@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 
 export type ManagedRuntimeConfig =
   | { enabled: false }
@@ -46,6 +47,7 @@ export interface PowerShellCommandRunnerOptions {
   spawnProcess?: (executable: string, args: readonly string[], options: { cwd: string; windowsHide: true; detached: boolean }) => ManagedChildProcess;
   terminateProcessTree?: (pid: number) => Promise<void>;
   cleanupTimeoutMs?: number;
+  stdioDrainTimeoutMs?: number;
 }
 
 export class ManagedProcessCleanupError extends Error {
@@ -55,15 +57,65 @@ export class ManagedProcessCleanupError extends Error {
   }
 }
 
+export class ManagedCommandStdioDrainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagedCommandStdioDrainError";
+  }
+}
+
 export interface ManagedProbeTransport {
   get(path: "/system_stats" | "/object_info", options?: { signal?: AbortSignal }): Promise<Response>;
-  close(): void;
+  close(): Promise<void> | void;
+}
+
+export type ManagedComfyUIEndpointState =
+  | { state: "idle" }
+  | { state: "active" }
+  | { state: "blocked"; reasonCode: "process-cleanup-unconfirmed" };
+
+export class ManagedComfyUIEndpointRegistry {
+  private readonly states = new Map<string, ManagedComfyUIEndpointState>();
+
+  constructor(private readonly recoveryToken: string) {
+    if (!recoveryToken) throw new Error("Managed ComfyUI recovery token must not be empty");
+  }
+
+  getState(baseUrl: string): ManagedComfyUIEndpointState {
+    return this.states.get(baseUrl) ?? { state: "idle" };
+  }
+
+  begin(baseUrl: string): void {
+    const current = this.getState(baseUrl);
+    if (current.state === "blocked") throw new Error("Managed ComfyUI endpoint restart is blocked after an unconfirmed process cleanup");
+    if (current.state === "active") throw new Error("Managed ComfyUI endpoint restart is already in progress in this process");
+    this.states.set(baseUrl, { state: "active" });
+  }
+
+  finish(baseUrl: string): void {
+    if (this.getState(baseUrl).state === "active") this.states.delete(baseUrl);
+  }
+
+  block(baseUrl: string): void {
+    this.states.set(baseUrl, { state: "blocked", reasonCode: "process-cleanup-unconfirmed" });
+  }
+
+  async acknowledgeRecovery(
+    baseUrl: string,
+    evidence: { recoveryToken: string; externallyVerified: boolean },
+  ): Promise<void> {
+    if (evidence.recoveryToken !== this.recoveryToken) throw new Error("Managed ComfyUI recovery token is invalid");
+    if (!evidence.externallyVerified) throw new Error("Managed ComfyUI external recovery verification is required");
+    if (this.getState(baseUrl).state !== "blocked") throw new Error("Managed ComfyUI endpoint is not blocked");
+    this.states.delete(baseUrl);
+  }
 }
 
 export interface ManagedRuntimeDependencies {
   commandRunner?: ManagedCommandRunner;
   probeFactory: (baseUrl: "http://127.0.0.1:8000") => ManagedProbeTransport;
   readinessPollMs?: number;
+  endpointRegistry?: ManagedComfyUIEndpointRegistry;
 }
 
 const CANONICAL_BASE_URL = "http://127.0.0.1:8000" as const;
@@ -71,8 +123,8 @@ const MAX_COMMAND_TIMEOUT_MS = 600_000;
 const MAX_READY_TIMEOUT_MS = 900_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 2_000;
-const activeRestartEndpoints = new Set<string>();
-const blockedRestartEndpoints = new Set<string>();
+const DEFAULT_STDIO_DRAIN_TIMEOUT_MS = 1_000;
+const defaultEndpointRegistry = new ManagedComfyUIEndpointRegistry(randomUUID());
 
 function required(env: Record<string, string | undefined>, name: string): string {
   const value = env[name]?.trim();
@@ -203,6 +255,7 @@ function withCleanupDeadline(cleanup: Promise<void>, deadlineMs: number): Promis
 
 export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOptions = {}): ManagedCommandRunner {
   const cleanupTimeoutMs = options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS;
+  const stdioDrainTimeoutMs = options.stdioDrainTimeoutMs ?? DEFAULT_STDIO_DRAIN_TIMEOUT_MS;
   const spawnProcess = options.spawnProcess ?? ((executable, args, spawnOptions) => spawn(executable, [...args], {
     ...spawnOptions,
     stdio: ["ignore", "pipe", "pipe"],
@@ -210,11 +263,18 @@ export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOp
   const treeTerminator = options.terminateProcessTree ?? ((pid) => terminateProcessTree(pid, cleanupTimeoutMs));
   return (request) => new Promise<ManagedCommandResult>((resolveRun, rejectRun) => {
     if (request.signal?.aborted) { rejectRun(request.signal.reason ?? new Error("Managed ComfyUI command aborted")); return; }
-    const child = spawnProcess(request.executable, request.args, {
-      cwd: request.cwd,
-      windowsHide: request.windowsHide,
-      detached: process.platform !== "win32",
-    });
+    let child: ManagedChildProcess;
+    try {
+      child = spawnProcess(request.executable, request.args, {
+        cwd: request.cwd,
+        windowsHide: request.windowsHide,
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "unknown launch error";
+      rejectRun(new Error(`Managed ComfyUI command failed to launch: ${detail}`, { cause: error }));
+      return;
+    }
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const outState = { bytes: 0, truncated: false };
@@ -223,12 +283,15 @@ export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOp
     child.stderr.on("data", (chunk: Buffer) => appendBounded(stderr, chunk, errState, request.maxOutputBytes));
 
     let settled = false;
+    let exited = false;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
     const finishError = async (error: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       request.signal?.removeEventListener("abort", onAbort);
-      if (!child.pid) { rejectRun(new ManagedProcessCleanupError("Managed ComfyUI process-tree cleanup failed: child PID is unavailable", { cause: error })); return; }
+      if (exited || !child.pid) { rejectRun(error); return; }
       try {
         await withCleanupDeadline(treeTerminator(child.pid), cleanupTimeoutMs);
         rejectRun(error);
@@ -241,11 +304,23 @@ export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOp
     request.signal?.addEventListener("abort", onAbort, { once: true });
     child.once("error", (error) => { void finishError(new Error(`Managed ComfyUI command failed to launch: ${error.message}`)); });
     let exitCode: number | null = null;
-    child.once("exit", (code) => { exitCode = code; });
+    child.once("exit", (code) => {
+      if (settled) return;
+      exited = true;
+      exitCode = code;
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", onAbort);
+      drainTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        rejectRun(new ManagedCommandStdioDrainError(`Managed ComfyUI stdio drain timed out after ${stdioDrainTimeoutMs}ms`));
+      }, stdioDrainTimeoutMs);
+    });
     child.once("close", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       request.signal?.removeEventListener("abort", onAbort);
       resolveRun({
         exitCode: code ?? exitCode ?? -1,
@@ -271,6 +346,68 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
   });
 }
 
+async function readResponseJsonObject(response: Response, maximumBytes: number): Promise<Record<string, unknown>> {
+  if (!response.body) throw new Error("ComfyUI readiness probe returned an empty body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maximumBytes) {
+        await reader.cancel("ComfyUI readiness response exceeded its size limit").catch(() => undefined);
+        throw new Error("ComfyUI readiness probe response is too large");
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel("ComfyUI readiness response reading failed").catch(() => undefined);
+    throw error;
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(new TextDecoder().decode(bytes)); }
+  catch { throw new Error("ComfyUI readiness probe returned invalid JSON"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("ComfyUI readiness probe returned an invalid object");
+  return parsed as Record<string, unknown>;
+}
+
+async function discardResponseBody(response: Response): Promise<void> {
+  if (!response.body) return;
+  const reader = response.body.getReader();
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      total += value.byteLength;
+      if (total > 64 * 1024) {
+        await reader.cancel("ComfyUI readiness error response exceeded its size limit").catch(() => undefined);
+        return;
+      }
+    }
+  } catch {
+    await reader.cancel("ComfyUI readiness error response reading failed").catch(() => undefined);
+  }
+}
+
+async function assertReadyProbeResponse(response: Response, path: "/system_stats" | "/object_info"): Promise<void> {
+  if (!response.ok) {
+    await discardResponseBody(response);
+    throw new Error(`ComfyUI ${path} readiness probe failed (${response.status})`);
+  }
+  const payload = await readResponseJsonObject(response, path === "/system_stats" ? 1024 * 1024 : 16 * 1024 * 1024);
+  if (path === "/system_stats") {
+    const system = payload.system;
+    if (!system || typeof system !== "object" || Array.isArray(system) || !Array.isArray(payload.devices))
+      throw new Error("ComfyUI system_stats readiness probe returned an invalid schema");
+  }
+}
+
 /**
  * Process-local controller for the sole canonical ComfyUI endpoint.
  * Construct it once per worker. A shared endpoint guard also rejects accidental
@@ -279,6 +416,7 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
 export class ManagedComfyUIRuntime {
   private readonly commandRunner: ManagedCommandRunner;
   private readonly readinessPollMs: number;
+  private readonly endpointRegistry: ManagedComfyUIEndpointRegistry;
   private restarting = false;
 
   constructor(
@@ -287,24 +425,27 @@ export class ManagedComfyUIRuntime {
   ) {
     this.commandRunner = dependencies.commandRunner ?? createPowerShellCommandRunner();
     this.readinessPollMs = dependencies.readinessPollMs ?? 250;
+    this.endpointRegistry = dependencies.endpointRegistry ?? defaultEndpointRegistry;
+  }
+
+  getEndpointState(): ManagedComfyUIEndpointState {
+    return this.endpointRegistry.getState(this.config.baseUrl);
   }
 
   async restartAfterJob(signal?: AbortSignal): Promise<void> {
     if (this.restarting) throw new Error("Managed ComfyUI restart is already in progress");
-    if (blockedRestartEndpoints.has(this.config.baseUrl)) throw new Error("Managed ComfyUI endpoint restart is blocked after an unconfirmed process cleanup");
-    if (activeRestartEndpoints.has(this.config.baseUrl)) throw new Error("Managed ComfyUI endpoint restart is already in progress in this process");
+    this.endpointRegistry.begin(this.config.baseUrl);
     this.restarting = true;
-    activeRestartEndpoints.add(this.config.baseUrl);
     try {
       await this.runFixedScript("stop_backend.ps1", "stop", signal);
       await this.runFixedScript("start_backend.ps1", "start", signal);
       await this.waitUntilReady(signal);
     } catch (error) {
-      if (error instanceof ManagedProcessCleanupError) blockedRestartEndpoints.add(this.config.baseUrl);
+      if (error instanceof ManagedProcessCleanupError) this.endpointRegistry.block(this.config.baseUrl);
       throw error;
     } finally {
       this.restarting = false;
-      activeRestartEndpoints.delete(this.config.baseUrl);
+      this.endpointRegistry.finish(this.config.baseUrl);
     }
   }
 
@@ -339,15 +480,15 @@ export class ManagedComfyUIRuntime {
       try {
         const system = await probe.get("/system_stats", { signal: probeSignal });
         lastStatus = system.status;
-        if (!system.ok) throw new Error("system probe not ready");
+        await assertReadyProbeResponse(system, "/system_stats");
         const objects = await probe.get("/object_info", { signal: probeSignal });
         lastStatus = objects.status;
-        if (!objects.ok) throw new Error("object probe not ready");
+        await assertReadyProbeResponse(objects, "/object_info");
         return;
       } catch (error) {
         if (signal?.aborted) throw signal.reason ?? error;
       } finally {
-        probe.close();
+        await Promise.resolve(probe.close());
       }
       await abortableDelay(Math.min(this.readinessPollMs, Math.max(1, deadline - Date.now())), signal);
     }
