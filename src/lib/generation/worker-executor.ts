@@ -6,6 +6,8 @@ import {
   generationAttempts,
   generationEvents,
   generationJobs,
+  resourcePools,
+  resourcePoolSlots,
   workflowBackendValidations,
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
@@ -35,7 +37,6 @@ import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/ge
 import {
   attachOwnedAttempt,
   beginOwnedAttemptSubmission,
-  cancelOwnedAttemptBeforeSubmission,
   cancelOwnedJobBeforeAttempt,
   finalizeOwnedExecution,
   finalizeOwnedJob,
@@ -65,6 +66,26 @@ export interface GenerationJobLifecycleHooks {
     resourcePoolId: string;
     slotNo: number;
   }) => Promise<void>;
+  managedEndpoint?: { baseUrl: "http://127.0.0.1:8000" };
+}
+
+function parsePersistedBackendFeatures(value: unknown, fingerprint: string | null): BackendFeatureSnapshot | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !fingerprint) return null;
+  const candidate = value as Partial<BackendFeatureSnapshot>;
+  const cancellation = candidate.cancellation;
+  const output = candidate.output;
+  if (candidate.environmentFingerprint !== fingerprint
+    || !["client-assigned", "server-assigned", "not-applicable"].includes(String(candidate.externalIdStrategy))
+    || !cancellation || typeof cancellation.supportsPerTaskCancel !== "boolean"
+    || typeof cancellation.hasGlobalInterrupt !== "boolean" || typeof cancellation.safeForShared !== "boolean"
+    || !output || !["view", "api", "both"].includes(String(output.readMethod))
+    || typeof output.supportsStreaming !== "boolean" || !Number.isFinite(output.maxOutputSizeBytesEstimate)
+    || !Array.isArray(candidate.nodeCategories) || !candidate.nodeCategories.every((item) => typeof item === "string")
+    || !Array.isArray(candidate.devicesSummary) || !candidate.devicesSummary.every((item) => typeof item === "string")
+    || (candidate.comfyVersion !== undefined && typeof candidate.comfyVersion !== "string")
+    || !Number.isSafeInteger(candidate.probedAtMs) || !Number.isSafeInteger(candidate.validUntilMs)
+    || candidate.validUntilMs! < candidate.probedAtMs!) return null;
+  return structuredClone(candidate) as BackendFeatureSnapshot;
 }
 
 function mimeForOutput(
@@ -148,14 +169,41 @@ export async function executeGenerationJob(
     const config = snapshot.configJson && typeof snapshot.configJson === "object" ? snapshot.configJson as Record<string, unknown> : {};
     if (!backendId || !workflowDigest) return failJob(job.id, "", workerId, jobFencingToken, "Backend and active workflow package are required", "config_error");
 
-    const [backend] = await db.select().from(executionBackends).where(eq(executionBackends.id, backendId));
+    const capturedConfiguration = db.transaction((tx) => {
+      const backendRow = tx.select().from(executionBackends).where(eq(executionBackends.id, backendId)).get();
+      const validationRow = tx.select().from(workflowBackendValidations).where(and(
+        eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
+        eq(workflowBackendValidations.executionBackendId, backendId),
+      )).get();
+      const poolRow = backendRow
+        ? tx.select().from(resourcePools).where(eq(resourcePools.id, backendRow.resourcePoolId)).get()
+        : undefined;
+      const physicalSlots = backendRow
+        ? tx.select().from(resourcePoolSlots).where(eq(resourcePoolSlots.resourcePoolId, backendRow.resourcePoolId)).all()
+        : [];
+      return {
+        backend: backendRow ? structuredClone(backendRow) : undefined,
+        validation: validationRow ? structuredClone(validationRow) : undefined,
+        pool: poolRow ? structuredClone(poolRow) : undefined,
+        physicalSlotCount: physicalSlots.length,
+      };
+    });
+    const backend = capturedConfiguration.backend ? Object.freeze(capturedConfiguration.backend) : undefined;
     if (!backend || !backend.enabled) return failJob(job.id, "", workerId, jobFencingToken, "Execution backend is missing or disabled", "config_error");
+    if (lifecycle.managedEndpoint && (backend.adapterKind !== "comfyui"
+      || backend.baseUrl !== lifecycle.managedEndpoint.baseUrl
+      || capturedConfiguration.pool?.id !== backend.resourcePoolId
+      || capturedConfiguration.pool.capacity !== 1
+      || capturedConfiguration.physicalSlotCount !== 1)) {
+      return failJob(job.id, "", workerId, jobFencingToken, "Managed backend configuration does not match the worker endpoint", "config_error");
+    }
+    const persistedFeatures = parsePersistedBackendFeatures(backend.featureSnapshotJson, backend.environmentFingerprint);
+    if (!persistedFeatures) {
+      return failJob(job.id, "", workerId, jobFencingToken, "Execution backend feature snapshot is missing or invalid", "config_error");
+    }
     const workflowPackage = await loadActiveWorkflowPackage(workflowDigest);
     if (workflowPackage.manifest.capability !== job.capability) return failJob(job.id, "", workerId, jobFencingToken, "Workflow capability does not match job", "config_error");
-    const [backendValidation] = await db.select().from(workflowBackendValidations).where(and(
-      eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
-      eq(workflowBackendValidations.executionBackendId, backendId),
-    ));
+    const backendValidation = capturedConfiguration.validation;
     if (!backendValidation
       || backendValidation.environmentFingerprint !== backend.environmentFingerprint
       || backendValidation.environmentLockDigest !== workflowPackage.revision.environmentLockDigest) {
@@ -164,37 +212,6 @@ export async function executeGenerationJob(
         "Workflow package is not validated for the exact backend environment",
         "workflow_backend_validation_missing", true,
       );
-    }
-
-    const authHeaders = await resolveBackendAuthHeaders(backend.authType, backend.authConfigJson);
-    transport = await createComfyUITransport(
-      backend.baseUrl, backend.topology, authHeaders,
-      Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
-        ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
-        : [],
-      {
-        policyRevision: sha256(backend.networkPolicyJson),
-        ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
-        ...(abortSignal ? { lifecycleSignal: abortSignal } : {}),
-      },
-    );
-    const activeTransport = transport;
-    const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
-    if (backend.environmentFingerprint && backend.environmentFingerprint !== features.environmentFingerprint) {
-      return failJob(job.id, "", workerId, jobFencingToken, "Backend environment fingerprint drifted after workflow activation", "environment_drift", true);
-    }
-    const modelFolders = new Map<string, string[]>();
-    for (const model of workflowPackage.manifest.requirements.models) {
-      if (!modelFolders.has(model.folder)) {
-        modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
-      }
-      if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
-        return failJob(
-          job.id, "", workerId, jobFencingToken,
-          `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
-          "environment_model_drift", true,
-        );
-      }
     }
 
     const attemptNo = await getNextAttemptNo(job.id);
@@ -213,10 +230,10 @@ export async function executeGenerationJob(
         jobClaimFencingToken: jobFencingToken,
         phase: "PREPARING",
         backendId: backend.id,
-        backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
-        environmentFingerprint: features.environmentFingerprint,
+        backendFeatureSnapshotJson: persistedFeatures as unknown as Record<string, unknown>,
+        environmentFingerprint: persistedFeatures.environmentFingerprint,
         submissionCorrelationId: correlationId,
-        externalIdStrategy: features.externalIdStrategy,
+        externalIdStrategy: persistedFeatures.externalIdStrategy,
         systemOutputPrefix: outputPrefix,
         resourcePoolId: backend.resourcePoolId,
         resourceSlotNo: 0,
@@ -234,12 +251,6 @@ export async function executeGenerationJob(
 
     resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
     if (!resourceSlot) {
-      const cancelled = cancelOwnedAttemptBeforeSubmission({ jobId: job.id, attemptId, workerId, jobFencingToken });
-      if (cancelled.status === "applied") return preSubmissionCancelledResult();
-      if (cancelled.status === "invalid-resource-cardinality") return invalidResourceCardinalityResult();
-      if (cancelled.status !== "invalid-transition") {
-        requireApplied(cancelled, "job_claim_lost_cancelling_before_resource_acquisition");
-      }
       return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
     }
     resourcePoolIdForSlot = backend.resourcePoolId;
@@ -276,6 +287,37 @@ export async function executeGenerationJob(
         resourceRenewalInFlight = false;
       }
     }, 30_000);
+
+    const authHeaders = await resolveBackendAuthHeaders(backend.authType, backend.authConfigJson);
+    transport = await createComfyUITransport(
+      backend.baseUrl, backend.topology, authHeaders,
+      Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
+        ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
+        : [],
+      {
+        policyRevision: sha256(backend.networkPolicyJson),
+        ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
+        ...(abortSignal ? { lifecycleSignal: abortSignal } : {}),
+      },
+    );
+    const activeTransport = transport;
+    const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
+    if (backend.environmentFingerprint !== features.environmentFingerprint) {
+      return failJob(job.id, attemptId, workerId, jobFencingToken, "Backend environment fingerprint drifted after workflow activation", "environment_drift", true);
+    }
+    const modelFolders = new Map<string, string[]>();
+    for (const model of workflowPackage.manifest.requirements.models) {
+      if (!modelFolders.has(model.folder)) {
+        modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
+      }
+      if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
+        return failJob(
+          job.id, attemptId, workerId, jobFencingToken,
+          `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
+          "environment_model_drift", true,
+        );
+      }
+    }
 
     const defaults = config.defaultParameters && typeof config.defaultParameters === "object"
       ? config.defaultParameters as Record<string, unknown>

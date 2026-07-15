@@ -257,6 +257,7 @@ async function executeClaimedJob(job: ClaimedJob, boundarySignal: AbortSignal) {
         fencingToken,
         currentAbortController!.signal,
         managedRuntime ? {
+          managedEndpoint: { baseUrl: managedRuntimeConfig.enabled ? managedRuntimeConfig.baseUrl : "http://127.0.0.1:8000" },
           beforeTerminalResourceRelease: async () => {
             try { connectionManagerRegistry.closeAll(); }
             catch (error) { throw new ManagedRuntimeLifecycleError("managed_connection_close_failed", error); }

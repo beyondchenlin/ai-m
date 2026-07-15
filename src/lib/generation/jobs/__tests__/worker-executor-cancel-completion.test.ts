@@ -141,6 +141,7 @@ describe("worker completion after cancellation intent", () => {
       resourcePoolId: poolId,
       capabilitiesJson: {},
       environmentFingerprint: "env:test",
+      featureSnapshotJson: defaultBackendFeatures(),
       enabled: 1,
       createdAtMs: now,
       updatedAtMs: now,
@@ -340,7 +341,10 @@ describe("worker completion after cancellation intent", () => {
       return { id: artifactId };
     });
 
-    const execute = async (lifecycle?: { beforeTerminalResourceRelease?: () => Promise<void> }) => {
+    const execute = async (lifecycle?: {
+      beforeTerminalResourceRelease?: () => Promise<void>;
+      managedEndpoint?: { baseUrl: "http://127.0.0.1:8000" };
+    }) => {
       if (scenario === "known-completed") return executeGenerationJob(job, workerId, fencingToken, undefined, lifecycle);
       vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
       try {
@@ -422,6 +426,60 @@ describe("worker completion after cancellation intent", () => {
     readiness.resolve();
     await execution;
     expect(events).toEqual(["restart-start", "readiness-complete", "release-slot"]);
+  });
+
+  it("does not create a transport or probe when the shared slot is unavailable", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    mocks.acquireResourceSlot.mockResolvedValue(null);
+
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({ success: false, errorClass: "resource_exhausted", claimDisposition: "release-terminal" });
+    expect(mocks.createComfyUITransport).not.toHaveBeenCalled();
+    expect(mocks.probeBackendFeatures).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing persisted feature snapshot before slot acquisition or network access", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    await db.update(executionBackends).set({ featureSnapshotJson: null })
+      .where(eq(executionBackends.id, (await db.select().from(executionBackends))[0].id));
+
+    const result = await arranged.execute();
+
+    expect(result).toMatchObject({ success: false, errorClass: "config_error" });
+    expect(mocks.acquireResourceSlot).not.toHaveBeenCalled();
+    expect(mocks.createComfyUITransport).not.toHaveBeenCalled();
+  });
+
+  it("rejects a managed backend endpoint mismatch before slot acquisition or network access", async () => {
+    const arranged = await arrangeExecution("known-completed");
+
+    const result = await arranged.execute({
+      managedEndpoint: { baseUrl: "http://127.0.0.1:8000" },
+    });
+
+    expect(result).toMatchObject({ success: false, errorClass: "config_error" });
+    expect(mocks.acquireResourceSlot).not.toHaveBeenCalled();
+    expect(mocks.createComfyUITransport).not.toHaveBeenCalled();
+  });
+
+  it("uses the captured backend URL when the database row mutates after slot acquisition", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    const acquire = mocks.acquireResourceSlot.getMockImplementation()!;
+    mocks.acquireResourceSlot.mockImplementation(async (...args: unknown[]) => {
+      const slot = await acquire(...args);
+      const [backend] = await db.select().from(executionBackends);
+      await db.update(executionBackends).set({ baseUrl: "http://127.0.0.1:8001", adapterKind: "mutated" })
+        .where(eq(executionBackends.id, backend.id));
+      return slot;
+    });
+
+    await arranged.execute();
+
+    expect(mocks.createComfyUITransport).toHaveBeenCalledWith(
+      "http://127.0.0.1:8188", expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+    );
+    expect(JSON.stringify(mocks.createComfyUITransport.mock.calls)).not.toContain("8001");
   });
 
   it("retains the terminal claim and slot when the lifecycle hook fails", async () => {
