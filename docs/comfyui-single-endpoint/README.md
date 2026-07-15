@@ -39,10 +39,15 @@ Task 4 必须在目标 `8000` ComfyUI 的同一进程生命周期内完成 live 
 
 ## Task 4 verified evidence 后的命令参考
 
-下面命令现在不能执行，仅保留为 Task 4 验证通过后的人工参考。`WORKFLOW_PACKAGE_DIR` 应指向 `current.json` 选中的不可变代际内的包。
+下面命令现在不能执行，仅保留为 Task 4 验证通过后的人工参考。importer 不接受任意包目录：必须提供代际根目录、包名以及 Task 4 evidence 绑定的两个预期摘要；导入前会从实际字节重新计算并核对。
 
 ```powershell
-$env:WORKFLOW_PACKAGE_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single\generations\<generationDigest>\tts-index2'
+$env:WORKFLOW_GENERATION_ROOT = 'D:\demo1\ai-m-workflow-staging\pixelle-single\generations\<generationDigest>'
+$env:WORKFLOW_PACKAGE_NAME = 'tts-index2'
+$env:EXPECTED_GENERATION_DIGEST = '<generationDigest>'
+$env:EXPECTED_PACKAGE_DIGEST = '<packageDigest>'
+$env:TASK4_VERIFIED_EVIDENCE_FILE = 'D:\demo1\ai-m-workflow-staging\evidence\tts-index2.json'
+$env:REQUIRE_TASK4_VERIFIED_EVIDENCE = 'true'
 $env:WORKFLOW_IMPORTER_ID = 'local-importer'
 $env:PROFILE_KEY = 'pixelle.tts.index2.local'
 $env:PROFILE_DISPLAY_NAME = 'Pixelle IndexTTS2 Local'

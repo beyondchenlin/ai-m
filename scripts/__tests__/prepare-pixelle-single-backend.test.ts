@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
 import { parseCompiledBindings } from "../../src/lib/generation/workflows/compiled";
 import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
+import { verifyGenerationPackageForImport } from "../verify-generation-package";
 
 const temporaryDirectories: string[] = [];
 const ROOT_MARKER = ".ai-m-pixelle-staging.json";
@@ -90,6 +91,10 @@ describe("immutable Pixelle workflow preparation", () => {
   it("documents offline-only preparation and a safe post-Task4 import reference", async () => {
     const readme = await fs.readFile(path.resolve("docs/comfyui-single-endpoint/README.md"), "utf8");
     expect(readme).not.toContain("COMFYUI_INVENTORY_FILE");
+    expect(readme).not.toContain("WORKFLOW_PACKAGE_DIR");
+    expect(readme).toContain("EXPECTED_GENERATION_DIGEST");
+    expect(readme).toContain("EXPECTED_PACKAGE_DIGEST");
+    expect(readme).toContain("REQUIRE_TASK4_VERIFIED_EVIDENCE");
     expect(readme).toContain("prepared-environment-unverified");
     expect(readme).toMatch(/Task 4[\s\S]*verified evidence[\s\S]*import\/promote/i);
     expect(readme).toContain("Remove-Item Env:PROFILE_CONFIG_FILE -ErrorAction SilentlyContinue");
@@ -134,6 +139,38 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(() => bindWorkflow(workflow, compiled, { ...parameters, duration: 0.75 }, "out")).toThrow(/step/i);
   });
 
+  it("preserves each package binding, model and output-selector contract", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const result = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const generationRoot = path.join(stagingDir, "generations", result.generationDigest);
+    const expected: Record<string, { bindings: string[]; models: string[]; outputClass: string; outputField: string }> = {
+      "tts-index2": { bindings: ["text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
+      "tts-index2-8g": { bindings: ["text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
+      "tts-omnivoice-longform-bf16": { bindings: ["referenceText", "speed", "text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
+      "tts-omnivoice-clone-duration-bf16": { bindings: ["duration", "referenceText", "speed", "text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
+      "image-z-image-turbo": {
+        bindings: ["height", "prompt", "seed", "width"],
+        models: ["diffusion_models/z_image_turbo_bf16.safetensors", "text_encoders/qwen_3_4b.safetensors", "vae/ae.safetensors"],
+        outputClass: "SaveImage", outputField: "images",
+      },
+      "video-wan2.1-fusionx": {
+        bindings: ["height", "prompt", "seed", "width"],
+        models: ["diffusion_models/wan-fusionx/WanT2V_MasterModel.safetensors", "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors"],
+        outputClass: "VHS_VideoCombine", outputField: "gifs",
+      },
+    };
+    for (const [packageName, contract] of Object.entries(expected)) {
+      const packageDir = path.join(generationRoot, packageName);
+      const manifest = JSON.parse(await fs.readFile(path.join(packageDir, "manifest.json"), "utf8"));
+      const compiled = JSON.parse(await fs.readFile(path.join(packageDir, "compiled-bindings.json"), "utf8"));
+      expect(manifest.bindings.map((item: { key: string }) => item.key).sort()).toEqual(contract.bindings);
+      expect(manifest.requirements.models.map((item: { folder: string; filename: string }) => `${item.folder}/${item.filename}`).sort()).toEqual(contract.models);
+      expect(manifest.outputs[0]).toMatchObject({ field: contract.outputField, selector: { classType: contract.outputClass } });
+      expect(compiled.outputs[0]).toMatchObject({ field: contract.outputField, classType: contract.outputClass });
+      expect(compiled.bindings.map((item: { key: string }) => item.key).sort()).toEqual(contract.bindings);
+    }
+  });
+
   it("reuses identical generation bytes and digest without deleting immutable content", async () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     const first = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
@@ -142,6 +179,34 @@ describe("immutable Pixelle workflow preparation", () => {
     expect(second.generationDigest).toBe(first.generationDigest);
     expect(await fs.readFile(path.join(stagingDir, "generations", first.generationDigest, "tts-index2", "workflow.api.json"))).toEqual(bytes);
     expect(await fs.readdir(path.join(stagingDir, "generations"))).toEqual([first.generationDigest]);
+  });
+
+  it("recomputes generation/package digests before import and binds optional Task 4 evidence", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const prepared = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const selected = prepared.packages.find((item) => item.packageName === "tts-index2")!;
+    const generationRoot = path.join(stagingDir, "generations", prepared.generationDigest);
+    const base = {
+      generationRoot,
+      packageName: selected.packageName,
+      expectedGenerationDigest: prepared.generationDigest,
+      expectedPackageDigest: selected.packageDigest,
+    };
+    await expect(verifyGenerationPackageForImport(base)).resolves.toMatchObject({
+      generationDigest: prepared.generationDigest, packageDigest: selected.packageDigest, packageName: "tts-index2",
+    });
+    await expect(verifyGenerationPackageForImport({ ...base, expectedGenerationDigest: "0".repeat(64) })).rejects.toThrow(/generation digest/i);
+    await expect(verifyGenerationPackageForImport({ ...base, expectedPackageDigest: "0".repeat(64) })).rejects.toThrow(/package digest/i);
+    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true })).rejects.toThrow(/verified evidence/i);
+    const evidence = {
+      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify", generationDigest: prepared.generationDigest,
+      packageName: selected.packageName, packageDigest: selected.packageDigest,
+    };
+    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true, verifiedEvidence: evidence })).resolves.toMatchObject({ packageName: "tts-index2" });
+    await expect(verifyGenerationPackageForImport({ ...base, requireVerifiedEvidence: true, verifiedEvidence: { ...evidence, packageDigest: "f".repeat(64) } })).rejects.toThrow(/verified evidence/i);
+
+    await fs.writeFile(path.join(generationRoot, selected.packageName, "workflow.api.json"), "{}\n", "utf8");
+    await expect(verifyGenerationPackageForImport(base)).rejects.toThrow(/package digest|bytes/i);
   });
 
   it("keeps old generations after source content changes", async () => {

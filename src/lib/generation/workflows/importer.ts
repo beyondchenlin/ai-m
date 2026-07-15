@@ -48,6 +48,7 @@ export async function importWorkflowPackage(
         importedAtMs: now,
         workflowNodeCount: Object.keys(workflow).length,
         contractSha256: sha256(canonicalize(manifest)),
+        ...(input.generationProvenance ? { generationProvenance: input.generationProvenance } : {}),
       },
       updatedAtMs: now,
     }).onConflictDoNothing().run();

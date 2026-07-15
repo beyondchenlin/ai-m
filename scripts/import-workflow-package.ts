@@ -2,11 +2,13 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { generationProfileRevisions, generationProfileStates } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
-import { canonicalize, importWorkflowPackage, parseWorkflowManifest, parseWorkflowPackageLock, sha256 } from "@/lib/generation/workflows";
+import { canonicalize, compileWorkflowBindings, importWorkflowPackage, normalizeComfyWorkflow, parseCompiledBindings, parseWorkflowManifest, parseWorkflowPackageLock, sha256 } from "@/lib/generation/workflows";
+import { verifyGenerationPackageForImport } from "./verify-generation-package";
 
 async function readJson(file: string): Promise<unknown> {
   const text = await fs.readFile(file, "utf8");
@@ -17,36 +19,56 @@ function sha256Bytes(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function resolveLockedFile(packageDir: string, relativeName: string): string {
-  const resolved = path.resolve(packageDir, relativeName);
-  if (resolved !== packageDir && !resolved.startsWith(`${packageDir}${path.sep}`)) {
-    throw new Error(`Locked file escapes package directory: ${relativeName}`);
-  }
-  return resolved;
+function parseJsonBytes(bytes: Buffer, name: string): unknown {
+  try { return JSON.parse(bytes.toString("utf8")) as unknown; } catch { throw new Error(`${name} is invalid JSON`); }
 }
 
-async function main(): Promise<void> {
-  const packageDir = path.resolve(process.env.WORKFLOW_PACKAGE_DIR ?? process.argv[2] ?? "");
-  if (!process.env.WORKFLOW_PACKAGE_DIR && !process.argv[2]) throw new Error("WORKFLOW_PACKAGE_DIR or a package directory argument is required");
-  const manifestRaw = await readJson(path.join(packageDir, "manifest.json"));
+export async function main(): Promise<void> {
+  const generationRoot = process.env.WORKFLOW_GENERATION_ROOT?.trim();
+  const packageName = process.env.WORKFLOW_PACKAGE_NAME?.trim();
+  const expectedGenerationDigest = process.env.EXPECTED_GENERATION_DIGEST?.trim();
+  const expectedPackageDigest = process.env.EXPECTED_PACKAGE_DIGEST?.trim();
+  if (!generationRoot || !packageName || !expectedGenerationDigest || !expectedPackageDigest) {
+    throw new Error("WORKFLOW_GENERATION_ROOT, WORKFLOW_PACKAGE_NAME, EXPECTED_GENERATION_DIGEST and EXPECTED_PACKAGE_DIGEST are required");
+  }
+  const evidenceFile = process.env.TASK4_VERIFIED_EVIDENCE_FILE?.trim();
+  const verifiedEvidence = evidenceFile ? await readJson(path.resolve(evidenceFile)) : undefined;
+  const verified = await verifyGenerationPackageForImport({
+    generationRoot, packageName, expectedGenerationDigest, expectedPackageDigest, verifiedEvidence,
+    requireVerifiedEvidence: process.env.REQUIRE_TASK4_VERIFIED_EVIDENCE === "true",
+  });
+  const manifestRaw = parseJsonBytes(verified.files["manifest.json"], "manifest.json");
   const manifest = parseWorkflowManifest(manifestRaw);
-  const packageLockRaw = await readJson(path.join(packageDir, "package.lock.json"));
+  const packageLockRaw = parseJsonBytes(verified.files["package.lock.json"], "package.lock.json");
   const packageLock = parseWorkflowPackageLock(packageLockRaw, manifest);
   const verifiedFileDigests: Record<string, string> = {};
   for (const relativeName of Object.keys(packageLock.files)) {
-    const bytes = await fs.readFile(resolveLockedFile(packageDir, relativeName));
+    const bytes = verified.files[relativeName as keyof typeof verified.files];
+    if (!bytes) throw new Error(`Package lock names an unavailable file: ${relativeName}`);
     verifiedFileDigests[relativeName] = sha256Bytes(bytes);
   }
-  const workflowApi = await readJson(path.join(packageDir, manifest.workflowFile));
+  const workflowApi = parseJsonBytes(verified.files["workflow.api.json"], "workflow.api.json");
+  const compiledRaw = parseCompiledBindings(parseJsonBytes(verified.files["compiled-bindings.json"], "compiled-bindings.json"));
+  const recomputedCompiled = compileWorkflowBindings(normalizeComfyWorkflow(workflowApi), manifest);
+  if (canonicalize(compiledRaw) !== canonicalize(recomputedCompiled)) throw new Error("compiled-bindings.json does not match the workflow and manifest contract");
   const actorId = process.env.WORKFLOW_IMPORTER_ID?.trim() || "local-admin";
   const imported = await importWorkflowPackage({
     workflowApi,
     manifest,
     packageLock,
     verifiedFileDigests,
-    packagePath: packageDir,
+    packagePath: verified.packageDir,
+    generationProvenance: {
+      generationDigest: verified.generationDigest,
+      packageName: verified.packageName,
+      packageDigest: verified.packageDigest,
+      ...(verified.verifiedEvidenceDigest ? { verifiedEvidenceDigest: verified.verifiedEvidenceDigest } : {}),
+    },
   }, actorId);
-  console.log(JSON.stringify({ workflowDigest: imported.digest, state: imported.state }, null, 2));
+  console.log(JSON.stringify({
+    workflowDigest: imported.digest, state: imported.state,
+    generationDigest: verified.generationDigest, packageDigest: verified.packageDigest,
+  }, null, 2));
 
   const profileKey = process.env.PROFILE_KEY?.trim();
   if (!profileKey) return;
@@ -82,4 +104,6 @@ async function main(): Promise<void> {
   console.log(JSON.stringify({ profileRevisionId: id, profileKey, revisionNo, state: "disabled" }, null, 2));
 }
 
-main().catch((error) => { console.error(error instanceof Error ? error.message : error); process.exit(1); });
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => { console.error(error instanceof Error ? error.message : error); process.exit(1); });
+}
