@@ -28,6 +28,7 @@ export interface AuthorBinding {
   default?: unknown;
   minimum?: number;
   maximum?: number;
+  step?: number;
 }
 
 export interface AuthorOutput {

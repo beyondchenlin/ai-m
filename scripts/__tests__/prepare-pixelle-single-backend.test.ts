@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { bindWorkflow } from "../../src/lib/generation/workflows/binder";
+import { parseCompiledBindings } from "../../src/lib/generation/workflows/compiled";
 import { preparePixelleSingleBackendPackages } from "../prepare-pixelle-single-backend";
 
 const temporaryDirectories: string[] = [];
@@ -116,6 +118,22 @@ describe("immutable Pixelle workflow preparation", () => {
     }
   });
 
+  it("binds clone duration to the real 0.5..60 step-0.5 Pixelle contract", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const result = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
+    const packageDir = path.join(stagingDir, "generations", result.generationDigest, "tts-omnivoice-clone-duration-bf16");
+    const workflow = JSON.parse(await fs.readFile(path.join(packageDir, "workflow.api.json"), "utf8"));
+    const compiled = parseCompiledBindings(JSON.parse(await fs.readFile(path.join(packageDir, "compiled-bindings.json"), "utf8")));
+    const duration = compiled.bindings.find((binding) => binding.key === "duration");
+    const parameters = { text: "x", voiceReference: "voice.wav", speed: 0.5 };
+    expect(duration).toMatchObject({ minimum: 0.5, maximum: 60, step: 0.5 });
+    expect(bindWorkflow(workflow, compiled, { ...parameters, duration: 0.5 }, "out")["8"].inputs.value).toBe(0.5);
+    expect(bindWorkflow(workflow, compiled, { ...parameters, duration: 60 }, "out")["8"].inputs.value).toBe(60);
+    expect(() => bindWorkflow(workflow, compiled, { ...parameters, duration: 0.4 }, "out")).toThrow(/minimum/i);
+    expect(() => bindWorkflow(workflow, compiled, { ...parameters, duration: 60.5 }, "out")).toThrow(/maximum|exceeds/i);
+    expect(() => bindWorkflow(workflow, compiled, { ...parameters, duration: 0.75 }, "out")).toThrow(/step/i);
+  });
+
   it("reuses identical generation bytes and digest without deleting immutable content", async () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     const first = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
@@ -143,6 +161,44 @@ describe("immutable Pixelle workflow preparation", () => {
     await fs.writeFile(path.join(stagingDir, "sentinel"), "keep", "utf8");
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir })).rejects.toThrow(/unmanaged|marker/i);
     expect(await fs.readFile(path.join(stagingDir, "sentinel"), "utf8")).toBe("keep");
+  });
+
+  it.each(["EEXIST", "ENOTEMPTY"])("cleans its owned init directory after a %s initialization race", async (code) => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const error = Object.assign(new Error("simulated initialization race"), { code });
+    const result = await preparePixelleSingleBackendPackages({
+      pixelleRoot,
+      stagingDir,
+      renameInitDir: async () => {
+        await fs.mkdir(stagingDir);
+        await fs.writeFile(path.join(stagingDir, ROOT_MARKER), JSON.stringify({
+          schemaVersion: 2, producer: "ai-m/pixelle-single-backend", canonicalStagingPath: stagingDir,
+        }), "utf8");
+        await fs.mkdir(path.join(stagingDir, "generations"));
+        throw error;
+      },
+    });
+    expect(result.state).toBe("prepared-environment-unverified");
+    expect((await fs.readdir(path.dirname(stagingDir))).filter((name) => name.startsWith(`.${path.basename(stagingDir)}.init-`))).toEqual([]);
+  });
+
+  it.each(["marker write", "rename"])("cleans its owned init directory after %s failure", async (failure) => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    const injected = new Error(`injected init ${failure} failure`);
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot,
+      stagingDir,
+      ...(failure === "marker write"
+        ? { writeInitMarker: async () => { throw injected; } }
+        : { renameInitDir: async () => { throw injected; } }),
+    })).rejects.toThrow(/injected init/);
+    expect((await fs.readdir(path.dirname(stagingDir))).filter((name) => name.startsWith(`.${path.basename(stagingDir)}.init-`))).toEqual([]);
+  });
+
+  it("reports an unfamiliar init orphan instead of silently ignoring it", async () => {
+    const { pixelleRoot, stagingDir } = await makeTree();
+    await fs.mkdir(path.join(path.dirname(stagingDir), `.${path.basename(stagingDir)}.init-${"a".repeat(32)}`));
+    await expect(preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir })).rejects.toThrow(/init orphan/i);
   });
 
   it("takes a coherent six-file snapshot and rejects same-file or cross-file changes", async () => {

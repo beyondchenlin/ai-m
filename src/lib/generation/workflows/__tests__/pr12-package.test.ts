@@ -61,4 +61,24 @@ describe("PR-12 workflow package contract", () => {
       "manifest.json": "0".repeat(64),
     })).toThrow(/digest mismatch/i);
   });
+
+  it("enforces numeric binding step contracts at manifest, compiled and bind time", () => {
+    const numericManifest = parseWorkflowManifest({
+      ...manifestRaw,
+      bindings: [{
+        key: "duration", selector: { nodeId: "1", classType: "TextInput" }, inputName: "text",
+        valueType: "number", source: "request", required: true, userOverride: true,
+        minimum: 0.5, maximum: 60, step: 0.5,
+      }],
+    });
+    const workflow = normalizeComfyWorkflow(workflowRaw);
+    const compiled = compileWorkflowBindings(workflow, numericManifest);
+    expect(compiled.bindings[0]).toMatchObject({ minimum: 0.5, maximum: 60, step: 0.5 });
+    expect(bindWorkflow(workflow, compiled, { duration: 0.5 }, "out")["1"].inputs.text).toBe(0.5);
+    expect(bindWorkflow(workflow, compiled, { duration: 60 }, "out")["1"].inputs.text).toBe(60);
+    expect(() => bindWorkflow(workflow, compiled, { duration: 0.4 }, "out")).toThrow(/minimum/i);
+    expect(() => bindWorkflow(workflow, compiled, { duration: 60.5 }, "out")).toThrow(/maximum|exceeds/i);
+    expect(() => bindWorkflow(workflow, compiled, { duration: 0.75 }, "out")).toThrow(/step/i);
+    expect(() => parseWorkflowManifest({ ...manifestRaw, bindings: [{ ...numericManifest.bindings[0], step: 0 }] })).toThrow(/step/i);
+  });
 });

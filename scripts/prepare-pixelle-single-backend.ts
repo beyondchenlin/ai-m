@@ -20,6 +20,8 @@ export interface PrepareOptions {
   afterLockAcquired?: () => Promise<void>;
   afterSourceFileRead?: (sourceFile: string, index: number) => Promise<void>;
   writeBytes?: typeof fs.writeFile;
+  writeInitMarker?: typeof fs.writeFile;
+  renameInitDir?: typeof fs.rename;
 }
 
 interface PreparedPackage {
@@ -82,6 +84,7 @@ const numericBinding = (
   defaultValue: number | undefined,
   minimum: number,
   maximum: number,
+  step?: number,
 ): AuthorBinding => ({
   key,
   selector: selector(classType, metaTitle),
@@ -93,6 +96,7 @@ const numericBinding = (
   ...(defaultValue === undefined ? {} : { default: defaultValue }),
   minimum,
   maximum,
+  ...(step === undefined ? {} : { step }),
 });
 
 const voiceReferenceBinding = (): AuthorBinding => ({
@@ -148,7 +152,7 @@ function omniBindings(workflow: ComfyWorkflow, nodeClass: string, nodeTitle: str
       default: "",
     }),
     numericBinding("speed", nodeClass, nodeTitle, "speed", "number", numericInputDefault(workflow, nodeClass, nodeTitle, "speed"), 0.5, 2),
-    ...(includeDuration ? [numericBinding("duration", "PixelleDurationInput", "$duration.value", "value", "number", numericInputDefault(workflow, "PixelleDurationInput", "$duration.value", "value"), 0.1, 3_600)] : []),
+    ...(includeDuration ? [numericBinding("duration", "PixelleDurationInput", "$duration.value", "value", "number", numericInputDefault(workflow, "PixelleDurationInput", "$duration.value", "value"), 0.5, 60, 0.5)] : []),
   ];
 }
 
@@ -534,7 +538,38 @@ async function assertLockOwned(stagingDir: string, token: string): Promise<void>
   if (current.token !== token) throw new Error("prepare.lock ownership was lost");
 }
 
-async function initializeStaging(stagingDir: string): Promise<void> {
+async function assertNoInitOrphans(stagingDir: string): Promise<void> {
+  const prefix = `.${path.basename(stagingDir)}.init-`;
+  const orphans = (await fs.readdir(path.dirname(stagingDir))).filter((name) => name.startsWith(prefix));
+  if (orphans.length) throw new Error(`Staging init orphan requires manual review: ${orphans.sort().join(", ")}`);
+}
+
+async function cleanupCurrentInitDirectory(initDir: string, stagingDir: string, token: string): Promise<void> {
+  if (path.dirname(initDir) !== path.dirname(stagingDir) || path.basename(initDir) !== `.${path.basename(stagingDir)}.init-${token}`) {
+    throw new Error("Init cleanup ownership check failed");
+  }
+  const stat = await fs.lstat(initDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Init cleanup found an unsafe entry");
+  const entries = (await fs.readdir(initDir)).sort();
+  const unknown = entries.filter((name) => name !== STAGING_MARKER_FILENAME && name !== "generations");
+  if (unknown.length) throw new Error(`Init cleanup found unfamiliar content: ${unknown.join(", ")}`);
+  if (entries.includes("generations")) {
+    const generationsDir = path.join(initDir, "generations");
+    const generationsStat = await fs.lstat(generationsDir);
+    if (!generationsStat.isDirectory() || generationsStat.isSymbolicLink() || (await fs.readdir(generationsDir)).length) {
+      throw new Error("Init cleanup found an unsafe generations directory");
+    }
+    await fs.rmdir(generationsDir);
+  }
+  if (entries.includes(STAGING_MARKER_FILENAME)) {
+    await assertOwnedStaging(initDir, stagingDir);
+    await fs.unlink(path.join(initDir, STAGING_MARKER_FILENAME));
+  }
+  await fs.rmdir(initDir);
+}
+
+async function initializeStaging(stagingDir: string, options: PrepareOptions): Promise<void> {
+  await assertNoInitOrphans(stagingDir);
   const existing = await lstatOrNull(stagingDir);
   if (existing) {
     await assertOwnedStaging(stagingDir, stagingDir);
@@ -543,12 +578,19 @@ async function initializeStaging(stagingDir: string): Promise<void> {
   const token = randomBytes(16).toString("hex");
   const initDir = path.join(path.dirname(stagingDir), `.${path.basename(stagingDir)}.init-${token}`);
   await fs.mkdir(initDir);
-  await fs.writeFile(path.join(initDir, STAGING_MARKER_FILENAME), jsonBytes(stagingMarker(stagingDir)), { flag: "wx" });
-  await fs.mkdir(path.join(initDir, "generations"));
   try {
-    await fs.rename(initDir, stagingDir);
+    await (options.writeInitMarker ?? fs.writeFile)(path.join(initDir, STAGING_MARKER_FILENAME), jsonBytes(stagingMarker(stagingDir)), { flag: "wx" });
+    await assertOwnedStaging(initDir, stagingDir);
+    await fs.mkdir(path.join(initDir, "generations"));
+    await (options.renameInitDir ?? fs.rename)(initDir, stagingDir);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    const collision = (error as NodeJS.ErrnoException).code === "EEXIST" || (error as NodeJS.ErrnoException).code === "ENOTEMPTY";
+    try {
+      await cleanupCurrentInitDirectory(initDir, stagingDir, token);
+    } catch (cleanupError) {
+      throw new Error(`Staging initialization failed and owned init cleanup was blocked: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`, { cause: error });
+    }
+    if (!collision) throw error;
     await assertOwnedStaging(stagingDir, stagingDir);
   }
 }
@@ -657,7 +699,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   const workflowDir = path.resolve(pixelleRoot, "workflows", "selfhost");
   await assertNoSymlinkComponents(workflowDir, "Pixelle workflows/selfhost");
   if (await fs.realpath(workflowDir) !== workflowDir) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
-  await initializeStaging(stagingDir);
+  await initializeStaging(stagingDir, options);
   await assertGenerationsDirectory(stagingDir);
   const token = randomBytes(16).toString("hex");
   await acquireLock(stagingDir, options, token);
