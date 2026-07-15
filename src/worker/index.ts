@@ -13,11 +13,19 @@ import { executeGenerationJob } from "@/lib/generation/worker-executor";
 import { parseLegacyArtifactRecoveryBeforeMs, recoverStagingArtifacts } from "@/lib/generation/archiving";
 import { cleanupTerminalSharedInputs } from "@/lib/generation/input-materializer";
 import { cleanupSourceAssetStorage, recoverSourceMediaAssets } from "@/lib/generation/source-assets";
-import { waitForCurrentMigrationBundle } from "@/lib/db";
+import { db, waitForCurrentMigrationBundle } from "@/lib/db";
 import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-adapter";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { settleClaimedJob } from "./claim-settlement";
 import { connectionManagerRegistry } from "@/lib/generation/transports/comfyui-connection-manager";
+import { executionBackends, resourcePools } from "@/lib/db/schema";
+import {
+  ManagedComfyUIRuntime,
+  parseManagedComfyUIRuntimeConfig,
+  type ManagedProbeTransport,
+} from "@/lib/generation/runtime/managed-comfyui-runtime";
+import { createComfyUITransport, type ComfyUITransport } from "@/lib/generation/transports/comfyui";
+import { JobRuntimeBoundary } from "./job-runtime-boundary";
 
 // Worker 标识
 const WORKER_ID = `worker-${process.pid}-${Date.now().toString(36)}`;
@@ -25,11 +33,71 @@ const LEGACY_ARTIFACT_RECOVERY_BEFORE_MS = parseLegacyArtifactRecoveryBeforeMs(
   process.env.AI_M_LEGACY_ARTIFACT_RECOVERY_BEFORE_MS,
 );
 const SUPPORTED_CAPABILITIES = ["image", "text", "video", "speech"] as const;
+const managedRuntimeConfig = parseManagedComfyUIRuntimeConfig(process.env);
+
+type ManagedBackendRow = {
+  id: string;
+  adapterKind: string;
+  baseUrl: string;
+  resourcePoolId: string;
+  enabled: boolean | number;
+};
+
+type ManagedPoolRow = { id: string; capacity: number };
+
+export function validateManagedWorkerBackendConfiguration(
+  baseUrl: "http://127.0.0.1:8000",
+  backends: readonly ManagedBackendRow[],
+  pools: readonly ManagedPoolRow[],
+): void {
+  const enabledComfyUI = backends.filter((backend) => (backend.enabled === true || backend.enabled === 1)
+    && backend.adapterKind === "comfyui");
+  const canonical = enabledComfyUI.filter((backend) => backend.baseUrl === baseUrl);
+  const poolIds = new Set(canonical.map((backend) => backend.resourcePoolId));
+  const pool = poolIds.size === 1 ? pools.find((candidate) => candidate.id === canonical[0]?.resourcePoolId) : undefined;
+  if (canonical.length === 0
+    || canonical.length !== enabledComfyUI.length
+    || poolIds.size !== 1
+    || pool?.capacity !== 1) {
+    throw new Error("managed_comfyui_worker_configuration_invalid");
+  }
+}
+
+type ProbeTransportCreator = (
+  baseUrl: string,
+  topology: string,
+  headers: Record<string, string>,
+  expectedResolvedAddresses: readonly string[],
+  options: {
+    policyRevision: string;
+    resolver: (hostname: string, signal?: AbortSignal) => Promise<readonly { address: string; family: 4 | 6 }[]>;
+  },
+) => Promise<Pick<ComfyUITransport, "get" | "close">>;
+
+export function createManagedProbeFactory(createTransport: ProbeTransportCreator) {
+  return (baseUrl: "http://127.0.0.1:8000"): ManagedProbeTransport => {
+    const transport = createTransport(baseUrl, "same-host", {}, ["127.0.0.1"], {
+      policyRevision: "managed-loopback-v1",
+      resolver: async (hostname) => {
+        if (hostname !== "127.0.0.1") throw new Error("managed_comfyui_probe_non_loopback_host");
+        return [{ address: "127.0.0.1", family: 4 }];
+      },
+    });
+    return {
+      get: async (path, options) => (await transport).get(path, options),
+      close: async () => { await Promise.resolve((await transport).close()); },
+    };
+  };
+}
+
+const managedRuntime = managedRuntimeConfig.enabled
+  ? new ManagedComfyUIRuntime(managedRuntimeConfig, {
+      probeFactory: createManagedProbeFactory(createComfyUITransport),
+    })
+  : null;
 
 // 运行状态
 let running = true;
-let currentJobId: string | null = null;
-let currentFencingToken: number | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let recoveryTimer: ReturnType<typeof setInterval> | null = null;
 let currentAbortController: AbortController | null = null;
@@ -106,15 +174,18 @@ function startRecoveryScanner() {
 }
 
 /** 处理单个任务 */
-async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>) {
+type ClaimedJob = NonNullable<Awaited<ReturnType<typeof claimJob>>>;
+
+async function executeClaimedJob(job: ClaimedJob, boundarySignal: AbortSignal) {
+  const abortExecution = () => currentAbortController?.abort(boundarySignal.reason);
   try {
-    currentJobId = job.id;
     const fencingToken = job.claimFencingToken;
-    currentFencingToken = fencingToken;
 
     console.log(`[${WORKER_ID}] Claimed job ${job.id} (capability: ${job.capability}, project: ${job.projectId})`);
 
     currentAbortController = new AbortController();
+    if (boundarySignal.aborted) abortExecution();
+    else boundarySignal.addEventListener("abort", abortExecution, { once: true });
     // 启动心跳
     startHeartbeat(job.id, fencingToken);
 
@@ -131,21 +202,39 @@ async function processJob(job: NonNullable<Awaited<ReturnType<typeof claimJob>>>
     } else {
       console.warn(`[${WORKER_ID}] Retained job ${job.id} for fenced recovery`);
     }
-  } catch (err) {
-    console.error(`[${WORKER_ID}] Error processing job ${job.id}:`, err);
-    // Do not release ownership after an unexpected failure.  The external submit
-    // may have succeeded even when the local response was lost.  Recovery must
-    // classify the persisted attempt before another worker may act.
+    return result;
   } finally {
+    boundarySignal.removeEventListener("abort", abortExecution);
     stopHeartbeat();
-    currentJobId = null;
-    currentFencingToken = null;
     currentAbortController = null;
   }
 }
 
 
 /** 主循环 */
+function safeErrorSummary(error: unknown): string {
+  const raw = error instanceof Error ? `${error.name}: ${error.message}` : "unknown_error";
+  return raw.replace(/[\r\n\t]+/g, " ").slice(0, 512);
+}
+
+const jobRuntimeBoundary = new JobRuntimeBoundary<ClaimedJob, Awaited<ReturnType<typeof executeClaimedJob>>>({
+  execute: executeClaimedJob,
+  closeConnections: async () => {
+    if (managedRuntime) connectionManagerRegistry.closeAll();
+  },
+  restart: async (signal) => {
+    if (managedRuntime) await managedRuntime.restartAfterJob(signal);
+  },
+});
+
+async function processJob(job: ClaimedJob) {
+  try {
+    await jobRuntimeBoundary.run(job);
+  } catch (error) {
+    console.error(`[${WORKER_ID}] Job runtime boundary blocked: ${safeErrorSummary(error)}`);
+  }
+}
+
 async function mainLoop() {
   if (!isEnabled(FF.V2_DURABLE_EXECUTION)) {
     console.log(`[${WORKER_ID}] v2.0 durable execution is not enabled, exiting`);
@@ -154,6 +243,21 @@ async function mainLoop() {
 
   console.log(`[${WORKER_ID}] Worker started, waiting for platform schema...`);
   await waitForCurrentMigrationBundle();
+  if (managedRuntimeConfig.enabled) {
+    const backends = await db.select({
+      id: executionBackends.id,
+      adapterKind: executionBackends.adapterKind,
+      baseUrl: executionBackends.baseUrl,
+      resourcePoolId: executionBackends.resourcePoolId,
+      enabled: executionBackends.enabled,
+    }).from(executionBackends);
+    const pools = await db.select({ id: resourcePools.id, capacity: resourcePools.capacity }).from(resourcePools);
+    validateManagedWorkerBackendConfiguration(managedRuntimeConfig.baseUrl, backends, pools);
+    if (managedRuntime?.getEndpointState().state === "blocked") {
+      throw new Error("managed_comfyui_worker_registry_blocked");
+    }
+    console.log(`[${WORKER_ID}] Managed ComfyUI single-endpoint configuration validated`);
+  }
   console.log(`[${WORKER_ID}] Platform schema ready, polling for jobs...`);
 
   const artifactRecovery = await recoverStagingArtifacts({
@@ -183,6 +287,7 @@ async function mainLoop() {
 
   while (running) {
     try {
+      jobRuntimeBoundary.assertReadyToClaim();
       // 按优先级轮询能力
       let job = null;
       for (const capability of SUPPORTED_CAPABILITIES) {
@@ -196,6 +301,10 @@ async function mainLoop() {
           await currentJobPromise;
         } finally {
           currentJobPromise = null;
+        }
+        if (jobRuntimeBoundary.state === "blocked") {
+          console.error(`[${WORKER_ID}] Polling blocked by job runtime boundary`);
+          break;
         }
       } else {
         // 没有任务，等待
@@ -222,20 +331,11 @@ async function gracefulShutdown(signal: string) {
 
   // Preserve the claim while the executor persists an attention/terminal state.
   currentAbortController?.abort(new Error(`worker_shutdown:${signal}`));
-  if (currentJobPromise) {
-    const graceMs = Math.max(5_000, Number(process.env.AI_M_WORKER_SHUTDOWN_GRACE_MS ?? 25_000));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = await Promise.race([
-      currentJobPromise.then(() => false, () => false),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(true), graceMs);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (timedOut) {
-      console.warn(`[${WORKER_ID}] Graceful shutdown timed out; durable recovery will reconcile the retained claim`);
-    }
-  }
+  const configuredGraceMs = Number(process.env.AI_M_WORKER_SHUTDOWN_GRACE_MS ?? 25_000);
+  const graceMs = Number.isSafeInteger(configuredGraceMs) && configuredGraceMs >= 5_000 && configuredGraceMs <= 120_000
+    ? configuredGraceMs
+    : 25_000;
+  await jobRuntimeBoundary.stop(graceMs);
   connectionManagerRegistry.closeAll();
   stopHeartbeat();
   console.log(`[${WORKER_ID}] Shutdown coordination complete`);

@@ -6,6 +6,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isEnabledMock = vi.fn();
 const closeAllConnectionsMock = vi.fn();
+const parseManagedConfigMock = vi.fn((env: Record<string, string | undefined>) => {
+  void env;
+  return { enabled: false as const };
+});
+
+vi.mock("@/lib/generation/runtime/managed-comfyui-runtime", () => ({
+  parseManagedComfyUIRuntimeConfig: (env: Record<string, string | undefined>) => parseManagedConfigMock(env),
+  ManagedComfyUIRuntime: vi.fn(),
+}));
 
 vi.mock("@/lib/feature-flags", () => ({
   isEnabled: (...args: unknown[]) => isEnabledMock(...args),
@@ -68,7 +77,8 @@ describe("PR-11: Worker 信号处理", () => {
   });
 
   afterEach(() => {
-    vi.clearAllMocks();
+    isEnabledMock.mockClear();
+    closeAllConnectionsMock.mockClear();
   });
 
   it("收到 SIGINT 应调用 process.exit", async () => {
@@ -95,5 +105,80 @@ describe("PR-11: Worker 信号处理", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(process.exitCode).toBe(0);
+  });
+});
+
+describe("managed single-endpoint worker startup", () => {
+  it("parses managed runtime configuration exactly once per worker module", async () => {
+    await import("../index");
+    expect(parseManagedConfigMock).toHaveBeenCalledOnce();
+    expect(parseManagedConfigMock).toHaveBeenCalledWith(process.env);
+  });
+
+  it("allows multiple enabled rows only for one physical endpoint and one capacity-one pool", async () => {
+    const { validateManagedWorkerBackendConfiguration } = await import("../index");
+    expect(() => validateManagedWorkerBackendConfiguration(
+      "http://127.0.0.1:8000",
+      [
+        { id: "image", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
+        { id: "speech", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
+      ],
+      [{ id: "gpu", capacity: 1 }],
+    )).not.toThrow();
+  });
+
+  it.each([
+    {
+      name: "no enabled canonical backend",
+      backends: [{ id: "off", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: false }],
+      pools: [{ id: "gpu", capacity: 1 }],
+    },
+    {
+      name: "an additional enabled ComfyUI endpoint",
+      backends: [
+        { id: "managed", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true },
+        { id: "other", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8001", resourcePoolId: "gpu", enabled: true },
+      ],
+      pools: [{ id: "gpu", capacity: 1 }],
+    },
+    {
+      name: "canonical rows assigned to different pools",
+      backends: [
+        { id: "image", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu-a", enabled: true },
+        { id: "speech", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu-b", enabled: true },
+      ],
+      pools: [{ id: "gpu-a", capacity: 1 }, { id: "gpu-b", capacity: 1 }],
+    },
+    {
+      name: "a pool capacity other than one",
+      backends: [{ id: "managed", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8000", resourcePoolId: "gpu", enabled: true }],
+      pools: [{ id: "gpu", capacity: 2 }],
+    },
+  ])("fails closed for $name", async ({ backends, pools }) => {
+    const { validateManagedWorkerBackendConfiguration } = await import("../index");
+    expect(() => validateManagedWorkerBackendConfiguration("http://127.0.0.1:8000", backends, pools))
+      .toThrow(/managed_comfyui_worker_configuration_invalid/);
+  });
+
+  it("adapts the production transport into an awaitable readiness probe", async () => {
+    const { createManagedProbeFactory } = await import("../index");
+    let closeResolved = false;
+    const close = vi.fn(async () => { await Promise.resolve(); closeResolved = true; });
+    const get = vi.fn(async () => new Response("{}"));
+    const createTransport = vi.fn(async () => ({ get, close }));
+    const probe = createManagedProbeFactory(createTransport)("http://127.0.0.1:8000");
+
+    await probe.get("/system_stats");
+    await probe.close();
+
+    expect(createTransport).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000",
+      "same-host",
+      {},
+      ["127.0.0.1"],
+      expect.objectContaining({ policyRevision: "managed-loopback-v1" }),
+    );
+    expect(close).toHaveBeenCalledOnce();
+    expect(closeResolved).toBe(true);
   });
 });
