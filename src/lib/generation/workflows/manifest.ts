@@ -79,7 +79,7 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifest {
   const bindingKeys = new Set<string>();
   const bindings: AuthorBinding[] = data.bindings.map((item, index) => {
     const binding = object(item, `bindings[${index}]`);
-    keys(binding, ["key", "selector", "inputName", "valueType", "source", "required", "userOverride", "default", "minimum", "maximum"], `bindings[${index}]`);
+    keys(binding, ["key", "selector", "inputName", "valueType", "source", "required", "userOverride", "default", "minimum", "maximum", "step"], `bindings[${index}]`);
     const key = string(binding.key, `bindings[${index}].key`, /^[A-Za-z][A-Za-z0-9_.-]*$/);
     if (bindingKeys.has(key)) throw new WorkflowManifestError(`Duplicate binding key: ${key}`);
     bindingKeys.add(key);
@@ -97,10 +97,11 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifest {
     if (binding.default !== undefined) assertDefaultValue(binding.default, valueType, `bindings[${index}].default`);
     const minimum = binding.minimum === undefined ? undefined : number(binding.minimum, `bindings[${index}].minimum`, -Number.MAX_SAFE_INTEGER);
     const maximum = binding.maximum === undefined ? undefined : number(binding.maximum, `bindings[${index}].maximum`, -Number.MAX_SAFE_INTEGER);
+    const step = binding.step === undefined ? undefined : number(binding.step, `bindings[${index}].step`, Number.MIN_VALUE);
     if (minimum !== undefined && maximum !== undefined && maximum < minimum) {
       throw new WorkflowManifestError(`bindings[${index}].maximum must be >= minimum`);
     }
-    if ((minimum !== undefined || maximum !== undefined) && !["integer", "number"].includes(valueType)) {
+    if ((minimum !== undefined || maximum !== undefined || step !== undefined) && !["integer", "number"].includes(valueType)) {
       throw new WorkflowManifestError(`bindings[${index}] numeric limits require integer or number valueType`);
     }
     return {
@@ -114,6 +115,7 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifest {
       ...(binding.default !== undefined ? { default: binding.default } : {}),
       ...(minimum !== undefined ? { minimum } : {}),
       ...(maximum !== undefined ? { maximum } : {}),
+      ...(step !== undefined ? { step } : {}),
     };
   });
   const outputKeys = new Set<string>();

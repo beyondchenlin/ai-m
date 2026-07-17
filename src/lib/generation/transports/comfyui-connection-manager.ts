@@ -11,6 +11,7 @@
  */
 
 import type { ComfyWSMessage } from "./comfyui";
+import { randomBytes } from "node:crypto";
 
 /** 连接状态 */
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "closing";
@@ -47,12 +48,18 @@ export interface ReconnectConfig {
   maxAttempts: number;
 }
 
+export interface ComfyUIWebSocketFactory {
+  readonly canonicalEndpoint: string;
+  readonly registryKey: string;
+  open(clientId: string): WebSocket;
+}
+
 const DEFAULT_RECONNECT_CONFIG: ReconnectConfig = {
   initialDelayMs: 1_000,
   maxDelayMs: 60_000,
   backoffFactor: 2,
   jitterFactor: 0.3,
-  maxAttempts: Infinity,
+  maxAttempts: 5,
 };
 
 /**
@@ -62,8 +69,7 @@ const DEFAULT_RECONNECT_CONFIG: ReconnectConfig = {
  * 使用连接代次（generation）防止旧连接的延迟消息污染。
  */
 export class ComfyUIConnectionManager {
-  private readonly baseUrl: string;
-  private readonly clientId: string;
+  private readonly createWebSocket: () => WebSocket;
   private readonly config: ReconnectConfig;
 
   private ws: WebSocket | null = null;
@@ -81,9 +87,8 @@ export class ComfyUIConnectionManager {
   private lastProgressWriteMs = 0;
   private readonly progressWriteIntervalMs = 2_000;
 
-  constructor(baseUrl: string, clientId: string, config: Partial<ReconnectConfig> = {}) {
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
-    this.clientId = clientId;
+  constructor(createWebSocket: () => WebSocket, config: Partial<ReconnectConfig> = {}) {
+    this.createWebSocket = createWebSocket;
     this.config = { ...DEFAULT_RECONNECT_CONFIG, ...config };
   }
 
@@ -141,42 +146,51 @@ export class ComfyUIConnectionManager {
       return;
     }
 
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.shouldReconnect = true;
     this.doConnect();
   }
 
   private doConnect(): void {
+    if (this.ws) this.retireSocket(this.ws, true);
+    this.generation++;
+    const currentGen = this.generation;
     this.setState("connecting");
 
-    const wsUrl = this.baseUrl.replace(/^http/, "ws") + `/ws?clientId=${this.clientId}`;
-
     try {
-      this.ws = new WebSocket(wsUrl);
+      this.ws = this.createWebSocket();
     } catch (err) {
       this.handleConnectionError(`Failed to create WebSocket: ${err}`);
       return;
     }
 
-    const currentGen = this.generation;
+    const socket = this.ws;
+    let active = true;
 
-    this.ws.onopen = () => {
-      if (currentGen !== this.generation) return;
-      this.reconnectAttempts = 0;
+    socket.onopen = () => {
+      if (!active || currentGen !== this.generation) return;
       this.setState("connected");
     };
 
-    this.ws.onmessage = (event) => {
-      if (currentGen !== this.generation) return;
+    socket.onmessage = (event) => {
+      if (!active || currentGen !== this.generation) return;
       this.handleMessage(event.data, currentGen);
     };
 
-    this.ws.onerror = () => {
-      if (currentGen !== this.generation) return;
+    socket.onerror = () => {
+      if (!active || currentGen !== this.generation) return;
+      active = false;
+      this.retireSocket(socket, true);
       this.handleConnectionError("WebSocket error");
     };
 
-    this.ws.onclose = () => {
-      if (currentGen !== this.generation) return;
+    socket.onclose = () => {
+      if (!active || currentGen !== this.generation) return;
+      active = false;
+      this.retireSocket(socket, false);
       this.setState("disconnected");
       if (this.shouldReconnect) {
         this.scheduleReconnect();
@@ -334,15 +348,24 @@ export class ComfyUIConnectionManager {
 
     if (this.ws) {
       this.setState("closing");
-      try {
-        this.ws.close();
-      } catch {
-        // 忽略关闭错误
-      }
-      this.ws = null;
+      this.retireSocket(this.ws, true);
     }
 
     this.setState("disconnected");
+  }
+
+  private retireSocket(socket: WebSocket, close: boolean): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    if (this.ws === socket) this.ws = null;
+    if (!close) return;
+    try {
+      socket.close();
+    } catch {
+      // Ownership and event handlers are already detached; closing is best effort.
+    }
   }
 
   /** 重置进度快照（任务完成后清理） */
@@ -371,28 +394,62 @@ export class ComfyUIConnectionManager {
  * 连接管理器注册表
  * 每个后端 URL 对应一个共享连接管理器
  */
-class ConnectionManagerRegistry {
-  private managers = new Map<string, ComfyUIConnectionManager>();
+export interface ComfyUIConnectionLease {
+  readonly manager: ComfyUIConnectionManager;
+  readonly clientId: string;
+  release(): void;
+}
 
-  getOrCreate(baseUrl: string, clientId: string): ComfyUIConnectionManager {
-    const key = baseUrl.replace(/\/+$/, "").toLowerCase();
-    let mgr = this.managers.get(key);
-    if (!mgr) {
-      mgr = new ComfyUIConnectionManager(baseUrl, clientId);
-      this.managers.set(key, mgr);
+interface RegistryEntry {
+  readonly registryKey: string;
+  readonly manager: ComfyUIConnectionManager;
+  readonly clientId: string;
+  leases: number;
+}
+
+class ConnectionManagerRegistry {
+  private entries = new Map<string, RegistryEntry>();
+
+  acquire(factory: ComfyUIWebSocketFactory): ComfyUIConnectionLease {
+    let entry = this.entries.get(factory.registryKey);
+    if (!entry) {
+      const clientId = `ai-m-${randomBytes(12).toString("hex")}`;
+      entry = {
+        registryKey: factory.registryKey,
+        manager: new ComfyUIConnectionManager(() => factory.open(clientId)),
+        clientId,
+        leases: 0,
+      };
+      this.entries.set(factory.registryKey, entry);
     }
-    return mgr;
+    entry.leases++;
+    let released = false;
+    return {
+      manager: entry.manager,
+      clientId: entry.clientId,
+      release: () => {
+        if (released) return;
+        released = true;
+        entry!.leases--;
+        if (entry!.leases === 0) this.dispose(entry!);
+      },
+    };
+  }
+
+  private dispose(entry: RegistryEntry): void {
+    entry.manager.disconnect();
+    if (this.entries.get(entry.registryKey) === entry) this.entries.delete(entry.registryKey);
   }
 
   getAll(): ComfyUIConnectionManager[] {
-    return Array.from(this.managers.values());
+    return Array.from(this.entries.values(), (entry) => entry.manager);
   }
 
   closeAll(): void {
-    for (const mgr of this.managers.values()) {
-      mgr.disconnect();
+    for (const manager of this.getAll()) {
+      manager.disconnect();
     }
-    this.managers.clear();
+    this.entries.clear();
   }
 }
 

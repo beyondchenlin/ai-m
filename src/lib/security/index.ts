@@ -34,7 +34,7 @@ export {
 } from "./audit";
 export type { AuditAction as AuditActionType, AuditTargetType as AuditTargetTypeType, AuditEventInput } from "./audit";
 
-export { validateBackendAuthConfig, resolveBackendAuthHeaders } from "./backend-auth";
+export { assertSafeBackendHeaderValue, validateBackendAuthConfig, resolveBackendAuthHeaders } from "./backend-auth";
 export type { BackendAuthType, BackendAuthConfig } from "./backend-auth";
 
 export { resolveLegacyProviderSecrets } from "./provider-secrets";

@@ -1,0 +1,170 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { JobRuntimeBoundary } from "../job-runtime-boundary";
+
+type Result = { claimDisposition: "release-terminal" | "retain-recovery" };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+describe("JobRuntimeBoundary", () => {
+  it("waits for execution and terminal claim release settlement before closing connections and restarting", async () => {
+    const settlement = deferred<Result>();
+    const events: string[] = [];
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => { events.push("execute"); return settlement.promise; },
+      closeConnections: async () => { events.push("close"); },
+      restart: async () => { events.push("restart"); },
+    });
+
+    const run = boundary.run("job-1");
+    await Promise.resolve();
+    expect(events).toEqual(["execute"]);
+    expect(boundary.state).toBe("running-job");
+
+    settlement.resolve({ claimDisposition: "release-terminal" });
+    await run;
+    expect(events).toEqual(["execute", "close", "restart"]);
+    expect(boundary.state).toBe("ready");
+  });
+
+  it("blocks claims when restart fails", async () => {
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => ({ claimDisposition: "release-terminal" }),
+      closeConnections: async () => undefined,
+      restart: async () => { throw new Error("readiness failed"); },
+    });
+
+    await expect(boundary.run("job-1")).rejects.toThrow("readiness failed");
+    expect(boundary.state).toBe("blocked");
+    expect(() => boundary.assertReadyToClaim()).toThrow(/blocked/);
+  });
+
+  it("restarts for retained recovery results but remains blocked", async () => {
+    const restart = vi.fn(async () => undefined);
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => ({ claimDisposition: "retain-recovery" }),
+      closeConnections: async () => undefined,
+      restart,
+    });
+
+    await boundary.run("job-1");
+    expect(restart).toHaveBeenCalledOnce();
+    expect(boundary.state).toBe("blocked");
+    expect(() => boundary.assertReadyToClaim()).toThrow(/blocked/);
+  });
+
+  it("rejects concurrent jobs and gates the next claim until restart completes", async () => {
+    const restart = deferred<void>();
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => ({ claimDisposition: "release-terminal" }),
+      closeConnections: async () => undefined,
+      restart: async () => restart.promise,
+    });
+
+    const first = boundary.run("job-1");
+    await vi.waitFor(() => expect(boundary.state).toBe("restarting"));
+    expect(() => boundary.assertReadyToClaim()).toThrow(/restarting/);
+    await expect(boundary.run("job-2")).rejects.toThrow(/restarting/);
+
+    restart.resolve();
+    await first;
+    expect(() => boundary.assertReadyToClaim()).not.toThrow();
+  });
+
+  it("shutdown aborts an in-progress restart and stops after a bounded wait", async () => {
+    vi.useFakeTimers();
+    const restartStarted = deferred<void>();
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => ({ claimDisposition: "release-terminal" }),
+      closeConnections: async () => undefined,
+      restart: async (signal) => {
+        restartStarted.resolve();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+
+    const run = boundary.run("job-1");
+    await restartStarted.promise;
+    const shutdown = boundary.stop(25);
+    await vi.advanceTimersByTimeAsync(25);
+    await shutdown;
+    await expect(run).rejects.toThrow(/shutdown/);
+    expect(boundary.state).toBe("stopped");
+    vi.useRealTimers();
+  });
+
+  it("preserves legacy polling after an unmanaged execution error without closing or restarting", async () => {
+    const closeConnections = vi.fn(async () => undefined);
+    const restart = vi.fn(async () => undefined);
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => { throw new Error("legacy executor failure"); },
+      closeConnections,
+      restart,
+      policy: { restartAfterJob: false, blockOnExecutionError: false, blockOnRetainedResult: false },
+    });
+
+    await expect(boundary.run("job-1")).rejects.toThrow("legacy executor failure");
+    expect(boundary.state).toBe("ready");
+    expect(() => boundary.assertReadyToClaim()).not.toThrow();
+    expect(closeConnections).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("blocks a retained managed result without resetting uncertain backend history", async () => {
+    const closeConnections = vi.fn(async () => undefined);
+    const restart = vi.fn(async () => undefined);
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => ({ claimDisposition: "retain-recovery" }),
+      closeConnections,
+      restart,
+      policy: { restartAfterJob: false, blockOnExecutionError: true, blockOnRetainedResult: true },
+    });
+
+    await boundary.run("job-1");
+    expect(boundary.state).toBe("blocked");
+    expect(closeConnections).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("preserves execution and runtime reset failures in one typed aggregate", async () => {
+    const executionError = new Error("execution secret");
+    const resetError = new Error("reset secret");
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => { throw executionError; },
+      closeConnections: async () => undefined,
+      restart: async () => { throw resetError; },
+    });
+
+    const error = await boundary.run("job-1").catch((caught) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect(error.code).toBe("execution_and_runtime_reset_failed");
+    expect(error.errors).toEqual([executionError, resetError]);
+    expect(error.message).not.toContain("secret");
+    expect(boundary.state).toBe("blocked");
+  });
+
+  it("clears its shutdown deadline timer when the active run settles first", async () => {
+    vi.useFakeTimers();
+    const execution = deferred<Result>();
+    const boundary = new JobRuntimeBoundary<string, Result>({
+      execute: async () => execution.promise,
+      closeConnections: async () => undefined,
+      restart: async () => undefined,
+      policy: { restartAfterJob: false, blockOnExecutionError: false, blockOnRetainedResult: false },
+    });
+    const run = boundary.run("job-1");
+    const stop = boundary.stop(25_000);
+    execution.resolve({ claimDisposition: "release-terminal" });
+    await run;
+    await stop;
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+});

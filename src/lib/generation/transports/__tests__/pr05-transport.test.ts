@@ -21,13 +21,13 @@ import type { BackendFeatureSnapshot } from "@/lib/generation/transports/comfyui
 
 describe("PR-05: ComfyUI 连接管理器", () => {
   it("初始状态为 disconnected 且 generation 为 0", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     expect(mgr.getState()).toBe("disconnected");
     expect(mgr.getGeneration()).toBe(0);
   });
 
   it("registerTaskHandler 返回清理函数并创建进度快照", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     const unregister = mgr.registerTaskHandler("test-prompt-1", () => {});
     expect(typeof unregister).toBe("function");
 
@@ -41,7 +41,7 @@ describe("PR-05: ComfyUI 连接管理器", () => {
   });
 
   it("disconnect 后状态为 disconnected 且 generation 递增", () => {
-    const mgr = new ComfyUIConnectionManager("http://localhost:8188", "test-client");
+    const mgr = new ComfyUIConnectionManager(() => new WebSocket("ws://localhost"));
     mgr.disconnect();
     expect(mgr.getState()).toBe("disconnected");
     expect(mgr.getGeneration()).toBe(1);
@@ -56,7 +56,11 @@ describe("PR-05: 取消策略", () => {
     post: async (_path: string, _body: unknown) => new Response("{}", { status: 200 }),
     uploadImage: async (input: { filename: string }) => ({ name: input.filename, subfolder: "", type: "input" }),
     getFile: async () => new Response(),
-    connectWebSocket: () => new WebSocket("ws://localhost"),
+    getWebSocketFactory: () => ({
+      canonicalEndpoint: "http://localhost:8188",
+      registryKey: "pr05-test",
+      open: () => new WebSocket("ws://localhost"),
+    }),
     cancel: async () => {},
     interrupt: async () => {},
     close: () => {},
@@ -86,6 +90,38 @@ describe("PR-05: 取消策略", () => {
     expect(result.method).toBe("per-task");
     expect(result.requested).toBe(true);
     expect(result.needsReconciliation).toBe(true);
+  });
+
+  it("consumes the status-only cancellation acknowledgement body", async () => {
+    let bodyFinished = false;
+    let pulls = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        if (pulls === 1) controller.enqueue(new TextEncoder().encode("{}"));
+        else {
+          controller.close();
+          bodyFinished = true;
+        }
+      },
+      cancel() { bodyFinished = true; },
+    }), { status: 200 });
+    const transport = { ...mockTransport, post: async () => response };
+
+    await safeCancelJob(transport, sharedFeatures, "test-id", { isShared: true });
+
+    expect(bodyFinished).toBe(true);
+  });
+
+  it("does not expose a cancellation response body in its safe message", async () => {
+    const transport = {
+      ...mockTransport,
+      post: async () => new Response("Bearer cancellation-secret", { status: 500 }),
+    };
+
+    const result = await safeCancelJob(transport, sharedFeatures, "test-id", { isShared: true });
+
+    expect(result.safeMessage).not.toContain("cancellation-secret");
   });
 
   it("专用后端无按任务取消时尝试全局中断", async () => {

@@ -5,8 +5,11 @@
  * 提交不确定（SUBMISSION_UNKNOWN）与对账、以及取消路径。
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ComfyUIExecutionOrchestrator } from "../comfyui-execution-orchestrator";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  ComfyUIExecutionOrchestrator,
+  ExecutionCallbackPersistenceError,
+} from "../comfyui-execution-orchestrator";
 import { connectionManagerRegistry } from "../comfyui-connection-manager";
 import {
   FakeComfyUITransport,
@@ -14,6 +17,7 @@ import {
   installFakeWebSocket,
 } from "@/lib/test-helpers/fake-comfyui";
 import type { ExecutionConfig } from "../comfyui-execution-orchestrator";
+import { ComfyUIOperationError, type ComfyUIOperationOptions } from "../comfyui";
 
 const pngBytes = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -63,7 +67,100 @@ function makeCompletedHistory(promptId: string) {
   };
 }
 
+function makeTerminalHistory(
+  promptId: string,
+  statusStr: string,
+  completed: boolean,
+  messageType?: string,
+) {
+  return {
+    [promptId]: {
+      promptId,
+      outputs: {},
+      status: {
+        statusStr,
+        completed,
+        messages: messageType ? [[messageType, {}] as [string, Record<string, unknown>]] : [],
+      },
+    },
+  };
+}
+
+function makeCorrelationTerminalTransport(promptId: string, correlationId: string) {
+  class CorrelationTerminalTransport extends FakeComfyUITransport {
+    private queueProbes = 0;
+
+    override async get(path: string): Promise<Response> {
+      if (path === "/queue") {
+        this.queueProbes++;
+        this.scenario.queueRunning = this.queueProbes === 1
+          ? [{ prompt_id: promptId, correlation_id: correlationId }]
+          : [];
+      }
+      return super.get(path);
+    }
+  }
+
+  return new CorrelationTerminalTransport({
+    submitError: new Error("timeout"),
+    promptId,
+    queueRunning: [{ prompt_id: promptId, correlation_id: correlationId }],
+    history: makeTerminalHistory(promptId, "error", false, "execution_interrupted"),
+  });
+}
+
 describe("PR-11: 编排器假后端集成", () => {
+  it("does not submit when its lifecycle is already aborted", async () => {
+    const transport = new FakeComfyUITransport({
+      promptId: "must-not-submit",
+      history: makeCompletedHistory("must-not-submit"),
+      fileBytes: pngArrayBuffer,
+    });
+    const post = vi.spyOn(transport, "post");
+    const lifecycle = new AbortController();
+    lifecycle.abort(new Error("ownership lost"));
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {},
+      fastConfig(),
+      "pre-aborted",
+      lifecycle.signal,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(false);
+    expect(post).not.toHaveBeenCalledWith("/prompt", expect.anything(), expect.anything());
+  });
+
+  it("does not submit when ownership is aborted while persisting SUBMITTING", async () => {
+    const transport = new FakeComfyUITransport({
+      promptId: "must-not-submit",
+      history: makeCompletedHistory("must-not-submit"),
+      fileBytes: pngArrayBuffer,
+    });
+    const post = vi.spyOn(transport, "post");
+    const lifecycle = new AbortController();
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onPhaseChange: async (phase) => {
+          if (phase === "SUBMITTING") lifecycle.abort(new Error("ownership lost"));
+        },
+      },
+      fastConfig(),
+      "abort-during-phase",
+      lifecycle.signal,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(false);
+    expect(post).not.toHaveBeenCalledWith("/prompt", expect.anything(), expect.anything());
+  });
+
   let restoreWebSocket: (() => void) | null = null;
 
   beforeEach(() => {
@@ -88,7 +185,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onOutputStream: async (output) => {
           outputs.push(await output.response.arrayBuffer());
@@ -102,7 +198,145 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
     expect(result.externalJobId).toBe(promptId);
+    expect(result.submissionDisposition).toBe("definitely-submitted");
     expect(outputs).toHaveLength(1);
+  });
+
+  it("passes the configured absolute submission deadline into the transport", async () => {
+    class CapturingTransport extends FakeComfyUITransport {
+      observedTimeoutMs: number | undefined;
+      override async post(path: string, body: unknown, options?: ComfyUIOperationOptions): Promise<Response> {
+        if (path === "/prompt") this.observedTimeoutMs = options?.timeoutMs;
+        return super.post(path, body);
+      }
+    }
+    const promptId = "submission-deadline-config";
+    const transport = new CapturingTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeCompletedHistory(promptId),
+      fileBytes: pngArrayBuffer,
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      { onOutputStream: async (output) => { await output.response.arrayBuffer(); } },
+      { ...fastConfig(), submitTimeoutMs: 137 },
+    );
+
+    await orchestrator.execute(workflow);
+
+    expect(transport.observedTimeoutMs).toBe(137);
+  });
+
+  it("does not reconcile a submission proven to have timed out before write", async () => {
+    const reconciliations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      submitError: new ComfyUIOperationError(
+        "ComfyUI submission operation failed",
+        "definitely-not-submitted",
+      ),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      { onReconciliation: (result) => { reconciliations.push(result.evidenceStrength); } },
+      fastConfig(),
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result).toMatchObject({
+      success: false,
+      phase: "FAILED",
+      submissionDisposition: "definitely-not-submitted",
+      needsAttention: false,
+    });
+    expect(reconciliations).toEqual([]);
+  });
+
+  it("reconciles but never resubmits an accepted prompt with an invalid acknowledgement", async () => {
+    const transport = new FakeComfyUITransport({
+      submitError: new ComfyUIOperationError(
+        "ComfyUI accepted the submission but returned an invalid acknowledgement",
+        "submission-uncertain",
+      ),
+    });
+    const post = vi.spyOn(transport, "post");
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {},
+      { ...fastConfig(), maxReconciliationAttempts: 1 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.submissionDisposition).toBe("submission-uncertain");
+    expect(post.mock.calls.filter(([path]) => path === "/prompt")).toHaveLength(1);
+  });
+
+  it("uses one absolute collection deadline across every output download", async () => {
+    class CollectionDeadlineTransport extends FakeComfyUITransport {
+      readonly downloadTimeouts: number[] = [];
+      override async getFile(
+        params: { filename: string; subfolder: string; type: string },
+        options?: ComfyUIOperationOptions,
+      ): Promise<Response> {
+        this.downloadTimeouts.push(options?.timeoutMs ?? -1);
+        return super.getFile(params, options);
+      }
+    }
+    const promptId = "collection-absolute-deadline";
+    const history = makeCompletedHistory(promptId);
+    history[promptId].outputs["node-1"].images = [
+      { filename: "first.png", subfolder: "", type: "output" },
+      { filename: "second.png", subfolder: "", type: "output" },
+    ];
+    const transport = new CollectionDeadlineTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history,
+      fileBytes: pngArrayBuffer,
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onOutputStream: async (output) => {
+          await output.response.arrayBuffer();
+          await new Promise((resolve) => setTimeout(resolve, 15));
+        },
+      },
+      {
+        ...fastConfig(),
+        collectionTimeoutMs: 200,
+        approvedOutputs: [{ key: "primary", nodeId: "node-1", field: "images", mediaKind: "image", maxItems: 2 }],
+        maxOutputs: 2,
+      },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.success).toBe(true);
+    expect(transport.downloadTimeouts).toHaveLength(2);
+    expect(transport.downloadTimeouts[0]).toBeLessThanOrEqual(200);
+    expect(transport.downloadTimeouts[1]).toBeLessThan(transport.downloadTimeouts[0]);
+  });
+
+  it("propagates durable callback failures instead of classifying them as execution errors", async () => {
+    const transport = new FakeComfyUITransport({ promptId: "callback-failure" });
+    const injected = new Error("database write failed");
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onPhaseChange: () => { throw new ExecutionCallbackPersistenceError(injected); },
+      },
+      fastConfig(),
+    );
+
+    await expect(orchestrator.execute(workflow)).rejects.toMatchObject({ cause: injected });
   });
 
   it("提交响应丢失后应对账发现任务正在运行并完成", async () => {
@@ -120,7 +354,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onReconciliation: (r) => { reconciliations.push(r.evidenceStrength); },
         onOutputStream: async (output) => { await output.response.arrayBuffer(); },
@@ -133,6 +366,7 @@ describe("PR-11: 编排器假后端集成", () => {
 
     expect(result.success).toBe(true);
     expect(result.phase).toBe("SUCCEEDED");
+    expect(result.submissionDisposition).toBe("definitely-submitted");
     expect(result.externalJobId).toBe(promptId);
     expect(reconciliations.length).toBeGreaterThan(0);
     expect(reconciliations[0]).toBe("conclusive");
@@ -140,6 +374,7 @@ describe("PR-11: 编排器假后端集成", () => {
 
   it("提交丢失且始终无证据时应升级人工处理", async () => {
     const promptId = "sub-unknown-escalate";
+    const terminalEvidence: string[] = [];
     const transport = new FakeComfyUITransport({
       submitError: new Error("timeout"),
       promptId,
@@ -151,8 +386,7 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
-      {},
+      { onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); } },
       {
         ...fastConfig(),
         maxReconciliationAttempts: 1,
@@ -164,6 +398,8 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.success).toBe(false);
     expect(result.phase).toBe("FAILED");
     expect(result.needsAttention).toBe(true);
+    expect(result.submissionDisposition).toBe("submission-uncertain");
+    expect(terminalEvidence).toEqual([]);
   });
 
 
@@ -178,7 +414,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => { if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel(); },
         onOutputStream: async (output) => { await output.response.arrayBuffer(); },
@@ -190,7 +425,7 @@ describe("PR-11: 编排器假后端集成", () => {
     expect(result.cancellationRequested).toBe(true);
   });
 
-  it("执行中请求取消应进入 CANCELLED 状态", async () => {
+  it("escalates when cancellation termination remains unconfirmed", async () => {
     const promptId = "cancel-during-run";
     const transport = new FakeComfyUITransport({
       promptId,
@@ -202,7 +437,6 @@ describe("PR-11: 编排器假后端集成", () => {
     const orchestrator = new ComfyUIExecutionOrchestrator(
       transport,
       defaultBackendFeatures(),
-      "http://localhost:8188",
       {
         onPhaseChange: (phase) => {
           if (phase === "EXTERNAL_RUNNING") {
@@ -210,12 +444,151 @@ describe("PR-11: 编排器假后端集成", () => {
           }
         },
       },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(result.cancellationRequested).toBe(true);
+  });
+
+  it("confirms a correlated interrupted history only in cancellation context", async () => {
+    const promptId = "correlated-interrupted-cancel";
+    const correlationId = "corr-interrupted-cancel";
+    const confirmations: string[] = [];
+    const reconciliationOutcomes: Array<string | undefined> = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      makeCorrelationTerminalTransport(promptId, correlationId),
+      defaultBackendFeatures(),
+      {
+        isCancellationRequested: () => true,
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
+        onReconciliation: (result) => { reconciliationOutcomes.push(result.historyOutcome); },
+      },
       fastConfig(),
+      correlationId,
     );
 
     const result = await orchestrator.execute(workflow);
 
     expect(result.phase).toBe("CANCELLED");
-    expect(result.cancellationRequested).toBe(true);
+    expect(result.externalJobId).toBe(promptId);
+    expect(confirmations).toEqual([promptId]);
+    expect(reconciliationOutcomes).toEqual(["cancelled"]);
+  });
+
+  it("treats a correlated interrupted history as failure without cancellation context", async () => {
+    const promptId = "correlated-interrupted-no-cancel";
+    const correlationId = "corr-interrupted-no-cancel";
+    const confirmations: string[] = [];
+    const reconciliationOutcomes: Array<string | undefined> = [];
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      makeCorrelationTerminalTransport(promptId, correlationId),
+      defaultBackendFeatures(),
+      {
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.externalJobId); },
+        onReconciliation: (result) => { reconciliationOutcomes.push(result.historyOutcome); },
+      },
+      fastConfig(),
+      correlationId,
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(result.externalJobId).toBe(promptId);
+    expect(confirmations).toEqual([]);
+    expect(reconciliationOutcomes).toEqual(["cancelled"]);
+  });
+
+  it("confirms cancellation only from an explicit cancelled history terminal", async () => {
+    const promptId = "cancel-history-terminal";
+    const confirmations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalHistory(promptId, "error", false, "execution_interrupted"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onPhaseChange: (phase) => {
+          if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();
+        },
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+      },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("CANCELLED");
+    expect(confirmations).toEqual(["history-terminal-cancelled"]);
+  });
+
+  it("classifies an ordinary failed history terminal as failure, not cancellation", async () => {
+    const promptId = "cancel-race-failed";
+    const confirmations: string[] = [];
+    const terminalEvidence: string[] = [];
+    let historyProbes = 0;
+    class CountingTransport extends FakeComfyUITransport {
+      override async get(path: string): Promise<Response> {
+        if (path === `/history/${promptId}`) historyProbes++;
+        return super.get(path);
+      }
+    }
+    const transport = new CountingTransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalHistory(promptId, "error", false, "execution_error"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+        onExternalTerminationEvidence: (evidence) => { terminalEvidence.push(evidence.proofKind); },
+      },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(false);
+    expect(confirmations).toEqual([]);
+    expect(terminalEvidence).toEqual(["history-failed"]);
+    expect(historyProbes).toBe(1);
+  });
+
+  it("does not confirm contradictory success plus interruption history", async () => {
+    const promptId = "cancel-race-contradictory";
+    const confirmations: string[] = [];
+    const transport = new FakeComfyUITransport({
+      promptId,
+      queueRunning: [{ prompt_id: promptId }],
+      history: makeTerminalHistory(promptId, "success", true, "execution_interrupted"),
+    });
+    const orchestrator = new ComfyUIExecutionOrchestrator(
+      transport,
+      defaultBackendFeatures(),
+      {
+        onPhaseChange: (phase) => {
+          if (phase === "EXTERNAL_RUNNING") void orchestrator.requestCancel();
+        },
+        onCancellationConfirmed: (evidence) => { confirmations.push(evidence.source); },
+      },
+      { ...fastConfig(), totalExecutionTimeoutMs: 200 },
+    );
+
+    const result = await orchestrator.execute(workflow);
+
+    expect(result.phase).toBe("FAILED");
+    expect(result.needsAttention).toBe(true);
+    expect(confirmations).toEqual([]);
   });
 });

@@ -136,5 +136,21 @@ class ImportSafetyTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
 
 
+class InterruptPolicyScopeTests(unittest.TestCase):
+    def test_ignores_tests_but_reports_production_calls_outside_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            policy = root / "src/lib/generation/transports/comfyui-cancellation.ts"
+            test_file = root / "src/lib/generation/transports/__tests__/transport.test.ts"
+            production = root / "src/lib/generation/worker-executor.ts"
+            for file in [policy, test_file, production]:
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text("await client.interrupt();\n", encoding="utf-8")
+
+            calls = pr12_static_checks.find_production_interrupt_calls(root)
+
+        self.assertEqual(calls, ["src/lib/generation/worker-executor.ts"])
+
+
 if __name__ == "__main__":
     unittest.main()

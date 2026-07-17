@@ -1,11 +1,15 @@
 export {
   ComfyUIHttpTransport,
+  ComfyUIOperationError,
+  ComfyUIOperationDeadlineError,
+  parseComfyUIOperationTimeouts,
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
   probeModelFolder,
   probeQueueStatus,
   probeHistory,
+  classifyComfyHistory,
   createComfyUITransport,
 } from "./comfyui";
 export type {
@@ -14,9 +18,12 @@ export type {
   ComfyPromptResponse,
   ComfyProgress,
   ComfyExecutionResult,
+  ComfyHistoryOutcome,
   ComfySystemInfo,
   ComfyObjectInfo,
   ComfyWSMessage,
+  ComfyUIOperationOptions,
+  ComfyUISubmissionDisposition,
 } from "./comfyui";
 
 export {
@@ -68,10 +75,11 @@ export type {
   ReconciliationConfig,
 } from "./comfyui-reconciliation";
 
-export { ComfyUIExecutionOrchestrator } from "./comfyui-execution-orchestrator";
+export { ComfyUIExecutionOrchestrator, ExecutionCallbackPersistenceError } from "./comfyui-execution-orchestrator";
 export type {
   OrchestratorPhase,
   ExecutionCallbacks,
+  ExternalTerminationEvidence,
   ExecutionConfig,
   OrchestratorResult,
 } from "./comfyui-execution-orchestrator";

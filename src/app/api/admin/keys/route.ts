@@ -9,6 +9,7 @@ import {
   readRequiredString,
   readEnum,
   encryptSecret,
+  assertSafeBackendHeaderValue,
 
   readJsonBodyLimited,
 } from "@/lib/security";
@@ -46,6 +47,7 @@ export async function POST(req: NextRequest) {
     const label = readRequiredString(body, "label", { maxLength: 120 });
     const keyType = readEnum(body, "keyType", KEY_TYPES);
     const secretValue = readRequiredString(body, "secretValue", { maxLength: 64 * 1024 });
+    assertSafeBackendHeaderValue(keyType, secretValue);
     const now = Date.now();
     const id = genId();
     await db.insert(keyReferences).values({

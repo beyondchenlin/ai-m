@@ -25,6 +25,13 @@ function coerce(value: unknown, binding: CompiledBinding): unknown {
     }
     if (binding.minimum !== undefined && numberValue < binding.minimum) throw new WorkflowBindingError(`${binding.key} is below minimum ${binding.minimum}`);
     if (binding.maximum !== undefined && numberValue > binding.maximum) throw new WorkflowBindingError(`${binding.key} exceeds maximum ${binding.maximum}`);
+    if (binding.step !== undefined) {
+      const steps = (numberValue - (binding.minimum ?? 0)) / binding.step;
+      const tolerance = Number.EPSILON * 16 * Math.max(1, Math.abs(steps));
+      if (Math.abs(steps - Math.round(steps)) > tolerance) {
+        throw new WorkflowBindingError(`${binding.key} must align to step ${binding.step}`);
+      }
+    }
     return numberValue;
   }
   return structuredClone(value);

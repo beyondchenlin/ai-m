@@ -17,6 +17,8 @@ import type {
 import type { BackendFeatureSnapshot } from "@/lib/generation/transports/comfyui-behavior-probe";
 
 export interface FakeTransportScenario {
+  /** Stable fake backend identity; different prompt IDs may share one connection. */
+  connectionIdentity?: string;
   /** 提交 /prompt 时抛出的错误，优先级最高 */
   submitError?: Error;
   /** 提交返回的 promptId */
@@ -35,6 +37,7 @@ export interface FakeTransportScenario {
   fileBytes?: ArrayBuffer;
   /** /view 返回的状态码 */
   fileStatus?: number;
+  fileHeaders?: HeadersInit;
   /** /system_stats 返回内容 */
   systemInfo?: ComfySystemInfo;
   /** /object_info 返回内容 */
@@ -209,13 +212,23 @@ export class FakeComfyUITransport implements ComfyUITransport {
     return { name: input.filename, subfolder: input.subfolder ?? "", type: "input" };
   }
 
-  async getFile(): Promise<Response> {
+  async getFile(
+    params?: { filename: string; subfolder: string; type: string },
+    options?: import("@/lib/generation/transports/comfyui").ComfyUIOperationOptions,
+  ): Promise<Response> {
+    void params;
+    void options;
     const bytes = this.scenario.fileBytes ?? new ArrayBuffer(0);
-    return new Response(bytes, { status: this.scenario.fileStatus ?? 200 });
+    return new Response(bytes, { status: this.scenario.fileStatus ?? 200, headers: this.scenario.fileHeaders });
   }
 
-  connectWebSocket(): WebSocket {
-    return new FakeWebSocket();
+  getWebSocketFactory() {
+    const identity = this.scenario.connectionIdentity ?? "default";
+    return Object.freeze({
+      canonicalEndpoint: "http://fake-comfyui.test",
+      registryKey: `fake-comfyui:${identity}`,
+      open: (clientId: string) => new FakeWebSocket(`ws://fake-comfyui.test/ws?clientId=${encodeURIComponent(clientId)}`),
+    });
   }
 
   async cancel(): Promise<void> {}

@@ -46,7 +46,7 @@ export function parseCompiledBindings(value: unknown): CompiledBindings {
   const bindingKeys = new Set<string>();
   const bindings: CompiledBinding[] = root.bindings.map((item, index) => {
     const entry = record(item, `bindings[${index}]`);
-    const allowed = new Set(["key", "inputName", "valueType", "source", "required", "userOverride", "default", "minimum", "maximum", "nodeId", "classType"]);
+    const allowed = new Set(["key", "inputName", "valueType", "source", "required", "userOverride", "default", "minimum", "maximum", "step", "nodeId", "classType"]);
     const unknown = Object.keys(entry).filter((key) => !allowed.has(key));
     if (unknown.length) throw new CompiledBindingsError(`bindings[${index}] has unknown field(s): ${unknown.join(", ")}`);
     const key = text(entry.key, `bindings[${index}].key`, /^[A-Za-z][A-Za-z0-9_.-]*$/);
@@ -58,7 +58,12 @@ export function parseCompiledBindings(value: unknown): CompiledBindings {
     if (!["request", "reference-image", "voice-reference"].includes(source)) throw new CompiledBindingsError(`unsupported compiled binding source: ${source}`);
     const minimum = optionalNumber(entry.minimum, `bindings[${index}].minimum`);
     const maximum = optionalNumber(entry.maximum, `bindings[${index}].maximum`);
+    const step = optionalNumber(entry.step, `bindings[${index}].step`);
     if (minimum !== undefined && maximum !== undefined && maximum < minimum) throw new CompiledBindingsError(`bindings[${index}] maximum is below minimum`);
+    if (step !== undefined && step <= 0) throw new CompiledBindingsError(`bindings[${index}].step must be positive`);
+    if ((minimum !== undefined || maximum !== undefined || step !== undefined) && !["integer", "number"].includes(valueType)) {
+      throw new CompiledBindingsError(`bindings[${index}] numeric limits require integer or number valueType`);
+    }
     return {
       key,
       inputName: text(entry.inputName, `bindings[${index}].inputName`),
@@ -69,6 +74,7 @@ export function parseCompiledBindings(value: unknown): CompiledBindings {
       ...(entry.default !== undefined ? { default: structuredClone(entry.default) } : {}),
       ...(minimum !== undefined ? { minimum } : {}),
       ...(maximum !== undefined ? { maximum } : {}),
+      ...(step !== undefined ? { step } : {}),
       nodeId: text(entry.nodeId, `bindings[${index}].nodeId`, /^\d+$/),
       classType: text(entry.classType, `bindings[${index}].classType`),
     };

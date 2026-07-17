@@ -12,7 +12,14 @@
  */
 
 import type { ComfyUITransport, ComfyExecutionResult, ComfyWSMessage } from "./comfyui";
-import { submitPrompt, probeHistory, probeQueueStatus } from "./comfyui";
+import {
+  classifyComfyHistory,
+  ComfyUIOperationError,
+  submitPrompt,
+  probeHistory,
+  probeQueueStatus,
+  type ComfyUISubmissionDisposition,
+} from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 import {
   ComfyUIConnectionManager,
@@ -66,6 +73,35 @@ export interface ExecutionCallbacks {
   isCancellationRequested?: () => boolean | Promise<boolean>;
   /** Records the exact cancellation method/evidence selected by policy. */
   onCancellationResult?: (result: CancellationResult) => void | Promise<void>;
+  /** Persists strong terminal evidence before the attempt may become CANCELLED. */
+  onCancellationConfirmed?: (evidence: CancellationConfirmationEvidence) => void | Promise<void>;
+  /** Persists classifier-backed external terminal evidence before ownership may be released. */
+  onExternalTerminationEvidence?: (evidence: ExternalTerminationEvidence) => void | Promise<void>;
+}
+
+export interface ExternalTerminationEvidence {
+  proofKind: "history-completed" | "history-cancelled" | "history-failed";
+  externalJobId: string;
+  observedAtMs: number;
+}
+
+export interface CancellationConfirmationEvidence {
+  outcome: "confirmed-cancelled";
+  source: "history-terminal-cancelled";
+  externalJobId: string;
+  method: CancellationResult["method"];
+  observedAtMs: number;
+}
+
+type CancellationOutcome =
+  | { outcome: "pending" | "unknown" | "completed" | "failed" }
+  | { outcome: "confirmed-cancelled"; evidence: CancellationConfirmationEvidence };
+
+/** A durable callback failed; callers must retain ownership for recovery. */
+export class ExecutionCallbackPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("execution_callback_persistence_failed", { cause });
+  }
 }
 
 /** 执行配置 */
@@ -131,6 +167,7 @@ export interface OrchestratorResult {
   errorClass?: string;
   cancellationRequested?: boolean;
   needsAttention?: boolean;
+  submissionDisposition: ComfyUISubmissionDisposition;
 }
 
 /**
@@ -150,41 +187,56 @@ export class ComfyUIExecutionOrchestrator {
   private readonly config: ExecutionConfig;
   private readonly callbacks: ExecutionCallbacks;
   private readonly connectionMgr: ComfyUIConnectionManager;
-  private readonly baseUrl: string;
+  private readonly releaseConnection: () => void;
   private readonly clientId: string;
   private readonly correlationId?: string;
 
   private phase: OrchestratorPhase = "CREATED";
   private externalJobId: string | null = null;
+  private terminalEvidenceRecorded = false;
   private cancelRequested = false;
   private cancellationDispatched = false;
+  private cancellationWithoutIdReported = false;
+  private cancellationResult: CancellationResult | null = null;
   private stopped = false;
   private startTimeMs = 0;
   private submitTimeMs = 0;
   private reconciliationCount = 0;
   private outputCollected = false;
+  private submissionDisposition: ComfyUISubmissionDisposition = "definitely-not-submitted";
+  private readonly lifecycleSignal?: AbortSignal;
+  private readonly operationController = new AbortController();
+  private readonly removeLifecycleListener?: () => void;
 
   private wsUnregister: (() => void) | null = null;
   private progressListener: (() => void) | null = null;
 
   constructor(
-    transport: ComfyUITransport & { getClientId?: () => string },
+    transport: ComfyUITransport,
     features: BackendFeatureSnapshot,
-    baseUrl: string,
     callbacks: ExecutionCallbacks = {},
     config: Partial<ExecutionConfig> = {},
     correlationId?: string,
+    lifecycleSignal?: AbortSignal,
   ) {
     this.transport = transport;
     this.features = features;
-    this.baseUrl = baseUrl;
     this.callbacks = callbacks;
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.clientId =
-      (transport as { getClientId?: () => string }).getClientId?.() ??
-      `orchestrator-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const socketFactory = transport.getWebSocketFactory();
     this.correlationId = correlationId;
-    this.connectionMgr = connectionManagerRegistry.getOrCreate(baseUrl, this.clientId);
+    this.lifecycleSignal = lifecycleSignal;
+    this.stopped = lifecycleSignal?.aborted ?? false;
+    if (lifecycleSignal?.aborted) this.operationController.abort(lifecycleSignal.reason);
+    else if (lifecycleSignal) {
+      const onAbort = () => this.stop(lifecycleSignal.reason);
+      lifecycleSignal.addEventListener("abort", onAbort, { once: true });
+      this.removeLifecycleListener = () => lifecycleSignal.removeEventListener("abort", onAbort);
+    }
+    const lease = connectionManagerRegistry.acquire(socketFactory);
+    this.connectionMgr = lease.manager;
+    this.clientId = lease.clientId;
+    this.releaseConnection = lease.release;
   }
 
   /**
@@ -195,11 +247,13 @@ export class ComfyUIExecutionOrchestrator {
    */
   async execute(workflow: Record<string, unknown>): Promise<OrchestratorResult> {
     this.startTimeMs = Date.now();
-    this.stopped = false;
 
     try {
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
       await this.setPhase("SUBMITTING");
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
       await this.connectionMgr.connect();
+      if (this.stopped || this.lifecycleSignal?.aborted) return this.buildResult("Execution lifecycle ended", "ownership_lost");
 
       const submitResult = await this.submitWithTimeout(workflow);
       if (!submitResult.success) {
@@ -236,6 +290,7 @@ export class ComfyUIExecutionOrchestrator {
       await this.setPhase("SUCCEEDED");
       return this.buildResult();
     } catch (err) {
+      if (err instanceof ExecutionCallbackPersistenceError) throw err;
       const error = err instanceof Error ? err : new Error(String(err));
       const classification = classifySubmissionError(error);
       await this.callbacks.onError?.(error, classification.errorClass);
@@ -254,19 +309,25 @@ export class ComfyUIExecutionOrchestrator {
       const result: CancellationResult = {
         requested: false,
         method: "none",
-        safeMessage: "Cancellation recorded before an external job ID was assigned",
-        needsReconciliation: false,
+        safeMessage: "Cancellation is awaiting correlation reconciliation for an external job ID",
+        needsReconciliation: true,
+        evidenceKind: "unknown",
       };
-      await this.callbacks.onCancellationResult?.(result);
+      this.cancellationResult = result;
+      if (!this.cancellationWithoutIdReported) {
+        this.cancellationWithoutIdReported = true;
+        await this.callbacks.onCancellationResult?.(result);
+      }
       return result;
     }
 
     if (this.cancellationDispatched) {
-      return {
+      return this.cancellationResult ?? {
         requested: true,
         method: "none",
         safeMessage: "Cancellation was already dispatched; awaiting reconciliation",
         needsReconciliation: true,
+        evidenceKind: "unknown",
       };
     }
 
@@ -274,13 +335,15 @@ export class ComfyUIExecutionOrchestrator {
     const result = await safeCancelJob(this.transport, this.features, this.externalJobId, {
       isShared: this.config.isSharedBackend,
     });
+    this.cancellationResult = result;
     await this.callbacks.onCancellationResult?.(result);
     return result;
   }
 
   /** 停止编排器（内部使用） */
-  stop(): void {
+  stop(reason?: unknown): void {
     this.stopped = true;
+    if (!this.operationController.signal.aborted) this.operationController.abort(reason);
   }
 
   private async setPhase(phase: OrchestratorPhase): Promise<void> {
@@ -292,17 +355,15 @@ export class ComfyUIExecutionOrchestrator {
   private async submitWithTimeout(
     workflow: Record<string, unknown>,
   ): Promise<{ success: boolean; needsReconciliation: boolean }> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Do not abort the underlying request on timeout: the server may already
-      // have accepted the prompt.  A local timeout is therefore classified as
-      // submission-unknown and reconciled by correlation ID.
-      const result = await Promise.race([
-        submitPrompt(this.transport, workflow, this.clientId, this.correlationId),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error("submission_timeout")), this.config.submitTimeoutMs);
-        }),
-      ]);
+      const result = await submitPrompt(
+        this.transport,
+        workflow,
+        this.clientId,
+        this.correlationId,
+        { timeoutMs: this.config.submitTimeoutMs, signal: this.operationController.signal },
+      );
+      this.submissionDisposition = "definitely-submitted";
       this.externalJobId = result.promptId;
       await this.callbacks.onExternalJobId?.(result.promptId);
       this.submitTimeMs = Date.now();
@@ -311,23 +372,34 @@ export class ComfyUIExecutionOrchestrator {
       const error = err instanceof Error ? err : new Error(String(err));
       const classification = classifySubmissionError(error);
 
+      if (error instanceof ComfyUIOperationError) {
+        this.submissionDisposition = error.submissionDisposition;
+        if (error.submissionDisposition === "definitely-not-submitted") {
+          this.phase = "FAILED";
+          await this.callbacks.onError?.(error, "submission_not_sent");
+          return { success: false, needsReconciliation: false };
+        }
+        this.submitTimeMs = Date.now();
+        return { success: false, needsReconciliation: true };
+      }
+
       if (
         error.message.includes("timeout") ||
         error.message.includes("aborted") ||
         error.message.includes("Failed to fetch") ||
         classification.errorClass === "network_error"
       ) {
+        this.submissionDisposition = "submission-uncertain";
         this.submitTimeMs = Date.now();
         return { success: false, needsReconciliation: true };
       }
 
       if (classification.retryable) {
+        this.submissionDisposition = "submission-uncertain";
         return { success: false, needsReconciliation: true };
       }
 
       throw error;
-    } finally {
-      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -335,7 +407,7 @@ export class ComfyUIExecutionOrchestrator {
     await new Promise((r) => setTimeout(r, this.config.reconciliationGraceMs));
 
     while (!this.stopped && this.reconciliationCount < this.config.maxReconciliationAttempts) {
-      if (await this.refreshCancellationState()) { this.phase = "CANCELLED"; return false; }
+      await this.refreshCancellationState();
 
       this.reconciliationCount++;
 
@@ -348,24 +420,39 @@ export class ComfyUIExecutionOrchestrator {
           maxAttempts: this.config.maxReconciliationAttempts,
         },
         this.correlationId,
+        { signal: this.operationController.signal },
       );
 
       // 对账过程中发现了外部任务编号（提交响应丢失场景）
       if (result.discoveredExternalJobId && !this.externalJobId) {
         this.externalJobId = result.discoveredExternalJobId;
         await this.callbacks.onExternalJobId?.(result.discoveredExternalJobId);
+        if (this.cancelRequested) await this.requestCancel();
       }
 
       await this.callbacks.onReconciliation?.(result);
 
       if (result.exists && result.externalStatus) {
+        this.submissionDisposition = "definitely-submitted";
         if (result.externalStatus === "queued" || result.externalStatus === "running") {
           return true;
         }
         if (result.externalStatus === "completed") {
+          await this.recordHistoryTermination("completed");
           return true;
         }
+        if (result.externalStatus === "cancelled") {
+          const cancellation = this.classifyCancellationHistory(result.executionResult);
+          if (this.cancelRequested && cancellation?.outcome === "confirmed-cancelled") {
+            await this.confirmCancellation(cancellation);
+            return false;
+          }
+          await this.recordHistoryTermination("cancelled");
+          this.phase = "FAILED";
+          return false;
+        }
         if (result.externalStatus === "failed") {
+          await this.recordHistoryTermination("failed");
           this.phase = "FAILED";
           return false;
         }
@@ -379,7 +466,7 @@ export class ComfyUIExecutionOrchestrator {
       const delay = nextReconciliationDelay(this.reconciliationCount, {
         intervalMs: this.config.reconciliationIntervalMs,
       });
-      await this.sleepCancellable(delay);
+      await this.sleepCancellable(delay, false);
     }
 
     this.phase = "FAILED";
@@ -395,9 +482,17 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation === "completed") return true;
-        if (cancellation === "cancelled") {
-          this.phase = "CANCELLED";
+        if (cancellation.outcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
+        if (cancellation.outcome === "failed") {
+          await this.recordHistoryTermination("failed");
+          this.phase = "FAILED";
+          return false;
+        }
+        if (cancellation.outcome === "confirmed-cancelled") {
+          await this.confirmCancellation(cancellation);
           return false;
         }
       }
@@ -408,16 +503,25 @@ export class ComfyUIExecutionOrchestrator {
       }
 
       try {
-        const data = await probeQueueStatus(this.transport);
+        const data = await probeQueueStatus(this.transport, undefined, { signal: this.operationController.signal });
         {
           const running = data.queueRunning.some((q) => q.promptId === this.externalJobId);
           if (running) {
             return true;
           }
 
-          const history = await probeHistory(this.transport, this.externalJobId);
-          if (history[this.externalJobId!]) {
+          const history = await probeHistory(
+            this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+          );
+          const historyOutcome = classifyComfyHistory(history[this.externalJobId!]);
+          if (historyOutcome === "completed") {
+            await this.recordHistoryTermination("completed");
             return true;
+          }
+          if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+            await this.recordHistoryTermination(historyOutcome);
+            this.phase = "FAILED";
+            return false;
           }
         }
       } catch {
@@ -443,9 +547,17 @@ export class ComfyUIExecutionOrchestrator {
     while (!this.stopped) {
       if (await this.refreshCancellationState()) {
         const cancellation = await this.resolveCancellationOutcome();
-        if (cancellation === "completed") return true;
-        if (cancellation === "cancelled") {
-          this.phase = "CANCELLED";
+        if (cancellation.outcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
+        if (cancellation.outcome === "failed") {
+          await this.recordHistoryTermination("failed");
+          this.phase = "FAILED";
+          return false;
+        }
+        if (cancellation.outcome === "confirmed-cancelled") {
+          await this.confirmCancellation(cancellation);
           return false;
         }
       }
@@ -456,16 +568,18 @@ export class ComfyUIExecutionOrchestrator {
       }
 
       try {
-        const history = await probeHistory(this.transport, this.externalJobId);
-        if (history[this.externalJobId]) {
-          const result = history[this.externalJobId];
-          if (result.status.completed) {
-            if (result.status.statusStr === "error") {
-              this.phase = "FAILED";
-              return false;
-            }
-            return true;
-          }
+        const history = await probeHistory(
+          this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+        );
+        const historyOutcome = classifyComfyHistory(history[this.externalJobId]);
+        if (historyOutcome === "completed") {
+          await this.recordHistoryTermination("completed");
+          return true;
+        }
+        if (historyOutcome === "failed" || historyOutcome === "cancelled") {
+          await this.recordHistoryTermination(historyOutcome);
+          this.phase = "FAILED";
+          return false;
         }
       } catch {
         // 轮询失败继续
@@ -494,10 +608,20 @@ export class ComfyUIExecutionOrchestrator {
   private async collectOutputs(): Promise<boolean> {
     if (!this.externalJobId) return false;
 
-    const startTime = Date.now();
+    const collectionDeadlineMs = Date.now() + this.config.collectionTimeoutMs;
+    const remainingCollectionMs = () => {
+      const remaining = collectionDeadlineMs - Date.now();
+      if (remaining <= 0) throw new Error("ComfyUI collection operation deadline exceeded");
+      return remaining;
+    };
 
     try {
-      const history = await probeHistory(this.transport, this.externalJobId);
+      const history = await probeHistory(
+        this.transport,
+        this.externalJobId,
+        undefined,
+        { timeoutMs: remainingCollectionMs(), signal: this.operationController.signal },
+      );
       const result = history[this.externalJobId];
 
       if (!result) {
@@ -515,7 +639,7 @@ export class ComfyUIExecutionOrchestrator {
         if (!output) continue;
         // Once ComfyUI reports completion, committed output wins the cancel race.
         // Continue collecting immutable outputs instead of discarding completed work.
-        if (Date.now() - startTime > this.config.collectionTimeoutMs) {
+        if (Date.now() >= collectionDeadlineMs) {
           this.phase = "FAILED";
           return false;
         }
@@ -563,7 +687,10 @@ export class ComfyUIExecutionOrchestrator {
             if (!this.callbacks.onOutputStream) {
               throw new Error("A streaming output consumer is required");
             }
-            const response = await this.transport.getFile(file);
+            const response = await this.transport.getFile(file, {
+              timeoutMs: remainingCollectionMs(),
+              signal: this.operationController.signal,
+            });
             if (!response.ok || !response.body) {
               throw new Error(`Output download failed (${response.status})`);
             }
@@ -572,6 +699,7 @@ export class ComfyUIExecutionOrchestrator {
               filename: file.filename, subfolder: file.subfolder, type: file.type, response,
             });
           } catch (error) {
+            if (error instanceof ExecutionCallbackPersistenceError) throw error;
             const failure = error instanceof Error ? error : new Error(String(error));
             await this.callbacks.onError?.(failure, "collection_error");
             return false;
@@ -586,6 +714,7 @@ export class ComfyUIExecutionOrchestrator {
       this.outputCollected = true;
       return true;
     } catch (err) {
+      if (err instanceof ExecutionCallbackPersistenceError) throw err;
       const error = err instanceof Error ? err : new Error(String(err));
       await this.callbacks.onError?.(error, "collection_error");
       return false;
@@ -618,47 +747,104 @@ export class ComfyUIExecutionOrchestrator {
     );
   }
 
-  private async resolveCancellationOutcome(): Promise<"pending" | "cancelled" | "completed"> {
-    if (!this.cancelRequested) return "pending";
-    if (!this.externalJobId) return "cancelled";
+  private async resolveCancellationOutcome(): Promise<CancellationOutcome> {
+    if (!this.cancelRequested) return { outcome: "pending" };
+    if (!this.externalJobId) return { outcome: "unknown" };
 
     try {
-      const history = await probeHistory(this.transport, this.externalJobId);
+      const history = await probeHistory(
+        this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+      );
       const result = history[this.externalJobId];
-      if (result?.status.completed) {
-        return result.status.statusStr === "error" ? "cancelled" : "completed";
-      }
+      const terminal = this.classifyCancellationHistory(result);
+      if (terminal) return terminal;
     } catch {
       // Fall through to queue evidence.
     }
 
     try {
-      const queue = await probeQueueStatus(this.transport);
+      const queue = await probeQueueStatus(this.transport, undefined, { signal: this.operationController.signal });
       const ids = [...queue.queueRunning, ...queue.queuePending].map((entry) => entry.promptId);
-      if (!ids.includes(this.externalJobId)) return "cancelled";
+      if (ids.includes(this.externalJobId)) return { outcome: "pending" };
+      const history = await probeHistory(
+        this.transport, this.externalJobId, undefined, { signal: this.operationController.signal },
+      );
+      const terminal = this.classifyCancellationHistory(history[this.externalJobId]);
+      if (terminal) return terminal;
     } catch {
       // Absence of evidence is not evidence of cancellation.
     }
-    return "pending";
+    return { outcome: "unknown" };
+  }
+
+  private classifyCancellationHistory(result: ComfyExecutionResult | undefined): CancellationOutcome | null {
+    const historyOutcome = classifyComfyHistory(result);
+    if (historyOutcome === "cancelled") {
+      return {
+        outcome: "confirmed-cancelled",
+        evidence: {
+          outcome: "confirmed-cancelled",
+          source: "history-terminal-cancelled",
+          externalJobId: this.externalJobId!,
+          method: this.cancellationResult?.method ?? "none",
+          observedAtMs: Date.now(),
+        },
+      };
+    }
+
+    if (historyOutcome === "failed") return { outcome: "failed" };
+    if (historyOutcome === "completed") return { outcome: "completed" };
+    return null;
+  }
+
+  private async confirmCancellation(
+    cancellation: Extract<CancellationOutcome, { outcome: "confirmed-cancelled" }>,
+  ): Promise<void> {
+    await this.recordHistoryTermination("cancelled", cancellation.evidence.observedAtMs);
+    await this.callbacks.onCancellationConfirmed?.(cancellation.evidence);
+    this.phase = "CANCELLED";
+  }
+
+  private async recordHistoryTermination(
+    outcome: "completed" | "cancelled" | "failed",
+    observedAtMs = Date.now(),
+  ): Promise<void> {
+    if (this.terminalEvidenceRecorded) return;
+    if (!this.externalJobId) throw new Error("terminal_history_without_external_job_id");
+    await this.callbacks.onExternalTerminationEvidence?.({
+      proofKind: `history-${outcome}`,
+      externalJobId: this.externalJobId,
+      observedAtMs,
+    });
+    this.terminalEvidenceRecorded = true;
   }
 
   private async refreshCancellationState(): Promise<boolean> {
     if (!this.cancelRequested && (await this.callbacks.isCancellationRequested?.())) {
-      await this.requestCancel();
+      this.cancelRequested = true;
     }
+    if (this.cancelRequested && !this.cancellationDispatched) await this.requestCancel();
     return this.cancelRequested;
   }
 
-  private async sleepCancellable(ms: number): Promise<void> {
+  private async sleepCancellable(ms: number, interruptOnCancellation = true): Promise<void> {
+    if (!interruptOnCancellation) {
+      await this.refreshCancellationState();
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return;
+    }
     const interval = 100;
     const steps = Math.ceil(ms / interval);
     for (let i = 0; i < steps && !this.stopped; i++) {
-      if (await this.refreshCancellationState()) break;
+      const cancellationWasRequested = this.cancelRequested;
+      const cancellationRequested = await this.refreshCancellationState();
+      if (cancellationRequested && !cancellationWasRequested && interruptOnCancellation) break;
       await new Promise((r) => setTimeout(r, interval));
     }
   }
 
   private cleanup(): void {
+    this.removeLifecycleListener?.();
     if (this.wsUnregister) {
       this.wsUnregister();
       this.wsUnregister = null;
@@ -670,6 +856,7 @@ export class ComfyUIExecutionOrchestrator {
       this.progressListener();
       this.progressListener = null;
     }
+    this.releaseConnection();
   }
 
   private buildResult(errorMessage?: string, errorClass?: string): OrchestratorResult {
@@ -684,6 +871,7 @@ export class ComfyUIExecutionOrchestrator {
         (this.phase === "FAILED" && (this.reconciliationCount > 0 || this.cancelRequested))
         || (this.stopped && Boolean(this.externalJobId) && this.phase !== "SUCCEEDED" && this.phase !== "CANCELLED"),
       outputs: this.outputCollected ? [] : undefined,
+      submissionDisposition: this.submissionDisposition,
     };
   }
 }

@@ -153,6 +153,22 @@ function mutate(
 }
 
 describe("worker startup command contract", () => {
+  it("establishes worker identity before startup and periodic artifact recovery", () => {
+    const identity = workerSource.indexOf("const WORKER_ID =");
+    const schemaReady = workerSource.indexOf("await waitForCurrentMigrationBundle()");
+    const recoveryCall = /recoverStagingArtifacts\(\{\s*recoveryOwner: WORKER_ID/g;
+    const startupRecovery = workerSource.slice(schemaReady).search(recoveryCall);
+    expect(identity).toBeGreaterThanOrEqual(0);
+    expect(schemaReady).toBeGreaterThan(identity);
+    expect(startupRecovery).toBeGreaterThan(0);
+    expect(workerSource.match(recoveryCall)).toHaveLength(2);
+  });
+
+  it("waits for the complete validated migration journal instead of table presence", () => {
+    expect(workerSource).toContain("await waitForCurrentMigrationBundle(");
+    expect(workerSource).not.toContain("SELECT name FROM sqlite_master WHERE type='table'");
+  });
+
   it.each([
     ['double-quoted operator', 'node "&&" tsx', [["node", "&&", "tsx"]]],
     ["single-quoted operator", "node '&&' tsx", [["node", "&&", "tsx"]]],

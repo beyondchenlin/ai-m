@@ -222,9 +222,11 @@ def main() -> int:
         if token not in materializer:
             raise AssertionError(f"input materializer is missing {token}")
     worker = require("src/worker/index.ts")
-    for token in ["cleanupTerminalSharedInputs", "source_media_assets", "generation_job_source_assets"]:
+    for token in ["cleanupTerminalSharedInputs", "recoverSourceMediaAssets", "waitForCurrentMigrationBundle"]:
         if token not in worker:
             raise AssertionError(f"worker readiness/recovery is missing {token}")
+    if "sqlite_master WHERE type='table'" in worker:
+        raise AssertionError("worker readiness must use the validated migration journal, not table-name presence")
 
     source_route = require("src/app/api/source-assets/[id]/route.ts")
     for token in ["verifyOwnedSourceAssetFile", "Accept-Ranges", "export async function DELETE"]:

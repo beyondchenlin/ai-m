@@ -644,7 +644,58 @@ export const resourcePoolSlots = sqliteTable("resource_pool_slots", {
   fencingToken: integer("fencing_token").notNull().default(0),
   expiresAtMs: integer("expires_at_ms"),
   updatedAtMs: integer("updated_at_ms").notNull(),
-});
+}, (table) => [
+  uniqueIndex("resource_pool_slots_owner_attempt_unique")
+    .on(table.ownerAttemptId)
+    .where(sql`${table.ownerAttemptId} IS NOT NULL`),
+]);
+
+export const resourceReconciliationProofs = sqliteTable("resource_reconciliation_proofs", {
+  id: text("id").primaryKey(),
+  attemptId: text("attempt_id")
+    .notNull()
+    .references(() => generationAttempts.id, { onDelete: "cascade" }),
+  backendId: text("backend_id")
+    .notNull()
+    .references(() => executionBackends.id, { onDelete: "restrict" }),
+  externalJobId: text("external_job_id").notNull(),
+  proofKind: text("proof_kind", {
+    enum: ["history-completed", "history-cancelled", "history-failed"],
+  }).notNull(),
+  observedAtMs: integer("observed_at_ms").notNull(),
+  resourcePoolId: text("resource_pool_id")
+    .notNull()
+    .references(() => resourcePools.id, { onDelete: "restrict" }),
+  resourceSlotNo: integer("resource_slot_no").notNull(),
+  resourceLeaseToken: text("resource_lease_token").notNull(),
+  resourceFencingToken: integer("resource_fencing_token").notNull(),
+  disposition: text("disposition", { enum: ["retained", "reconciled"] })
+    .notNull().default("retained"),
+  reconciledAtMs: integer("reconciled_at_ms"),
+  createdAtMs: integer("created_at_ms").notNull(),
+}, (table) => [
+  uniqueIndex("resource_reconciliation_proofs_lease_unique").on(
+    table.attemptId,
+    table.resourcePoolId,
+    table.resourceSlotNo,
+    table.resourceLeaseToken,
+    table.resourceFencingToken,
+  ),
+  uniqueIndex("resource_reconciliation_proofs_external_unique").on(table.backendId, table.externalJobId),
+  index("resource_reconciliation_proofs_disposition_observed_idx").on(table.disposition, table.observedAtMs),
+  index("resource_reconciliation_proofs_attempt_idx").on(table.attemptId),
+  check("resource_reconciliation_proofs_kind_check", sql`${table.proofKind} IN ('history-completed', 'history-cancelled', 'history-failed')`),
+  check("resource_reconciliation_proofs_observed_check", sql`${table.observedAtMs} > 0`),
+  check("resource_reconciliation_proofs_slot_check", sql`${table.resourceSlotNo} > 0`),
+  check("resource_reconciliation_proofs_lease_check", sql`length(${table.resourceLeaseToken}) > 0`),
+  check("resource_reconciliation_proofs_fence_check", sql`${table.resourceFencingToken} >= 0`),
+  check("resource_reconciliation_proofs_disposition_check", sql`${table.disposition} IN ('retained', 'reconciled')`),
+  check(
+    "resource_reconciliation_proofs_reconciled_check",
+    sql`((${table.disposition} = 'retained' AND ${table.reconciledAtMs} IS NULL) OR (${table.disposition} = 'reconciled' AND ${table.reconciledAtMs} IS NOT NULL AND ${table.reconciledAtMs} >= ${table.observedAtMs}))`,
+  ),
+  check("resource_reconciliation_proofs_created_check", sql`${table.createdAtMs} > 0`),
+]);
 
 export const generationArtifacts = sqliteTable("generation_artifacts", {
   id: text("id").primaryKey(),
@@ -656,7 +707,7 @@ export const generationArtifacts = sqliteTable("generation_artifacts", {
     enum: ["image", "video", "audio", "text", "archive"],
   }).notNull(),
   status: text("status", {
-    enum: ["STAGING", "COMMITTED", "QUARANTINED", "DELETED"],
+    enum: ["STAGING", "RECOVERING", "COMMITTED", "QUARANTINED", "DELETED"],
   }).notNull(),
   storageKey: text("storage_key").notNull().unique(),
   visibility: text("visibility", {
@@ -671,6 +722,12 @@ export const generationArtifacts = sqliteTable("generation_artifacts", {
   metadataJson: text("metadata_json", { mode: "json" }).notNull(),
   parentArtifactId: text("parent_artifact_id"),
   committedAtMs: integer("committed_at_ms"),
+  writerLeaseOwner: text("writer_lease_owner"),
+  writerLeaseToken: text("writer_lease_token"),
+  writerLeaseExpiresAtMs: integer("writer_lease_expires_at_ms"),
+  recoveryLeaseOwner: text("recovery_lease_owner"),
+  recoveryLeaseToken: text("recovery_lease_token"),
+  recoveryLeaseExpiresAtMs: integer("recovery_lease_expires_at_ms"),
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 });

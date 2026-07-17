@@ -1,5 +1,7 @@
 # AI Comic Builder
 
+Pixelle 单端口 ComfyUI 的当前代际盘点、真实验证、整体重启与重连流程见 [docs/comfyui-single-endpoint/README.md](docs/comfyui-single-endpoint/README.md)。`workflow:verify:pixelle-single` 默认仅执行 inventory，不会提交任务或重启后端。
+
 
 社区交流：[https://linux.do/](https://linux.do/)
 
@@ -93,6 +95,12 @@ corepack pnpm worker:dev
 corepack pnpm worker:build
 corepack pnpm worker
 ```
+
+See [Artifact completeness guarantees and limits](docs/artifact-completeness.md) before relying on archived media as evidence of a complete upstream response.
+
+#### Legacy artifact recovery cutoff
+
+During a mixed-version rollout, leave `AI_M_LEGACY_ARTIFACT_RECOVERY_BEFORE_MS` unset so new workers never claim lease-less artifacts from old writers. After every pre-0062 writer is confirmed drained, an operator may set it to an epoch-millisecond cutoff; only legacy rows created at or before that cutoff become eligible for fenced recovery. Invalid or future values fail closed.
 
 ### 构建版本信息
 

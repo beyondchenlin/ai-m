@@ -5,6 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { buildSync } from "esbuild";
 import {
   LEGACY_VISUAL_SUBJECT_MIGRATION_TIMESTAMP,
@@ -17,11 +18,75 @@ import {
   loadValidatedMigrationBundle,
   prepareMigrationJournal,
   resolveMigrationsFolder,
+  waitForCurrentMigrationBundle,
 } from "../index";
+import {
+  MIGRATION_PRECONDITION_REGISTRY,
+  validateMigrationPreconditionRegistry,
+} from "../migration-preconditions";
 
 describe("migration journal startup ordering", () => {
   const repositoryMigrations = readMigrationFiles({ migrationsFolder: path.resolve("drizzle") });
   const repositoryBundle = loadValidatedMigrationBundle(path.resolve("drizzle"));
+  const OLD_0060_HASH = "92abf3be9aac6c6591cd7c5ca7cc9527cf42baa04bd79b4aeb6790797dadef23";
+  const OLD_0060_TIMESTAMP = 1784209200000;
+  const PUBLISHED_0061_HASH = "1616ca4c54d5af31ced5ca321a016f3124a0dc2b36a1941c4710e3ade010221f";
+
+  it("preserves exact published 0060 bytes and binds the precondition to additive 0061", () => {
+    expect(createHash("sha256").update(fs.readFileSync(
+      path.resolve("drizzle/0060_resource_reconciliation_proof.sql"),
+    )).digest("hex")).toBe(OLD_0060_HASH);
+    expect(repositoryBundle.migrations[60]).toMatchObject({
+      folderMillis: OLD_0060_TIMESTAMP,
+      hash: OLD_0060_HASH,
+    });
+    expect(createHash("sha256").update(fs.readFileSync(
+      path.resolve("drizzle/0061_resource_slot_owner_unique.sql"),
+    )).digest("hex")).toBe(PUBLISHED_0061_HASH);
+    expect(repositoryBundle.migrations).toHaveLength(63);
+    expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hash }) => ({ folderMillis, hash })))
+      .toEqual([{
+        folderMillis: repositoryBundle.migrations[61].folderMillis,
+        hash: repositoryBundle.migrations[61].hash,
+      }]);
+    expect(() => validateMigrationPreconditionRegistry(
+      repositoryBundle.migrations,
+      MIGRATION_PRECONDITION_REGISTRY,
+    )).not.toThrow();
+    expect(() => validateMigrationPreconditionRegistry(
+      repositoryBundle.migrations.map((migration, index) => index === 61
+        ? { ...migration, hash: "changed-0061-hash" }
+        : migration),
+      MIGRATION_PRECONDITION_REGISTRY,
+    )).toThrow(/precondition registry.*exact migration identity/i);
+  });
+
+  function databaseRecordedThroughPublished0060(): Database.Database {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const insert = sqlite.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+    for (const migration of repositoryBundle.migrations.slice(0, 60)) {
+      for (const statement of migration.sql ?? []) sqlite.exec(statement);
+      insert.run(migration.hash, migration.folderMillis);
+    }
+    const candidate0060 = repositoryBundle.migrations[60];
+    for (const statement of candidate0060.sql ?? []) {
+      if (!statement.includes("resource_pool_slots_owner_attempt_unique")) sqlite.exec(statement);
+    }
+    insert.run(OLD_0060_HASH, OLD_0060_TIMESTAMP);
+    return sqlite;
+  }
+
+  function databaseRecordedThroughPublished0061(): Database.Database {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    const insert = sqlite.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+    for (const migration of repositoryBundle.migrations.slice(0, 62)) {
+      for (const statement of migration.sql ?? []) sqlite.exec(statement);
+      insert.run(migration.hash, migration.folderMillis);
+    }
+    return sqlite;
+  }
 
   function legacyVisualDatabase(rows: Array<{ hash: string; createdAt: number }>): Database.Database {
     const sqlite = new Database(":memory:");
@@ -173,8 +238,9 @@ describe("migration journal startup ordering", () => {
     sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
     try {
       prepareMigrationJournal(sqlite, repositoryMigrations);
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(60);
-      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(repositoryMigrations.length);
+      expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+        .toEqual({ count: repositoryMigrations.length });
     } finally { sqlite.close(); }
   });
 
@@ -360,7 +426,8 @@ describe("migration journal startup ordering", () => {
       await Promise.all(runs);
       const sqlite = new Database(filename);
       try {
-        expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get()).toEqual({ count: 60 });
+        expect(sqlite.prepare('SELECT COUNT(*) count FROM "__drizzle_migrations"').get())
+          .toEqual({ count: repositoryMigrations.length });
       } finally { sqlite.close(); }
     } finally { fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
   }, 30_000);
@@ -452,11 +519,140 @@ describe("migration journal startup ordering", () => {
       const sqlite = new Database(":memory:");
       sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
       try {
-        expect(applyPendingMigrations(sqlite, bundle)).toBe(60);
+        expect(applyPendingMigrations(sqlite, bundle)).toBe(bundle.migrations.length);
         expect(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='disk_mutation_was_executed'").get())
           .toBeUndefined();
       } finally { sqlite.close(); }
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("upgrades a database recorded through published 0060 by applying additive 0061 and 0062", () => {
+    const sqlite = databaseRecordedThroughPublished0060();
+    try {
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 63 });
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[number], { hash: string }>(
+        'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+    } finally { sqlite.close(); }
+  });
+
+  it("aborts 0061 before DDL or journal writes on duplicate owners and retries after repair", () => {
+    const sqlite = databaseRecordedThroughPublished0060();
+    try {
+      sqlite.pragma("foreign_keys = OFF");
+      sqlite.exec(`
+        INSERT INTO resource_pool_slots
+          (resource_pool_id, slot_no, owner_attempt_id, lease_token, fencing_token, expires_at_ms, updated_at_ms)
+        VALUES
+          ('legacy-pool-a', 1, 'legacy-attempt-duplicate', 'legacy-token-a', 7, 999999, 1),
+          ('legacy-pool-b', 2, 'legacy-attempt-duplicate', 'legacy-token-b', 9, 999999, 1)
+      `);
+
+      expect(() => applyPendingMigrations(sqlite, repositoryBundle)).toThrow(
+        /legacy-attempt-duplicate[\s\S]*legacy-pool-a[\s\S]*slot(?:_no)?=1[\s\S]*legacy-pool-b[\s\S]*slot(?:_no)?=2/i,
+      );
+      expect(sqlite.prepare(
+        "SELECT resource_pool_id, slot_no, lease_token FROM resource_pool_slots ORDER BY resource_pool_id",
+      ).all()).toEqual([
+        { resource_pool_id: "legacy-pool-a", slot_no: 1, lease_token: "legacy-token-a" },
+        { resource_pool_id: "legacy-pool-b", slot_no: 2, lease_token: "legacy-token-b" },
+      ]);
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
+      ).get()).toBeUndefined();
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='resource_reconciliation_proofs'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 61 });
+      expect(sqlite.prepare<[number], { hash: string }>(
+        'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+
+      sqlite.prepare("DELETE FROM resource_pool_slots WHERE resource_pool_id=? AND slot_no=?")
+        .run("legacy-pool-b", 2);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
+      ).get()).toBeDefined();
+      expect(sqlite.prepare<[], { count: number }>(
+        'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
+      ).get()).toEqual({ count: 63 });
+    } finally { sqlite.close(); }
+  });
+
+  it("upgrades a database recorded through published 0061 by applying only 0062", () => {
+    const sqlite = databaseRecordedThroughPublished0061();
+    try {
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      const columns = sqlite.prepare<[], { name: string }>("PRAGMA table_info('generation_artifacts')")
+        .all().map((column) => column.name);
+      expect(columns).toEqual(expect.arrayContaining([
+        "writer_lease_owner", "writer_lease_token", "writer_lease_expires_at_ms",
+        "recovery_lease_owner", "recovery_lease_token", "recovery_lease_expires_at_ms",
+      ]));
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='generation_artifacts_lease_validate_update'",
+      ).get()).toBeDefined();
+    } finally { sqlite.close(); }
+  });
+
+  it("keeps concurrent worker connections waiting at 0061 and releases both after 0062", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-worker-journal-"));
+    const databasePath = path.join(directory, "worker.sqlite");
+    const writer = new Database(databasePath);
+    const observerA = new Database(databasePath);
+    const observerB = new Database(databasePath);
+    try {
+      writer.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+      const insert = writer.prepare('INSERT INTO "__drizzle_migrations" (hash, created_at) VALUES (?, ?)');
+      for (const migration of repositoryBundle.migrations.slice(0, 62)) {
+        for (const statement of migration.sql ?? []) writer.exec(statement);
+        insert.run(migration.hash, migration.folderMillis);
+      }
+      let released = 0;
+      const waits = [observerA, observerB].map((sqlite) => waitForCurrentMigrationBundle({
+        sqlite, bundle: repositoryBundle, timeoutMs: 2_000, pollIntervalMs: 10,
+      }).then(() => { released++; }));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(released).toBe(0);
+      const migration0062 = repositoryBundle.migrations[62];
+      writer.transaction(() => {
+        for (const statement of migration0062.sql ?? []) writer.exec(statement);
+        insert.run(migration0062.hash, migration0062.folderMillis);
+      })();
+      await Promise.all(waits);
+      expect(released).toBe(2);
+    } finally {
+      observerA.close(); observerB.close(); writer.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("installs a partial unique owner index used by resource-slot owner lookups", () => {
+    const sqlite = new Database(":memory:");
+    sqlite.exec('CREATE TABLE "__drizzle_migrations" (id INTEGER PRIMARY KEY, hash text NOT NULL, created_at numeric)');
+    try {
+      applyPendingMigrations(sqlite, repositoryBundle);
+      const ownerIndex = sqlite.prepare<[], { name: string; unique: number; partial: number }>(
+        'PRAGMA index_list("resource_pool_slots")',
+      ).all().find((candidate) => candidate.name === "resource_pool_slots_owner_attempt_unique");
+      expect(ownerIndex).toMatchObject({ unique: 1, partial: 1 });
+      expect(sqlite.prepare<[], { name: string; key: number }>(
+        'PRAGMA index_xinfo("resource_pool_slots_owner_attempt_unique")',
+      ).all().filter((column) => column.key === 1).map((column) => column.name)).toEqual(["owner_attempt_id"]);
+      const plan = sqlite.prepare<[], { detail: string }>(
+        "EXPLAIN QUERY PLAN SELECT slot_no FROM resource_pool_slots WHERE owner_attempt_id='attempt-index-probe'",
+      ).all().map((row) => row.detail).join(" ");
+      expect(plan).toMatch(/resource_pool_slots_owner_attempt_unique/i);
+    } finally { sqlite.close(); }
   });
 
   it.each(["COMMIT", "ROLLBACK", "BEGIN", "SAVEPOINT x", "RELEASE x", "END", "ATTACH ':memory:' AS x", "DETACH x", "VACUUM", "PRAGMA journal_mode=DELETE"])(

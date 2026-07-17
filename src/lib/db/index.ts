@@ -11,6 +11,11 @@ import {
 } from "./migration-journal";
 import { detectJournalLessBaselineMigrationCount } from "./migration-schema-evidence";
 import { validateMigrationExecutionStatements } from "./migration-data-evidence";
+import {
+  MIGRATION_PRECONDITION_REGISTRY,
+  runMigrationPrecondition,
+  validateMigrationPreconditionRegistry,
+} from "./migration-preconditions";
 
 type DrizzleDB = ReturnType<typeof drizzle<typeof schema>>;
 type SqliteConnection = import("better-sqlite3").Database;
@@ -298,6 +303,7 @@ function readValidatedMigrationBundle(folder: string, expectedManifestDigest?: s
     }
   }
   validateMigrationExecutionStatements(migrations);
+  validateMigrationPreconditionRegistry(migrations, MIGRATION_PRECONDITION_REGISTRY);
   const bundle = Object.freeze({ folder, manifestDigest, migrations: Object.freeze(migrations) });
   validatedMigrationBundles.add(bundle);
   return bundle;
@@ -337,6 +343,7 @@ export function applyPendingMigrations(
     );
     for (const migration of migrations.slice(recordedCount)) {
       if (!migration.sql) throw new Error(`Migration ${migration.folderMillis} has no SQL metadata`);
+      runMigrationPrecondition(sqlite, migration);
       for (const statement of migration.sql) sqlite.exec(statement);
       insert.run(migration.hash, migration.folderMillis);
       applied += 1;
@@ -359,6 +366,40 @@ export function runMigrations() {
   }
 
   applyPendingMigrations(sqlite, bundle);
+}
+
+export function isCurrentMigrationBundleApplied(
+  sqlite: SqliteConnection,
+  bundle: ValidatedMigrationBundle = loadValidatedMigrationBundle(),
+): boolean {
+  try {
+    const rows = readMigrationJournal(sqlite);
+    if (rows.length !== bundle.migrations.length) return false;
+    return rows.every((row, index) => row.createdAt === bundle.migrations[index].folderMillis
+      && row.hash === bundle.migrations[index].hash);
+  } catch {
+    return false;
+  }
+}
+
+export async function waitForCurrentMigrationBundle(options: {
+  sqlite?: SqliteConnection;
+  bundle?: ValidatedMigrationBundle;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+} = {}): Promise<void> {
+  const sqlite = options.sqlite ?? getSqlite();
+  const bundle = options.bundle ?? loadValidatedMigrationBundle();
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const startedAt = Date.now();
+  for (;;) {
+    if (isCurrentMigrationBundleApplied(sqlite, bundle)) return;
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error("Platform migration journal is not current. Wait for application migrations before starting the worker.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
 }
 
 // Proxy preserves the `db` export API — lazy-inits on first property access

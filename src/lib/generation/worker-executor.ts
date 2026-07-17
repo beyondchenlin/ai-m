@@ -1,39 +1,91 @@
 /** Durable ComfyUI execution worker with fenced writes and immutable workflows. */
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   executionBackends,
-  generationArtifacts,
   generationAttempts,
   generationEvents,
   generationJobs,
+  resourcePools,
+  resourcePoolSlots,
   workflowBackendValidations,
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
 import {
   ComfyUIExecutionOrchestrator,
+  ComfyUIOperationError,
+  ExecutionCallbackPersistenceError,
   acquireResourceSlot,
   createComfyUITransport,
   probeBackendFeatures,
   probeModelFolder,
   releaseResourceSlot,
+  recordResourceTerminationProof,
   renewResourceSlot,
   streamCommitArtifact,
   materializeWorkflowInputs,
+  parseComfyUIOperationTimeouts,
 } from "@/lib/generation";
 import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
+import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
 import { bindWorkflow, loadActiveWorkflowPackage } from "@/lib/generation/workflows";
+import { sha256 } from "@/lib/generation/workflows/canonical";
 import { resolveBackendAuthHeaders } from "@/lib/security";
 import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
 import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
+import {
+  attachOwnedAttempt,
+  beginOwnedAttemptSubmission,
+  cancelOwnedJobBeforeAttempt,
+  finalizeOwnedExecution,
+  finalizeOwnedJob,
+  type AttemptPhase,
+  type OwnedAttemptPatch,
+} from "@/lib/generation/jobs/state-transitions";
+import {
+  applyOwnedAttemptTransition,
+  CONFIRMED_CANCELLATION_PREDECESSORS,
+  transitionForOrchestratorPhase,
+  type OwnedAttemptTransition,
+} from "@/lib/generation/jobs/attempt-transitions";
+import {
+  finalizeGenerationFailure,
+  finalizeGenerationSuccess,
+  ownershipLostResult,
+  OwnedTransitionError,
+  requireApplied,
+  type JobExecutionResult,
+} from "@/lib/generation/jobs/worker-finalization";
+export type { JobExecutionResult } from "@/lib/generation/jobs/worker-finalization";
 
-export interface JobExecutionResult {
-  success: boolean;
-  finalPhase: string;
-  errorMessage?: string;
-  errorClass?: string;
-  needsAttention: boolean;
+export interface GenerationJobLifecycleHooks {
+  beforeTerminalResourceRelease?: (identity: {
+    jobId: string;
+    attemptId: string;
+    resourcePoolId: string;
+    slotNo: number;
+  }) => Promise<void>;
+  managedEndpoint?: { baseUrl: "http://127.0.0.1:8000" };
+}
+
+function parsePersistedBackendFeatures(value: unknown, fingerprint: string | null): BackendFeatureSnapshot | null {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !fingerprint) return null;
+  const candidate = value as Partial<BackendFeatureSnapshot>;
+  const cancellation = candidate.cancellation;
+  const output = candidate.output;
+  if (candidate.environmentFingerprint !== fingerprint
+    || !["client-assigned", "server-assigned", "not-applicable"].includes(String(candidate.externalIdStrategy))
+    || !cancellation || typeof cancellation.supportsPerTaskCancel !== "boolean"
+    || typeof cancellation.hasGlobalInterrupt !== "boolean" || typeof cancellation.safeForShared !== "boolean"
+    || !output || !["view", "api", "both"].includes(String(output.readMethod))
+    || typeof output.supportsStreaming !== "boolean" || !Number.isFinite(output.maxOutputSizeBytesEstimate)
+    || !Array.isArray(candidate.nodeCategories) || !candidate.nodeCategories.every((item) => typeof item === "string")
+    || !Array.isArray(candidate.devicesSummary) || !candidate.devicesSummary.every((item) => typeof item === "string")
+    || (candidate.comfyVersion !== undefined && typeof candidate.comfyVersion !== "string")
+    || !Number.isSafeInteger(candidate.probedAtMs) || !Number.isSafeInteger(candidate.validUntilMs)
+    || candidate.validUntilMs! < candidate.probedAtMs!) return null;
+  return structuredClone(candidate) as BackendFeatureSnapshot;
 }
 
 function mimeForOutput(
@@ -56,30 +108,24 @@ function mimeForOutput(
   return detected;
 }
 
-async function updateAttemptFenced(
-  attemptId: string,
-  jobFencingToken: number,
-  values: Partial<typeof generationAttempts.$inferInsert>,
-): Promise<boolean> {
-  const rows = await db.update(generationAttempts).set({ ...values, updatedAtMs: Date.now() }).where(and(
-    eq(generationAttempts.id, attemptId),
-    eq(generationAttempts.jobClaimFencingToken, jobFencingToken),
-  )).returning({ id: generationAttempts.id });
-  return Boolean(rows[0]);
-}
-
-async function updateJobFenced(
+function applyAttemptTransition(
   jobId: string,
+  attemptId: string,
   workerId: string,
   jobFencingToken: number,
-  values: Partial<typeof generationJobs.$inferInsert>,
-): Promise<boolean> {
-  const rows = await db.update(generationJobs).set({ ...values, updatedAtMs: Date.now() }).where(and(
-    eq(generationJobs.id, jobId),
-    eq(generationJobs.claimOwner, workerId),
-    eq(generationJobs.claimFencingToken, jobFencingToken),
-  )).returning({ id: generationJobs.id });
-  return Boolean(rows[0]);
+  transition: OwnedAttemptTransition,
+  values: OwnedAttemptPatch = {},
+  event?: {
+    eventType: string;
+    severity: typeof generationEvents.$inferInsert.severity;
+    safePayloadJson: Record<string, unknown>;
+  },
+): ReturnType<typeof applyOwnedAttemptTransition> {
+  return applyOwnedAttemptTransition(
+    { jobId, attemptId, workerId, jobFencingToken },
+    transition,
+    { values, event },
+  );
 }
 
 export async function executeGenerationJob(
@@ -87,29 +133,41 @@ export async function executeGenerationJob(
   workerId: string,
   jobFencingToken: number,
   abortSignal?: AbortSignal,
+  lifecycle: GenerationJobLifecycleHooks = {},
 ): Promise<JobExecutionResult> {
   if (job.cancelRequestedAtMs) {
     await cancelQueuedJob(job.id, workerId, jobFencingToken);
-    return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+    return { success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" };
   }
   if (!isEnabled(FF.V2_COMFYUI_TRANSPORT)) {
     return failJob(job.id, "", workerId, jobFencingToken, "ComfyUI transport is not enabled", "config_error");
   }
 
   const attemptId = genId();
-  let attemptPersisted = false;
   let resourceSlot: { slotNo: number; leaseToken: string; fencingToken: number } | null = null;
+  let resourcePoolIdForSlot: string | null = null;
   let resourceTimer: ReturnType<typeof setInterval> | null = null;
   let retainResource = false;
+  let resourceLeaseLost = false;
   let orchestrator: ComfyUIExecutionOrchestrator | null = null;
   let transport: ComfyUITransport | null = null;
-  let resourceRenewalInFlight = false;
+  const executionController = new AbortController();
+  const executionSignal = executionController.signal;
+  const forwardExternalAbort = () => executionController.abort(abortSignal?.reason);
+  if (abortSignal?.aborted) forwardExternalAbort();
+  else abortSignal?.addEventListener("abort", forwardExternalAbort, { once: true });
+  const lifecycleState: { completedResult: JobExecutionResult | null } = { completedResult: null };
+  const complete = (result: JobExecutionResult): JobExecutionResult => {
+    lifecycleState.completedResult = result;
+    return result;
+  };
+  let resourceRenewalInFlight: Promise<void> | null = null;
   let inputCleanup: (() => Promise<void>) | null = null;
   const committedArtifacts: CollectedArtifactCandidate[] = [];
   let outputSequence = 0;
 
   try {
-    if (abortSignal?.aborted) throw new Error("execution_aborted_before_start");
+    if (executionSignal.aborted) throw new Error("execution_aborted_before_start");
     const snapshot = job.executionSnapshotJson as Record<string, unknown>;
     const backendId = typeof snapshot.executionBackendId === "string" ? snapshot.executionBackendId : "";
     const workflowDigest = typeof snapshot.workflowPackageDigest === "string" ? snapshot.workflowPackageDigest : "";
@@ -117,14 +175,41 @@ export async function executeGenerationJob(
     const config = snapshot.configJson && typeof snapshot.configJson === "object" ? snapshot.configJson as Record<string, unknown> : {};
     if (!backendId || !workflowDigest) return failJob(job.id, "", workerId, jobFencingToken, "Backend and active workflow package are required", "config_error");
 
-    const [backend] = await db.select().from(executionBackends).where(eq(executionBackends.id, backendId));
+    const capturedConfiguration = db.transaction((tx) => {
+      const backendRow = tx.select().from(executionBackends).where(eq(executionBackends.id, backendId)).get();
+      const validationRow = tx.select().from(workflowBackendValidations).where(and(
+        eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
+        eq(workflowBackendValidations.executionBackendId, backendId),
+      )).get();
+      const poolRow = backendRow
+        ? tx.select().from(resourcePools).where(eq(resourcePools.id, backendRow.resourcePoolId)).get()
+        : undefined;
+      const physicalSlots = backendRow
+        ? tx.select().from(resourcePoolSlots).where(eq(resourcePoolSlots.resourcePoolId, backendRow.resourcePoolId)).all()
+        : [];
+      return {
+        backend: backendRow ? structuredClone(backendRow) : undefined,
+        validation: validationRow ? structuredClone(validationRow) : undefined,
+        pool: poolRow ? structuredClone(poolRow) : undefined,
+        physicalSlotCount: physicalSlots.length,
+      };
+    });
+    const backend = capturedConfiguration.backend ? Object.freeze(capturedConfiguration.backend) : undefined;
     if (!backend || !backend.enabled) return failJob(job.id, "", workerId, jobFencingToken, "Execution backend is missing or disabled", "config_error");
+    if (lifecycle.managedEndpoint && (backend.adapterKind !== "comfyui"
+      || backend.baseUrl !== lifecycle.managedEndpoint.baseUrl
+      || capturedConfiguration.pool?.id !== backend.resourcePoolId
+      || capturedConfiguration.pool.capacity !== 1
+      || capturedConfiguration.physicalSlotCount !== 1)) {
+      return failJob(job.id, "", workerId, jobFencingToken, "Managed backend configuration does not match the worker endpoint", "config_error");
+    }
+    const persistedFeatures = parsePersistedBackendFeatures(backend.featureSnapshotJson, backend.environmentFingerprint);
+    if (!persistedFeatures) {
+      return failJob(job.id, "", workerId, jobFencingToken, "Execution backend feature snapshot is missing or invalid", "config_error");
+    }
     const workflowPackage = await loadActiveWorkflowPackage(workflowDigest);
     if (workflowPackage.manifest.capability !== job.capability) return failJob(job.id, "", workerId, jobFencingToken, "Workflow capability does not match job", "config_error");
-    const [backendValidation] = await db.select().from(workflowBackendValidations).where(and(
-      eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
-      eq(workflowBackendValidations.executionBackendId, backendId),
-    ));
+    const backendValidation = capturedConfiguration.validation;
     if (!backendValidation
       || backendValidation.environmentFingerprint !== backend.environmentFingerprint
       || backendValidation.environmentLockDigest !== workflowPackage.revision.environmentLockDigest) {
@@ -135,17 +220,103 @@ export async function executeGenerationJob(
       );
     }
 
+    const attemptNo = await getNextAttemptNo(job.id);
+    const correlationId = `corr-${attemptId}`;
+    const outputPrefix = `ai-m/${job.id}/${attemptNo}`;
+    const attemptCreatedAtMs = Date.now();
+    const attached = attachOwnedAttempt({
+      jobId: job.id,
+      workerId,
+      jobFencingToken,
+    }, {
+      attempt: {
+        id: attemptId,
+        jobId: job.id,
+        attemptNo,
+        jobClaimFencingToken: jobFencingToken,
+        phase: "PREPARING",
+        backendId: backend.id,
+        backendFeatureSnapshotJson: persistedFeatures as unknown as Record<string, unknown>,
+        environmentFingerprint: persistedFeatures.environmentFingerprint,
+        submissionCorrelationId: correlationId,
+        externalIdStrategy: persistedFeatures.externalIdStrategy,
+        systemOutputPrefix: outputPrefix,
+        resourcePoolId: backend.resourcePoolId,
+        resourceSlotNo: 0,
+        resourceLeaseToken: `pending-${attemptId}`,
+        resourceFencingToken: 0,
+        createdAtMs: attemptCreatedAtMs,
+        updatedAtMs: attemptCreatedAtMs,
+      },
+    });
+    if (attached.status !== "applied") {
+      const cancelled = cancelOwnedJobBeforeAttempt({ jobId: job.id, workerId, jobFencingToken });
+      if (cancelled.status === "applied") return preSubmissionCancelledResult();
+      requireApplied(attached, "job_claim_lost_before_attempt_attachment");
+    }
+
+    resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
+    if (!resourceSlot) {
+      return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
+    }
+    resourcePoolIdForSlot = backend.resourcePoolId;
+    const begun = beginOwnedAttemptSubmission({
+      jobId: job.id,
+      attemptId,
+      workerId,
+      jobFencingToken,
+    }, {
+      resourcePoolId: backend.resourcePoolId,
+      slotNo: resourceSlot.slotNo,
+      leaseToken: resourceSlot.leaseToken,
+      fencingToken: resourceSlot.fencingToken,
+    });
+    if (begun.status === "cancelled-before-submission") {
+      resourceSlot = null;
+      return preSubmissionCancelledResult();
+    }
+    if (begun.status === "invalid-resource-cardinality") return invalidResourceCardinalityResult();
+    requireApplied(begun, "job_or_resource_lease_lost_before_submission_boundary");
+
+    resourceTimer = setInterval(() => {
+      if (!resourceSlot || resourceRenewalInFlight) return;
+      resourceRenewalInFlight = (async () => {
+        const renewed = await renewResourceSlot(
+          backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken, workerId,
+        ).catch(() => false);
+        if (!renewed) {
+          resourceLeaseLost = true;
+          retainResource = true;
+          executionController.abort(new Error("resource_lease_lost"));
+          orchestrator?.stop();
+        }
+      })().finally(() => { resourceRenewalInFlight = null; });
+    }, 30_000);
+
     const authHeaders = await resolveBackendAuthHeaders(backend.authType, backend.authConfigJson);
     transport = await createComfyUITransport(
       backend.baseUrl, backend.topology, authHeaders,
       Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
         ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
         : [],
+      {
+        policyRevision: sha256(backend.networkPolicyJson),
+        ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
+        lifecycleSignal: executionSignal,
+      },
     );
     const activeTransport = transport;
     const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
-    if (backend.environmentFingerprint && backend.environmentFingerprint !== features.environmentFingerprint) {
-      return failJob(job.id, "", workerId, jobFencingToken, "Backend environment fingerprint drifted after workflow activation", "environment_drift", true);
+    if (backend.environmentFingerprint !== features.environmentFingerprint) {
+      return complete(await failJob(
+        job.id,
+        attemptId,
+        workerId,
+        jobFencingToken,
+        "Backend environment fingerprint drifted after workflow activation",
+        "environment_drift",
+        true,
+      ));
     }
     const modelFolders = new Map<string, string[]>();
     for (const model of workflowPackage.manifest.requirements.models) {
@@ -153,65 +324,13 @@ export async function executeGenerationJob(
         modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
       }
       if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
-        return failJob(
-          job.id, "", workerId, jobFencingToken,
+        return complete(await failJob(
+          job.id, attemptId, workerId, jobFencingToken,
           `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
           "environment_model_drift", true,
-        );
+        ));
       }
     }
-
-    const attemptNo = await getNextAttemptNo(job.id);
-    const correlationId = `corr-${attemptId}`;
-    const outputPrefix = `ai-m/${job.id}/${attemptNo}`;
-    await db.insert(generationAttempts).values({
-      id: attemptId,
-      jobId: job.id,
-      attemptNo,
-      jobClaimFencingToken: jobFencingToken,
-      phase: "PREPARING",
-      backendId: backend.id,
-      backendFeatureSnapshotJson: features as unknown as Record<string, unknown>,
-      environmentFingerprint: features.environmentFingerprint,
-      submissionCorrelationId: correlationId,
-      externalIdStrategy: features.externalIdStrategy,
-      systemOutputPrefix: outputPrefix,
-      resourcePoolId: backend.resourcePoolId,
-      resourceSlotNo: 0,
-      resourceLeaseToken: `pending-${attemptId}`,
-      resourceFencingToken: 0,
-      createdAtMs: Date.now(),
-      updatedAtMs: Date.now(),
-    });
-    attemptPersisted = true;
-
-    const claimed = await updateJobFenced(job.id, workerId, jobFencingToken, { currentAttemptId: attemptId });
-    if (!claimed) throw new Error("job_claim_lost_before_resource_acquisition");
-
-    resourceSlot = await acquireResourceSlot(backend.resourcePoolId, attemptId, workerId);
-    if (!resourceSlot) return failJob(job.id, attemptId, workerId, jobFencingToken, "No resource slot available", "resource_exhausted");
-    await updateAttemptFenced(attemptId, jobFencingToken, {
-      phase: "SUBMITTING",
-      resourceSlotNo: resourceSlot.slotNo,
-      resourceLeaseToken: resourceSlot.leaseToken,
-      resourceFencingToken: resourceSlot.fencingToken,
-    });
-
-    resourceTimer = setInterval(async () => {
-      if (!resourceSlot || resourceRenewalInFlight) return;
-      resourceRenewalInFlight = true;
-      try {
-        const renewed = await renewResourceSlot(
-          backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken,
-        ).catch(() => false);
-        if (!renewed) {
-          retainResource = true;
-          orchestrator?.stop();
-        }
-      } finally {
-        resourceRenewalInFlight = false;
-      }
-    }, 30_000);
 
     const defaults = config.defaultParameters && typeof config.defaultParameters === "object"
       ? config.defaultParameters as Record<string, unknown>
@@ -224,6 +343,7 @@ export async function executeGenerationJob(
       request: { ...defaults, ...request },
       metadata: job.metadataJson as Record<string, unknown>,
       maxReferenceInputs: workflowPackage.manifest.limits.maxBatch,
+      signal: executionSignal,
     });
     inputCleanup = materialized.cleanup;
     const workflow = bindWorkflow(
@@ -233,72 +353,122 @@ export async function executeGenerationJob(
       outputPrefix,
     );
 
-    const callbacks: ExecutionCallbacks = {
+    const durableCallbacks: ExecutionCallbacks = {
       onPhaseChange: async (phase: OrchestratorPhase) => {
         const mapped = phase === "CREATED" ? "PREPARING" : phase;
-        await updateAttemptFenced(attemptId, jobFencingToken, { phase: mapped });
+        if (["SUCCEEDED", "FAILED", "CANCELLED"].includes(mapped)) return;
+        // SUBMITTING was already persisted by the resource-bound atomic boundary.
+        if (mapped === "SUBMITTING") return;
+        const transition = transitionForOrchestratorPhase(mapped as AttemptPhase);
+        if (!transition) throw new Error(`unsupported_orchestrator_phase:${mapped}`);
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, transition),
+          "job_claim_lost_during_phase_change");
       },
       onExternalJobId: async (externalJobId) => {
         retainResource = true;
-        await updateAttemptFenced(attemptId, jobFencingToken, {
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-external-queued", {
           externalJobId,
           submittedAtMs: Date.now(),
-          phase: "EXTERNAL_QUEUED",
-        });
+        }), "job_claim_lost_recording_external_id");
       },
       onProgress: async (progress) => {
-        await updateAttemptFenced(attemptId, jobFencingToken, { progressSnapshotJson: progress as unknown as Record<string, unknown> });
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-progress", {
+          progressSnapshotJson: progress as unknown as Record<string, unknown>,
+        }), "job_claim_lost_recording_progress");
       },
       onReconciliation: async (result) => {
         if (result.discoveredExternalJobId) retainResource = true;
-        await updateAttemptFenced(attemptId, jobFencingToken, {
-          phase: result.exists ? "EXTERNAL_QUEUED" : "SUBMISSION_UNKNOWN",
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken,
+          result.exists ? "record-external-queued" : "mark-submission-unknown", {
           externalJobId: result.discoveredExternalJobId ?? undefined,
-        });
+        }), "job_claim_lost_during_reconciliation");
       },
       isCancellationRequested: async () => {
+        const now = Date.now();
         const [current] = await db
           .select({ cancelRequestedAtMs: generationJobs.cancelRequestedAtMs })
           .from(generationJobs)
           .where(and(
             eq(generationJobs.id, job.id),
+            eq(generationJobs.currentAttemptId, attemptId),
             eq(generationJobs.claimOwner, workerId),
             eq(generationJobs.claimFencingToken, jobFencingToken),
+            sql`${generationJobs.claimUntilMs} > ${now}`,
           ));
         if (!current) throw new Error("job_claim_lost_during_cancellation_probe");
         return Boolean(current.cancelRequestedAtMs);
       },
       onCancellationResult: async (result) => {
-        await updateAttemptFenced(attemptId, jobFencingToken, { phase: "CANCEL_REQUESTED" });
-        await db.insert(generationEvents).values({
-          id: genId(),
-          jobId: job.id,
-          attemptId,
+        requireApplied(applyAttemptTransition(job.id, attemptId, workerId, jobFencingToken, "record-cancellation-intent", {}, {
           eventType: "external_cancellation_requested",
           severity: result.needsReconciliation ? "warning" : "info",
           safePayloadJson: {
             requested: result.requested,
             method: result.method,
             needsReconciliation: result.needsReconciliation,
+            evidenceKind: result.evidenceKind,
             safeMessage: result.safeMessage.slice(0, 200),
           },
-          createdAtMs: Date.now(),
-        });
+        }), "job_claim_lost_recording_cancellation_request");
+      },
+      onCancellationConfirmed: async (evidence) => {
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken, "record-cancellation-confirmation", {}, {
+            eventType: "external_cancellation_confirmed",
+            severity: "info",
+            safePayloadJson: { ...evidence },
+          },
+        ), "job_claim_lost_recording_cancellation_confirmation");
+      },
+      onExternalTerminationEvidence: async (evidence) => {
+        if (!resourceSlot || !recordResourceTerminationProof({
+          attemptId,
+          backendId: backend.id,
+          externalJobId: evidence.externalJobId,
+          proofKind: evidence.proofKind,
+          observedAtMs: evidence.observedAtMs,
+          resourcePoolId: backend.resourcePoolId,
+          resourceSlotNo: resourceSlot.slotNo,
+          resourceLeaseToken: resourceSlot.leaseToken,
+          resourceFencingToken: resourceSlot.fencingToken,
+        })) throw new Error("external_termination_proof_persistence_failed");
+        retainResource = false;
       },
       onOutputStream: async (output) => {
+        requireApplied(applyAttemptTransition(
+          job.id, attemptId, workerId, jobFencingToken, "commit-collected-output",
+        ), "job_claim_lost_before_artifact_commit");
         const sequence = outputSequence++;
         const media = mimeForOutput(output.filename, output.mediaKind);
-        const contentLength = Number(output.response.headers.get("content-length") ?? 0);
-        if (contentLength > workflowPackage.manifest.limits.maxOutputBytes) throw new Error("Output exceeds workflow package limit");
+        const contentLengthHeader = output.response.headers.get("content-length");
+        let contentLength: number | undefined;
+        if (contentLengthHeader !== null) {
+          if (!/^\d+$/.test(contentLengthHeader)) throw new Error("Output returned an invalid Content-Length");
+          contentLength = Number(contentLengthHeader);
+          if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+            throw new Error("Output returned an invalid Content-Length");
+          }
+          if (contentLength > workflowPackage.manifest.limits.maxOutputBytes) {
+            throw new Error("Output exceeds workflow package limit");
+          }
+        }
+        const contentEncoding = output.response.headers.get("content-encoding")?.trim().toLowerCase();
+        const expectedSizeBytes = contentLength !== undefined
+          && (contentEncoding === undefined || contentEncoding === "identity")
+          ? contentLength
+          : undefined;
         if (!output.response.body) throw new Error("Output response has no body");
         const committed = await streamCommitArtifact({
           attemptId,
           expectedJobClaimFencingToken: jobFencingToken,
+          writerOwner: workerId,
           logicalName: `${output.nodeId}_${output.filename}`,
           kind: media.kind,
           mimeType: media.mimeType,
           visibility: "project",
           maxSizeBytes: workflowPackage.manifest.limits.maxOutputBytes,
+          ...(expectedSizeBytes !== undefined ? { expectedSizeBytes } : {}),
           metadata: {
             nodeId: output.nodeId, outputKey: output.outputKey, outputField: output.field,
             mediaKind: output.mediaKind, originalFilename: output.filename,
@@ -314,8 +484,16 @@ export async function executeGenerationJob(
         });
       },
     };
+    const callbacks = new Proxy(durableCallbacks, {
+      get(target, property, receiver) {
+        const callback = Reflect.get(target, property, receiver);
+        if (typeof callback !== "function") return callback;
+        return (...args: unknown[]) => Promise.resolve(Reflect.apply(callback, target, args))
+          .catch((error: unknown) => { throw new ExecutionCallbackPersistenceError(error); });
+      },
+    });
 
-    orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, backend.baseUrl, callbacks, {
+    orchestrator = new ComfyUIExecutionOrchestrator(activeTransport, features, callbacks, {
       totalExecutionTimeoutMs: workflowPackage.manifest.limits.maxJobMs,
       collectionTimeoutMs: Math.min(workflowPackage.manifest.limits.maxJobMs, 5 * 60 * 1000),
       isSharedBackend: backend.sharingMode === "shared",
@@ -324,12 +502,13 @@ export async function executeGenerationJob(
         key: output.key, nodeId: output.nodeId, field: output.field,
         mediaKind: output.mediaKind, maxItems: output.maxItems,
       })),
-    }, correlationId);
+    }, correlationId, executionSignal);
     const abortListener = () => orchestrator?.stop();
-    abortSignal?.addEventListener("abort", abortListener, { once: true });
+    executionSignal.addEventListener("abort", abortListener, { once: true });
     try {
       const result = await orchestrator.execute(workflow);
-      if (abortSignal?.aborted) {
+      if (resourceLeaseLost) return ownershipLostResult();
+      if (executionSignal.aborted) {
         retainResource = true;
         return failJob(
           job.id, attemptId, workerId, jobFencingToken,
@@ -339,9 +518,13 @@ export async function executeGenerationJob(
       if (result.success) {
         retainResource = false;
         const primaryArtifact = selectPrimaryArtifact(committedArtifacts, workflowPackage.compiled.outputs);
-        const artifactId = await succeedJob(
-          job.id, attemptId, workerId, jobFencingToken, primaryArtifact.artifactId,
-        );
+        const artifactId = await finalizeGenerationSuccess({
+          jobId: job.id,
+          attemptId,
+          workerId,
+          fencingToken: jobFencingToken,
+          artifactId: primaryArtifact.artifactId,
+        });
         try {
           await linkArtifactToBusinessEntity(job.id, artifactId);
           await mergeGenerationJobMetadata(job.id, {
@@ -356,31 +539,89 @@ export async function executeGenerationJob(
             createdAtMs: Date.now(),
           }).catch(() => undefined);
         }
-        return { success: true, finalPhase: "SUCCEEDED", needsAttention: false };
+        return complete({ success: true, finalPhase: "SUCCEEDED", needsAttention: false, claimDisposition: "release-terminal" });
       }
       if (result.cancellationRequested && result.phase === "CANCELLED") {
         retainResource = false;
         await cancelJob(job.id, attemptId, workerId, jobFencingToken);
-        return { success: false, finalPhase: "CANCELLED", needsAttention: false };
+        return complete({ success: false, finalPhase: "CANCELLED", needsAttention: false, claimDisposition: "release-terminal" });
       }
-      retainResource = retainResource || result.needsAttention || result.phase === "SUBMISSION_UNKNOWN";
-      return failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource);
+      retainResource = retainResource
+        || result.submissionDisposition === "submission-uncertain"
+        || result.needsAttention
+        || result.phase === "SUBMISSION_UNKNOWN";
+      return complete(await failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource));
     } finally {
-      abortSignal?.removeEventListener("abort", abortListener);
+      executionSignal.removeEventListener("abort", abortListener);
     }
   } catch (error) {
-    const failure = error instanceof Error ? error : new Error(String(error));
-    retainResource = retainResource || failure.message.includes("claim_lost") || failure.message.includes("ownership");
-    return failJob(job.id, attemptPersisted ? attemptId : "", workerId, jobFencingToken, failure.message, "unexpected_error", retainResource);
+    if (error instanceof OwnedTransitionError
+      && (error.transitionStatus === "lost-race" || error.transitionStatus === "ownership-lost")) {
+      retainResource = true;
+      return ownershipLostResult();
+    }
+    if (resourceLeaseLost) {
+      retainResource = true;
+      return ownershipLostResult();
+    }
+    const cleanupOnFailure = error && typeof error === "object"
+      ? (error as { cleanupOnFailure?: unknown }).cleanupOnFailure
+      : undefined;
+    if (typeof cleanupOnFailure === "function") {
+      await Promise.resolve(cleanupOnFailure()).catch(() => undefined);
+    }
+    const materializationCause = typeof cleanupOnFailure === "function"
+      && error instanceof Error
+      && error.cause instanceof ComfyUIOperationError
+      ? error.cause
+      : null;
+    if (materializationCause?.submissionDisposition === "definitely-not-submitted") {
+      retainResource = false;
+      return complete(await failJob(
+        job.id, attemptId, workerId, jobFencingToken,
+        "Input upload was not submitted before its operation deadline",
+        "input_upload_not_sent",
+      ));
+    }
+    retainResource = true;
+    throw error;
   } finally {
+    abortSignal?.removeEventListener("abort", forwardExternalAbort);
     if (resourceTimer) clearInterval(resourceTimer);
+    try { await resourceRenewalInFlight; } catch { /* renewal failure already fences this execution */ }
     transport?.close();
     if (!retainResource && inputCleanup) await inputCleanup().catch(() => undefined);
-    if (resourceSlot && !retainResource) {
-      const snapshot = job.executionSnapshotJson as Record<string, unknown>;
-      const backendId = snapshot.executionBackendId as string;
-      const [backend] = backendId ? await db.select().from(executionBackends).where(eq(executionBackends.id, backendId)) : [];
-      if (backend) await releaseResourceSlot(backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken).catch(() => false);
+    if (resourceSlot && resourcePoolIdForSlot && !retainResource
+      && lifecycleState.completedResult?.claimDisposition === "release-terminal"
+      && lifecycle.beforeTerminalResourceRelease) {
+      try {
+        await lifecycle.beforeTerminalResourceRelease({
+          jobId: job.id,
+          attemptId,
+          resourcePoolId: resourcePoolIdForSlot,
+          slotNo: resourceSlot.slotNo,
+        });
+      } catch (error) {
+        retainResource = true;
+        throw error;
+      }
+    }
+    if (resourceSlot && resourcePoolIdForSlot && !retainResource) {
+      await releaseResourceSlot(
+        resourcePoolIdForSlot,
+        resourceSlot.slotNo,
+        attemptId,
+        resourceSlot.leaseToken,
+        resourceSlot.fencingToken,
+      ).catch((error: unknown) => {
+        if (error instanceof InvalidResourceCardinalityError) {
+          console.error(
+            "[generation] retained resource leases after terminal release cardinality failure",
+            { code: error.code, attemptId: error.attemptId, slotCount: error.slotCount },
+          );
+        }
+        return false;
+      });
     }
   }
 }
@@ -388,15 +629,16 @@ export async function executeGenerationJob(
 
 async function cancelQueuedJob(jobId: string, workerId: string, fencingToken: number): Promise<void> {
   const now = Date.now();
-  const updated = await updateJobFenced(jobId, workerId, fencingToken, {
-    status: "CANCELLED",
-    completedAtMs: now,
+  const result = finalizeOwnedJob({ jobId, workerId, jobFencingToken: fencingToken }, {
+    expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
+    jobValues: { status: "CANCELLED", completedAtMs: now },
+    event: {
+      eventType: "job_cancelled_before_submission",
+      severity: "info",
+      safePayloadJson: {},
+    },
   });
-  if (!updated) throw new Error("Job fencing token is stale while cancelling before submission");
-  await db.insert(generationEvents).values({
-    id: genId(), jobId, attemptId: null, eventType: "job_cancelled_before_submission",
-    severity: "info", safePayloadJson: {}, createdAtMs: now,
-  });
+  requireApplied(result, "job_claim_lost_cancelling_before_submission");
 }
 
 async function getNextAttemptNo(jobId: string): Promise<number> {
@@ -414,49 +656,44 @@ async function failJob(
   errorClass: string,
   needsAttention = false,
 ): Promise<JobExecutionResult> {
-  const now = Date.now();
-  if (attemptId) await updateAttemptFenced(attemptId, fencingToken, {
-    phase: needsAttention ? "ORPHANED" : "FAILED",
+  return finalizeGenerationFailure({
+    jobId,
+    attemptId,
+    workerId,
+    fencingToken,
+    errorMessage,
     errorClass,
-    errorMessageSafe: errorMessage.slice(0, 500),
-    finishedAtMs: needsAttention ? null : now,
-  }).catch(() => false);
-  const updated = await updateJobFenced(jobId, workerId, fencingToken, {
-    status: needsAttention ? "NEEDS_ATTENTION" : "FAILED",
-    needsAttentionReason: needsAttention ? `${errorClass}:${errorMessage.slice(0, 200)}` : null,
-    completedAtMs: needsAttention ? null : now,
-  }).catch(() => false);
-  if (updated) await db.insert(generationEvents).values({
-    id: genId(), jobId, attemptId: attemptId || null, eventType: needsAttention ? "job_needs_attention" : "job_failed",
-    severity: needsAttention ? "warning" : "error", safePayloadJson: { errorClass, errorMessage: errorMessage.slice(0, 200) }, createdAtMs: now,
-  }).catch(() => undefined);
-  return { success: false, finalPhase: needsAttention ? "NEEDS_ATTENTION" : "FAILED", errorMessage, errorClass, needsAttention };
+    needsAttention,
+  });
 }
 
-async function succeedJob(
-  jobId: string,
-  attemptId: string,
-  workerId: string,
-  fencingToken: number,
-  artifactId: string,
-): Promise<string> {
-  const now = Date.now();
-  const [artifact] = await db.select({ id: generationArtifacts.id }).from(generationArtifacts)
-    .where(and(
-      eq(generationArtifacts.id, artifactId),
-      eq(generationArtifacts.attemptId, attemptId),
-      eq(generationArtifacts.status, "COMMITTED"),
-    ));
-  if (!artifact) throw new Error("Selected primary artifact is not committed for this execution attempt");
-  if (!await updateAttemptFenced(attemptId, fencingToken, { phase: "SUCCEEDED", finishedAtMs: now })) throw new Error("Attempt fencing token is stale");
-  if (!await updateJobFenced(jobId, workerId, fencingToken, { status: "SUCCEEDED", currentArtifactId: artifact.id, completedAtMs: now })) throw new Error("Job fencing token is stale");
-  await db.insert(generationEvents).values({ id: genId(), jobId, attemptId, eventType: "job_succeeded", severity: "info", safePayloadJson: {}, createdAtMs: now });
-  return artifact.id;
+function preSubmissionCancelledResult(): JobExecutionResult {
+  return {
+    success: false,
+    finalPhase: "CANCELLED",
+    needsAttention: false,
+    claimDisposition: "release-terminal",
+  };
+}
+
+function invalidResourceCardinalityResult(): JobExecutionResult {
+  return {
+    success: false,
+    finalPhase: "ORPHANED",
+    needsAttention: true,
+    claimDisposition: "retain-recovery",
+  };
 }
 
 async function cancelJob(jobId: string, attemptId: string, workerId: string, fencingToken: number): Promise<void> {
   const now = Date.now();
-  await updateAttemptFenced(attemptId, fencingToken, { phase: "CANCELLED", finishedAtMs: now });
-  await updateJobFenced(jobId, workerId, fencingToken, { status: "CANCELLED", completedAtMs: now });
-  await db.insert(generationEvents).values({ id: genId(), jobId, attemptId, eventType: "job_cancelled", severity: "info", safePayloadJson: {}, createdAtMs: now });
+  const result = finalizeOwnedExecution({ jobId, attemptId, workerId, jobFencingToken: fencingToken }, {
+    expectedJobStatuses: ["RUNNING", "CANCEL_REQUESTED"],
+    expectedAttemptPhases: CONFIRMED_CANCELLATION_PREDECESSORS,
+    requiredPriorEventType: "external_cancellation_confirmed",
+    attemptValues: { phase: "CANCELLED", finishedAtMs: now },
+    jobValues: { status: "CANCELLED", completedAtMs: now },
+    event: { eventType: "job_cancelled", severity: "info", safePayloadJson: {} },
+  });
+  requireApplied(result, "job_claim_lost_finalizing_cancellation");
 }

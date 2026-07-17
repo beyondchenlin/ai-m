@@ -24,6 +24,11 @@ export interface AddressValidationResult {
   errors: string[];
 }
 
+export type BackendAddressResolver = (
+  hostname: string,
+  signal?: AbortSignal,
+) => Promise<readonly { address: string; family: 4 | 6 }[]>;
+
 const METADATA_HOSTNAMES = new Set([
   "metadata.google.internal",
   "metadata.azure.internal",
@@ -32,6 +37,25 @@ const METADATA_HOSTNAMES = new Set([
 ]);
 
 const METADATA_IPS = new Set(["169.254.169.254", "100.100.100.200"]);
+
+export function canonicalizeUrlHostname(hostname: string): string {
+  const normalized = hostname.trim().toLowerCase();
+  return normalized.startsWith("[") && normalized.endsWith("]")
+    ? normalized.slice(1, -1)
+    : normalized;
+}
+
+export function canonicalizeSocketAddress(address: string): string {
+  const value = canonicalizeUrlHostname(address);
+  if (isIP(value) === 4) return value;
+  if (isIP(value) !== 6) throw new Error(`Invalid network address: ${address}`);
+  const canonical = new URL(`http://[${value}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (!mapped) return canonical;
+  const high = Number.parseInt(mapped[1], 16);
+  const low = Number.parseInt(mapped[2], 16);
+  return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+}
 
 function envList(name: string, fallback: string): string[] {
   return (process.env[name] ?? fallback)
@@ -93,7 +117,7 @@ function isMetadataAddress(address: string): boolean {
 }
 
 function hostAllowed(hostname: string, allowedHosts: readonly string[]): boolean {
-  const normalized = hostname.toLowerCase();
+  const normalized = canonicalizeUrlHostname(hostname);
   return allowedHosts.some((allowed) => {
     const value = allowed.toLowerCase();
     return normalized === value || (value.startsWith(".") && normalized.endsWith(value));
@@ -127,7 +151,9 @@ function parseAndValidateUrl(baseUrl: string): { url?: URL; errors: string[] } {
   if (url.protocol !== "http:" && url.protocol !== "https:") errors.push("Only HTTP and HTTPS are allowed");
   if (url.username || url.password) errors.push("Credentials must not be embedded in the URL");
   if (url.hash) errors.push("URL fragments are not allowed");
-  if (METADATA_HOSTNAMES.has(url.hostname.toLowerCase()) || METADATA_IPS.has(url.hostname)) {
+  if (url.search) errors.push("URL query parameters are not allowed");
+  const hostname = canonicalizeUrlHostname(url.hostname);
+  if (METADATA_HOSTNAMES.has(hostname) || METADATA_IPS.has(hostname)) {
     errors.push("Cloud metadata endpoints are forbidden");
   }
   const port = url.port ? Number(url.port) : (url.protocol === "https:" ? 443 : 80);
@@ -144,7 +170,8 @@ export function validateBackendUrl(
   }
   const parsed = parseAndValidateUrl(baseUrl);
   if (!parsed.url || parsed.errors.length > 0) return { valid: false, error: parsed.errors.join("; ") };
-  const hostname = parsed.url.hostname.toLowerCase();
+  const rawHostname = canonicalizeUrlHostname(parsed.url.hostname);
+  const hostname = isIP(rawHostname) ? canonicalizeSocketAddress(rawHostname) : rawHostname;
   const topologyValue = topology as BackendTopology;
 
   if (topologyValue === "same-host" && !["localhost", "127.0.0.1", "::1"].includes(hostname)) {
@@ -171,21 +198,42 @@ export function validateBackendUrl(
 export async function validateBackendUrlResolved(
   baseUrl: string,
   topology: BackendTopology,
+  resolver: BackendAddressResolver = async (hostname) => (await lookup(hostname, { all: true, verbatim: true }))
+    .filter((entry): entry is { address: string; family: 4 | 6 } => entry.family === 4 || entry.family === 6),
+  signal?: AbortSignal,
 ): Promise<AddressValidationResult> {
   const initial = validateBackendUrl(baseUrl, topology);
   if (!initial.valid) return { valid: false, resolvedAddresses: [], errors: [initial.error ?? "Invalid URL"] };
   const url = new URL(baseUrl.trim());
+  const rawHostname = canonicalizeUrlHostname(url.hostname);
+  const hostname = isIP(rawHostname) ? canonicalizeSocketAddress(rawHostname) : rawHostname;
   let addresses: string[];
-  if (isIP(url.hostname)) {
-    addresses = [url.hostname];
+  if (isIP(hostname)) {
+    addresses = [hostname];
   } else {
     try {
-      addresses = (await lookup(url.hostname, { all: true, verbatim: true })).map((entry) => entry.address);
+      if (signal?.aborted) throw signal.reason;
+      const resolved = resolver(hostname, signal);
+      let removeAbortListener: (() => void) | undefined;
+      const aborted = signal && new Promise<never>((_, reject) => {
+        const onAbort = () => reject(signal.reason ?? new Error("Backend resolution aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      });
+      const result = await (aborted ? Promise.race([resolved, aborted]) : resolved)
+        .finally(() => removeAbortListener?.());
+      addresses = result.map((entry) => entry.address);
     } catch {
+      if (signal?.aborted) throw signal.reason;
       return { valid: false, resolvedAddresses: [], errors: ["Backend hostname cannot be resolved"] };
     }
   }
-  const unique = [...new Set(addresses)];
+  let unique: string[];
+  try {
+    unique = [...new Set(addresses.map(canonicalizeSocketAddress))];
+  } catch {
+    return { valid: false, resolvedAddresses: [], errors: ["Backend hostname resolved to an invalid address"] };
+  }
   const errors = unique
     .filter((address) => !addressAllowedForTopology(address, topology))
     .map((address) => `Resolved address ${address} is not allowed for topology ${topology}`);
@@ -197,12 +245,13 @@ export function validateUrl(urlString: string, policy: NetworkPolicy): AddressVa
   const parsed = parseAndValidateUrl(urlString);
   if (!parsed.url) return { valid: false, resolvedAddresses: [], errors: parsed.errors };
   const errors = [...parsed.errors];
-  if (policy.allowedHosts.length > 0 && !hostAllowed(parsed.url.hostname, policy.allowedHosts)) {
+  const hostname = canonicalizeUrlHostname(parsed.url.hostname);
+  if (policy.allowedHosts.length > 0 && !hostAllowed(hostname, policy.allowedHosts)) {
     errors.push("Hostname is not allowlisted");
   }
   const port = parsed.url.port ? Number(parsed.url.port) : (parsed.url.protocol === "https:" ? 443 : 80);
   if (policy.allowedPorts?.length && !policy.allowedPorts.includes(port)) errors.push("Port is not allowlisted");
-  return { valid: errors.length === 0, resolvedAddresses: [parsed.url.hostname], errors };
+  return { valid: errors.length === 0, resolvedAddresses: [hostname], errors };
 }
 
 export function noRedirectFetchOptions(): RequestInit {

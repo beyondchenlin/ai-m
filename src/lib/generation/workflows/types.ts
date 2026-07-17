@@ -28,6 +28,7 @@ export interface AuthorBinding {
   default?: unknown;
   minimum?: number;
   maximum?: number;
+  step?: number;
 }
 
 export interface AuthorOutput {
@@ -90,4 +91,10 @@ export interface WorkflowPackageInput {
   /** SHA-256 of the exact bytes listed by package.lock.json. */
   verifiedFileDigests: Record<string, string>;
   packagePath: string;
+  generationProvenance?: {
+    generationDigest: string;
+    packageName: string;
+    packageDigest: string;
+    verifiedEvidenceDigest?: string;
+  };
 }

@@ -15,6 +15,16 @@ const FORBIDDEN_HEADERS = new Set([
   "host", "content-length", "connection", "transfer-encoding", "upgrade", "cookie", "set-cookie",
 ]);
 
+export function assertSafeBackendHeaderValue(
+  keyType: "bearer" | "header-token" | "basic" | "mtls-key",
+  secret: string,
+): void {
+  if (keyType !== "bearer" && keyType !== "header-token") return;
+  if (/[^\x09\x20-\x7e\x80-\xff]/.test(secret)) {
+    throw new RequestValidationError("Backend authentication secret is not a valid HTTP header value");
+  }
+}
+
 export function validateBackendAuthConfig(authType: BackendAuthType, raw: unknown): BackendAuthConfig {
   assertPlainObject(raw, "authConfigJson");
   if (authType === "none") {
@@ -43,6 +53,7 @@ export async function resolveBackendAuthHeaders(
   if (!key) throw new Error("Backend key reference does not exist");
   if (key.keyType !== authType) throw new Error("Backend key reference type does not match authType");
   const secret = decryptSecret(key.secretValue);
+  assertSafeBackendHeaderValue(key.keyType, secret);
   if (authType === "bearer") return { Authorization: `Bearer ${secret}` };
   if (authType === "basic") return { Authorization: `Basic ${Buffer.from(secret, "utf8").toString("base64")}` };
   if (authType === "header-token") return { [config.headerName!]: secret };

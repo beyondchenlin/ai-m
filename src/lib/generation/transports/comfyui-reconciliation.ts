@@ -6,8 +6,13 @@
  * 证据强度不足时保持不确定，进入人工处理。
  */
 
-import type { ComfyUITransport, ComfyExecutionResult } from "./comfyui";
-import { probeHistory, probeQueueStatus } from "./comfyui";
+import type {
+  ComfyUITransport,
+  ComfyExecutionResult,
+  ComfyHistoryOutcome,
+  ComfyUIOperationOptions,
+} from "./comfyui";
+import { classifyComfyHistory, probeHistory, probeQueueStatus } from "./comfyui";
 import type { BackendFeatureSnapshot } from "./comfyui-behavior-probe";
 
 /** 对账证据强度 */
@@ -20,7 +25,9 @@ export interface ReconciliationResult {
   /** 证据强度 */
   evidenceStrength: EvidenceStrength;
   /** 外部任务状态（如找到） */
-  externalStatus?: "queued" | "running" | "completed" | "failed";
+  externalStatus?: "queued" | "running" | "completed" | "cancelled" | "failed";
+  /** Typed interpretation of a history record, kept separate from queue state. */
+  historyOutcome?: ComfyHistoryOutcome;
   /** 历史记录（如找到） */
   executionResult?: ComfyExecutionResult;
   /** 对账过程中发现的外部任务编号（提交响应丢失时用于恢复） */
@@ -69,6 +76,7 @@ export async function reconcileSubmission(
   _features: BackendFeatureSnapshot,
   _config: Partial<ReconciliationConfig> = {},
   correlationId?: string,
+  operationOptions: ComfyUIOperationOptions = {},
 ): Promise<ReconciliationResult> {
   const evidence: ReconciliationEvidence[] = [];
   const now = Date.now();
@@ -82,7 +90,7 @@ export async function reconcileSubmission(
   // 提交响应丢失时，先通过关联编号发现外部任务编号
   if (!externalJobId && correlationId) {
     try {
-      const queue = await probeQueueStatus(transport, correlationId);
+      const queue = await probeQueueStatus(transport, correlationId, operationOptions);
       const running = queue.queueRunning ?? [];
       const pending = queue.queuePending ?? [];
       const match = running.find((q) => q.correlationId === correlationId) ??
@@ -118,7 +126,7 @@ export async function reconcileSubmission(
   }
 
   try {
-    const history = await probeHistory(transport, resolvedExternalJobId, correlationId);
+    const history = await probeHistory(transport, resolvedExternalJobId, correlationId, operationOptions);
     if (history[resolvedExternalJobId]) {
       foundInHistory = true;
       executionResult = history[resolvedExternalJobId];
@@ -146,7 +154,7 @@ export async function reconcileSubmission(
   }
 
   try {
-    const queue = await probeQueueStatus(transport, correlationId);
+    const queue = await probeQueueStatus(transport, correlationId, operationOptions);
     const running = queue.queueRunning ?? [];
     const pending = queue.queuePending ?? [];
 
@@ -189,16 +197,17 @@ export async function reconcileSubmission(
   const exists = foundInHistory || foundInQueueRunning || foundInQueuePending;
 
   let externalStatus: ReconciliationResult["externalStatus"];
+  const historyOutcome: ComfyHistoryOutcome | undefined = executionResult
+    ? classifyComfyHistory(executionResult)
+    : undefined;
   if (foundInQueueRunning) {
     externalStatus = "running";
   } else if (foundInQueuePending) {
     externalStatus = "queued";
   } else if (executionResult) {
-    if (executionResult.status.completed) {
-      externalStatus = executionResult.status.statusStr === "error" ? "failed" : "completed";
-    } else {
-      externalStatus = "queued";
-    }
+    if (historyOutcome === "completed") externalStatus = "completed";
+    if (historyOutcome === "cancelled") externalStatus = "cancelled";
+    if (historyOutcome === "failed") externalStatus = "failed";
   }
 
   const evidenceStrength = computeOverallStrength(evidence, exists);
@@ -207,6 +216,7 @@ export async function reconcileSubmission(
     exists,
     evidenceStrength,
     externalStatus,
+    historyOutcome,
     executionResult,
     discoveredExternalJobId,
     evidence,

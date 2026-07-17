@@ -79,6 +79,7 @@ async function main(): Promise<void> {
     Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
       ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
       : [],
+    { policyRevision: sha256(backend.networkPolicyJson) },
   );
   try {
     const workflow = normalizeComfyWorkflow(row.revision.workflowApiJson);

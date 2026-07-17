@@ -24,11 +24,13 @@ export {
   acquireResourceSlot,
   renewResourceSlot,
   releaseResourceSlot,
+  recordResourceTerminationProof,
   claimJob,
   renewJobClaim,
   releaseJobClaim,
   scanExpiredClaims,
 } from "./resources";
+export type { ResourceTerminationProofInput } from "./resources";
 export {
   validateWorkflowStructure,
   applyStaticPolicy,
@@ -43,12 +45,16 @@ export type {
 } from "./workflows";
 export {
   ComfyUIHttpTransport,
+  ComfyUIOperationError,
+  ComfyUIOperationDeadlineError,
+  parseComfyUIOperationTimeouts,
   submitPrompt,
   probeSystemInfo,
   probeObjectInfo,
   probeModelFolder,
   probeQueueStatus,
   probeHistory,
+  classifyComfyHistory,
   createComfyUITransport,
   probeBackendFeatures,
   isProbeFresh,
@@ -63,6 +69,7 @@ export {
   nextReconciliationDelay,
   classifySubmissionError,
   ComfyUIExecutionOrchestrator,
+  ExecutionCallbackPersistenceError,
 } from "./transports";
 export type {
   ComfyUITransport,
@@ -70,9 +77,12 @@ export type {
   ComfyPromptResponse,
   ComfyProgress,
   ComfyExecutionResult,
+  ComfyHistoryOutcome,
   ComfySystemInfo,
   ComfyObjectInfo,
   ComfyWSMessage,
+  ComfyUIOperationOptions,
+  ComfyUISubmissionDisposition,
   BackendFeatureSnapshot,
   ExternalIdStrategy,
   CancellationCapabilities,
@@ -92,6 +102,7 @@ export type {
   ReconciliationConfig,
   OrchestratorPhase,
   ExecutionCallbacks,
+  ExternalTerminationEvidence,
   ExecutionConfig,
   OrchestratorResult,
 } from "./transports";
@@ -107,5 +118,23 @@ export {
   ContenType,
 } from "./archiving";
 export type { ArtifactStreamInput, ArtifactCommitResult } from "./archiving";
-export { materializeWorkflowInputs } from "./input-materializer";
+export { InputMaterializationError, materializeWorkflowInputs } from "./input-materializer";
 export type { MaterializedWorkflowInput } from "./input-materializer";
+export {
+  ManagedComfyUIRuntime,
+  ManagedComfyUIEndpointRegistry,
+  ManagedCommandStdioDrainError,
+  ManagedProcessCleanupError,
+  createPowerShellCommandRunner,
+  parseManagedComfyUIRuntimeConfig,
+} from "./runtime/managed-comfyui-runtime";
+export type {
+  ManagedCommandRequest,
+  ManagedCommandResult,
+  ManagedCommandRunner,
+  ManagedComfyUIEndpointState,
+  ManagedProbeTransport,
+  ManagedRuntimeConfig,
+  ManagedRuntimeDependencies,
+  PowerShellCommandRunnerOptions,
+} from "./runtime/managed-comfyui-runtime";
