@@ -148,20 +148,26 @@ export async function executeGenerationJob(
   let resourcePoolIdForSlot: string | null = null;
   let resourceTimer: ReturnType<typeof setInterval> | null = null;
   let retainResource = false;
+  let resourceLeaseLost = false;
   let orchestrator: ComfyUIExecutionOrchestrator | null = null;
   let transport: ComfyUITransport | null = null;
+  const executionController = new AbortController();
+  const executionSignal = executionController.signal;
+  const forwardExternalAbort = () => executionController.abort(abortSignal?.reason);
+  if (abortSignal?.aborted) forwardExternalAbort();
+  else abortSignal?.addEventListener("abort", forwardExternalAbort, { once: true });
   const lifecycleState: { completedResult: JobExecutionResult | null } = { completedResult: null };
   const complete = (result: JobExecutionResult): JobExecutionResult => {
     lifecycleState.completedResult = result;
     return result;
   };
-  let resourceRenewalInFlight = false;
+  let resourceRenewalInFlight: Promise<void> | null = null;
   let inputCleanup: (() => Promise<void>) | null = null;
   const committedArtifacts: CollectedArtifactCandidate[] = [];
   let outputSequence = 0;
 
   try {
-    if (abortSignal?.aborted) throw new Error("execution_aborted_before_start");
+    if (executionSignal.aborted) throw new Error("execution_aborted_before_start");
     const snapshot = job.executionSnapshotJson as Record<string, unknown>;
     const backendId = typeof snapshot.executionBackendId === "string" ? snapshot.executionBackendId : "";
     const workflowDigest = typeof snapshot.workflowPackageDigest === "string" ? snapshot.workflowPackageDigest : "";
@@ -272,20 +278,19 @@ export async function executeGenerationJob(
     if (begun.status === "invalid-resource-cardinality") return invalidResourceCardinalityResult();
     requireApplied(begun, "job_or_resource_lease_lost_before_submission_boundary");
 
-    resourceTimer = setInterval(async () => {
+    resourceTimer = setInterval(() => {
       if (!resourceSlot || resourceRenewalInFlight) return;
-      resourceRenewalInFlight = true;
-      try {
+      resourceRenewalInFlight = (async () => {
         const renewed = await renewResourceSlot(
           backend.resourcePoolId, resourceSlot.slotNo, resourceSlot.leaseToken, resourceSlot.fencingToken, workerId,
         ).catch(() => false);
         if (!renewed) {
+          resourceLeaseLost = true;
           retainResource = true;
+          executionController.abort(new Error("resource_lease_lost"));
           orchestrator?.stop();
         }
-      } finally {
-        resourceRenewalInFlight = false;
-      }
+      })().finally(() => { resourceRenewalInFlight = null; });
     }, 30_000);
 
     const authHeaders = await resolveBackendAuthHeaders(backend.authType, backend.authConfigJson);
@@ -297,13 +302,21 @@ export async function executeGenerationJob(
       {
         policyRevision: sha256(backend.networkPolicyJson),
         ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
-        ...(abortSignal ? { lifecycleSignal: abortSignal } : {}),
+        lifecycleSignal: executionSignal,
       },
     );
     const activeTransport = transport;
     const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
     if (backend.environmentFingerprint !== features.environmentFingerprint) {
-      return failJob(job.id, attemptId, workerId, jobFencingToken, "Backend environment fingerprint drifted after workflow activation", "environment_drift", true);
+      return complete(await failJob(
+        job.id,
+        attemptId,
+        workerId,
+        jobFencingToken,
+        "Backend environment fingerprint drifted after workflow activation",
+        "environment_drift",
+        true,
+      ));
     }
     const modelFolders = new Map<string, string[]>();
     for (const model of workflowPackage.manifest.requirements.models) {
@@ -311,11 +324,11 @@ export async function executeGenerationJob(
         modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
       }
       if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
-        return failJob(
+        return complete(await failJob(
           job.id, attemptId, workerId, jobFencingToken,
           `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
           "environment_model_drift", true,
-        );
+        ));
       }
     }
 
@@ -330,7 +343,7 @@ export async function executeGenerationJob(
       request: { ...defaults, ...request },
       metadata: job.metadataJson as Record<string, unknown>,
       maxReferenceInputs: workflowPackage.manifest.limits.maxBatch,
-      signal: abortSignal,
+      signal: executionSignal,
     });
     inputCleanup = materialized.cleanup;
     const workflow = bindWorkflow(
@@ -381,7 +394,7 @@ export async function executeGenerationJob(
             eq(generationJobs.currentAttemptId, attemptId),
             eq(generationJobs.claimOwner, workerId),
             eq(generationJobs.claimFencingToken, jobFencingToken),
-            sql`${generationJobs.claimUntilMs} >= ${now}`,
+            sql`${generationJobs.claimUntilMs} > ${now}`,
           ));
         if (!current) throw new Error("job_claim_lost_during_cancellation_probe");
         return Boolean(current.cancelRequestedAtMs);
@@ -489,12 +502,13 @@ export async function executeGenerationJob(
         key: output.key, nodeId: output.nodeId, field: output.field,
         mediaKind: output.mediaKind, maxItems: output.maxItems,
       })),
-    }, correlationId, abortSignal);
+    }, correlationId, executionSignal);
     const abortListener = () => orchestrator?.stop();
-    abortSignal?.addEventListener("abort", abortListener, { once: true });
+    executionSignal.addEventListener("abort", abortListener, { once: true });
     try {
       const result = await orchestrator.execute(workflow);
-      if (abortSignal?.aborted) {
+      if (resourceLeaseLost) return ownershipLostResult();
+      if (executionSignal.aborted) {
         retainResource = true;
         return failJob(
           job.id, attemptId, workerId, jobFencingToken,
@@ -538,11 +552,15 @@ export async function executeGenerationJob(
         || result.phase === "SUBMISSION_UNKNOWN";
       return complete(await failJob(job.id, attemptId, workerId, jobFencingToken, result.errorMessage ?? `Execution ended in ${result.phase}`, result.errorClass ?? "execution_error", retainResource));
     } finally {
-      abortSignal?.removeEventListener("abort", abortListener);
+      executionSignal.removeEventListener("abort", abortListener);
     }
   } catch (error) {
     if (error instanceof OwnedTransitionError
       && (error.transitionStatus === "lost-race" || error.transitionStatus === "ownership-lost")) {
+      retainResource = true;
+      return ownershipLostResult();
+    }
+    if (resourceLeaseLost) {
       retainResource = true;
       return ownershipLostResult();
     }
@@ -568,26 +586,25 @@ export async function executeGenerationJob(
     retainResource = true;
     throw error;
   } finally {
+    abortSignal?.removeEventListener("abort", forwardExternalAbort);
+    if (resourceTimer) clearInterval(resourceTimer);
+    try { await resourceRenewalInFlight; } catch { /* renewal failure already fences this execution */ }
     transport?.close();
     if (!retainResource && inputCleanup) await inputCleanup().catch(() => undefined);
-    try {
-      if (resourceSlot && resourcePoolIdForSlot && !retainResource
-        && lifecycleState.completedResult?.claimDisposition === "release-terminal"
-        && lifecycle.beforeTerminalResourceRelease) {
-        try {
-          await lifecycle.beforeTerminalResourceRelease({
-            jobId: job.id,
-            attemptId,
-            resourcePoolId: resourcePoolIdForSlot,
-            slotNo: resourceSlot.slotNo,
-          });
-        } catch (error) {
-          retainResource = true;
-          throw error;
-        }
+    if (resourceSlot && resourcePoolIdForSlot && !retainResource
+      && lifecycleState.completedResult?.claimDisposition === "release-terminal"
+      && lifecycle.beforeTerminalResourceRelease) {
+      try {
+        await lifecycle.beforeTerminalResourceRelease({
+          jobId: job.id,
+          attemptId,
+          resourcePoolId: resourcePoolIdForSlot,
+          slotNo: resourceSlot.slotNo,
+        });
+      } catch (error) {
+        retainResource = true;
+        throw error;
       }
-    } finally {
-      if (resourceTimer) clearInterval(resourceTimer);
     }
     if (resourceSlot && resourcePoolIdForSlot && !retainResource) {
       await releaseResourceSlot(

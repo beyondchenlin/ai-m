@@ -34,7 +34,7 @@ export async function readExpiredJobCandidates(
       or(
         sql`${generationJobs.claimOwner} IS NULL`,
         sql`${generationJobs.claimUntilMs} IS NULL`,
-        sql`${generationJobs.claimUntilMs} < ${observedAtMs}`,
+        sql`${generationJobs.claimUntilMs} <= ${observedAtMs}`,
       ),
     ));
 
@@ -64,7 +64,7 @@ export async function readExpiredJobCandidates(
       claimOwner: job.claimOwner,
       claimUntilMs: null,
     } satisfies ExpiredJobSnapshot];
-    if (job.claimUntilMs >= observedAtMs) return [];
+    if (job.claimUntilMs > observedAtMs) return [];
     return [{
       ...base,
       claimKind: "expired",

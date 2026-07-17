@@ -204,7 +204,7 @@ export function recoverExpiredJob(
         return { status: "lost-race" } as const;
       }
       if (snapshot.claimKind === "expired"
-        && (currentJob.claimUntilMs === null || currentJob.claimUntilMs >= now)) {
+        && (currentJob.claimUntilMs === null || currentJob.claimUntilMs > now)) {
         return { status: "invalid-transition" } as const;
       }
 
@@ -351,7 +351,7 @@ export function attachOwnedAttempt(
         || current.claimOwner !== identity.workerId
         || current.claimFencingToken !== identity.jobFencingToken
         || current.claimUntilMs === null
-        || current.claimUntilMs < now
+        || current.claimUntilMs <= now
         || current.status !== "RUNNING") {
         return { status: "ownership-lost" } as const;
       }
@@ -394,7 +394,7 @@ export function cancelOwnedJobBeforeAttempt(
       || current.claimOwner !== identity.workerId
       || current.claimFencingToken !== identity.jobFencingToken
       || current.claimUntilMs === null
-      || current.claimUntilMs < now) return { status: "ownership-lost" } as const;
+      || current.claimUntilMs <= now) return { status: "ownership-lost" } as const;
     if (current.status !== "CANCEL_REQUESTED") return { status: "invalid-transition" } as const;
     const changed = tx.update(generationJobs).set({
       status: "CANCELLED",
@@ -441,7 +441,7 @@ export function cancelOwnedAttemptBeforeSubmission(
         || current.job.claimFencingToken !== identity.jobFencingToken
         || current.attempt.jobClaimFencingToken !== identity.jobFencingToken
         || current.job.claimUntilMs === null
-        || current.job.claimUntilMs < now) return { status: "ownership-lost" } as const;
+        || current.job.claimUntilMs <= now) return { status: "ownership-lost" } as const;
       if (current.job.status !== "CANCEL_REQUESTED") return { status: "invalid-transition" } as const;
       if (current.attempt.phase !== "PREPARING"
         || current.attempt.externalJobId !== null
@@ -536,7 +536,7 @@ export function beginOwnedAttemptSubmission(
       || current.claimFencingToken !== identity.jobFencingToken
       || current.attemptToken !== identity.jobFencingToken
       || current.claimUntilMs === null
-      || current.claimUntilMs < now
+      || current.claimUntilMs <= now
       || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
       return { status: "ownership-lost" } as const;
     }
@@ -564,7 +564,7 @@ export function beginOwnedAttemptSubmission(
       || slot.leaseToken !== resource.leaseToken
       || slot.fencingToken !== resource.fencingToken
       || slot.expiresAtMs === null
-      || slot.expiresAtMs < now) {
+      || slot.expiresAtMs <= now) {
       return { status: "ownership-lost" } as const;
     }
 
@@ -688,7 +688,7 @@ export function updateOwnedAttempt(
       || current.attemptResourceLeaseToken.startsWith("pending-")
       || current.attemptResourceFencingToken <= 0
       || current.claimUntilMs === null
-      || current.claimUntilMs < now
+      || current.claimUntilMs <= now
       || !(["RUNNING", "CANCEL_REQUESTED"] as JobStatus[]).includes(current.jobStatus)) {
       return { status: "ownership-lost" } as const;
     }
@@ -762,7 +762,7 @@ export function finalizeOwnedExecution(
         || current.claimFencingToken !== identity.jobFencingToken
         || current.attemptToken !== identity.jobFencingToken
         || current.claimUntilMs === null
-        || current.claimUntilMs < now
+        || current.claimUntilMs <= now
         || (current.jobStatus !== "RUNNING" && current.jobStatus !== "CANCEL_REQUESTED")) {
         return { status: "ownership-lost" } as const;
       }
@@ -841,7 +841,7 @@ export function finalizeOwnedJob(
       || current.claimOwner !== identity.workerId
       || current.claimFencingToken !== identity.jobFencingToken
       || current.claimUntilMs === null
-      || current.claimUntilMs < now
+      || current.claimUntilMs <= now
       || (current.status !== "RUNNING" && current.status !== "CANCEL_REQUESTED")) {
       return { status: "ownership-lost" } as const;
     }

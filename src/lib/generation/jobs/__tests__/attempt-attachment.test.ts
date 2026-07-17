@@ -5,6 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { db } from "@/lib/db";
 import { executionBackends, generationAttempts, generationJobs, resourcePools } from "@/lib/db/schema";
+import { terminateChildProcess, waitForChildExit, waitForIpcMessage } from "@/lib/test-helpers/child-process";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { attachOwnedAttempt } from "../state-transitions";
 
@@ -122,27 +123,32 @@ describe("owned attempt attachment", () => {
     });
     const firstWriter = launch(firstAttemptId);
     const secondWriter = launch(secondAttemptId);
-    const nextMessage = (child: ChildProcess) => new Promise<Record<string, unknown>>((resolve, reject) => {
-      child.once("message", (message) => resolve(message as Record<string, unknown>));
-      child.once("error", reject);
-    });
-    await Promise.all([nextMessage(firstWriter), nextMessage(secondWriter)]);
-    const firstResult = nextMessage(firstWriter);
-    const secondResult = nextMessage(secondWriter);
-    firstWriter.send({ go: true });
-    secondWriter.send({ go: true });
-    const [firstMessage, secondMessage] = await Promise.all([firstResult, secondResult]);
-    const first = firstMessage.result as { status: string };
-    const second = secondMessage.result as { status: string };
+    const writers: ChildProcess[] = [firstWriter, secondWriter];
+    try {
+      await Promise.all(writers.map((child) => waitForIpcMessage<{ ready: true }>(child)));
+      const firstResult = waitForIpcMessage<Record<string, unknown>>(firstWriter, 10_000);
+      const secondResult = waitForIpcMessage<Record<string, unknown>>(secondWriter, 10_000);
+      firstWriter.send({ go: true });
+      secondWriter.send({ go: true });
+      const [firstMessage, secondMessage] = await Promise.all([firstResult, secondResult]);
+      if (typeof firstMessage.error === "string") throw new Error(`first WAL writer failed: ${firstMessage.error}`);
+      if (typeof secondMessage.error === "string") throw new Error(`second WAL writer failed: ${secondMessage.error}`);
+      const first = firstMessage.result as { status: string } | undefined;
+      const second = secondMessage.result as { status: string } | undefined;
+      if (!first || !second) throw new Error("WAL writer returned an invalid result");
 
-    expect([first.status, second.status].sort()).toEqual(["applied", "ownership-lost"]);
-    const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
-    const attempts = await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, seeded.jobId));
-    const winnerId = attempts[0]?.id;
-    expect(job.currentAttemptId).toBe(winnerId);
-    expect(attempts).toHaveLength(1);
-    expect([firstAttemptId, secondAttemptId]).toContain(winnerId);
-  });
+      await Promise.all(writers.map((child) => waitForChildExit(child)));
+      expect([first.status, second.status].sort()).toEqual(["applied", "ownership-lost"]);
+      const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
+      const attempts = await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, seeded.jobId));
+      const winnerId = attempts[0]?.id;
+      expect(job.currentAttemptId).toBe(winnerId);
+      expect(attempts).toHaveLength(1);
+      expect([firstAttemptId, secondAttemptId]).toContain(winnerId);
+    } finally {
+      await Promise.allSettled(writers.map((child) => terminateChildProcess(child)));
+    }
+  }, 20_000);
 
   it("rolls back the inserted attempt when binding the job affects zero rows", async () => {
     const seeded = await seedOwnedJob();
@@ -167,5 +173,24 @@ describe("owned attempt attachment", () => {
     const attempts = await db.select().from(generationAttempts).where(eq(generationAttempts.jobId, seeded.jobId));
     expect(job.currentAttemptId).toBeNull();
     expect(attempts).toHaveLength(0);
+  });
+
+  it("rejects attempt attachment at the exact job-claim expiry boundary", async () => {
+    const seeded = await seedOwnedJob();
+    await db.update(generationJobs).set({ claimUntilMs: seeded.now })
+      .where(eq(generationJobs.id, seeded.jobId));
+
+    const result = attachOwnedAttempt({
+      jobId: seeded.jobId,
+      workerId: "worker-a",
+      jobFencingToken: 13,
+    }, {
+      clock: () => seeded.now,
+      attempt: attemptValues({ ...seeded, attemptId: crypto.randomUUID() }),
+    });
+
+    expect(result).toEqual({ status: "ownership-lost" });
+    expect(await db.select().from(generationAttempts)
+      .where(eq(generationAttempts.jobId, seeded.jobId))).toHaveLength(0);
   });
 });

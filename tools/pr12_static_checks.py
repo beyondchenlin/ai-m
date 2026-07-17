@@ -38,6 +38,32 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def find_production_interrupt_calls(
+    root: pathlib.Path, errors: list[str] | None = None
+) -> list[str]:
+    """Return direct interrupt calls outside the sole production policy module."""
+    calls: list[str] = []
+    source_root = root / "src"
+    if not source_root.exists():
+        return calls
+    for file in source_root.rglob("*.ts"):
+        relative = file.relative_to(root)
+        if "__tests__" in relative.parts or file.name.endswith((".test.ts", ".spec.ts")):
+            continue
+        relative_file = relative.as_posix()
+        try:
+            text = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            if errors is not None:
+                errors.append(f"unable to read required file: {relative_file}")
+            continue
+        if ".interrupt(" in text and relative_file != (
+            "src/lib/generation/transports/comfyui-cancellation.ts"
+        ):
+            calls.append(relative_file)
+    return calls
+
+
 def derive_node_engine(pin_contents: str) -> str:
     """Derive the package engine range from an exact stable Node version pin."""
     if pin_contents.endswith("\r\n"):
@@ -208,12 +234,7 @@ def run_checks(root: pathlib.Path = ROOT) -> list[str]:
         errors,
     )
 
-    interrupt_calls: list[str] = []
-    for file in (root / "src").rglob("*.ts"):
-        relative_file = file.relative_to(root).as_posix()
-        text = read(relative_file)
-        if ".interrupt(" in text and "comfyui-cancellation.ts" not in file.as_posix():
-            interrupt_calls.append(relative_file)
+    interrupt_calls = find_production_interrupt_calls(root, errors)
     require(
         not interrupt_calls,
         f"global interrupt call outside cancellation policy: {interrupt_calls}",

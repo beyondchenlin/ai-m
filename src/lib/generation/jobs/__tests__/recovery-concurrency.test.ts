@@ -373,7 +373,7 @@ describe("expired claim recovery concurrency", () => {
       .toHaveLength(2);
   });
 
-  it("defers job recovery after a read slot candidate is renewed, then converges after the renewed slot expires", async () => {
+  it("rejects an expired slot resurrection and lets fenced recovery converge", async () => {
     const now = 1_750_000_000_000;
     const seeded = await seedExpiredPreparingJob("RUNNING");
     const leaseToken = `lease-${seeded.attemptId}`;
@@ -388,10 +388,10 @@ describe("expired claim recovery concurrency", () => {
       expiresAtMs: now - 1,
       updatedAtMs: now - 1,
     });
-    const staleSlotCandidates = await readExpiredSlotCandidates(now);
+    const expiredSlotCandidates = await readExpiredSlotCandidates(now);
     expect(await renewResourceSlot(
       seeded.poolId, 1, leaseToken, 1, "worker-a", db, () => now,
-    )).toBe(true);
+    )).toBe(false);
     await db.update(generationJobs).set({ claimUntilMs: now + 1 })
       .where(eq(generationJobs.id, seeded.jobId));
 
@@ -401,12 +401,7 @@ describe("expired claim recovery concurrency", () => {
       jobId: seeded.jobId,
       status: "deferred-resource-slot",
     }]);
-    expect(await applyExpiredSlotCandidates(staleSlotCandidates, db, () => now + 2))
-      .toMatchObject([{ disposition: "retained", reason: "slot-changed" }]);
-
-    const renewedExpiry = now + 120_000;
-    const freshSlotCandidates = await readExpiredSlotCandidates(renewedExpiry + 1);
-    expect(await applyExpiredSlotCandidates(freshSlotCandidates, db, () => renewedExpiry + 1))
+    expect(await applyExpiredSlotCandidates(expiredSlotCandidates, db, () => now + 2))
       .toMatchObject([{ disposition: "reconciled", jobDisposition: "requeued" }]);
     const [job] = await db.select().from(generationJobs).where(eq(generationJobs.id, seeded.jobId));
     const [slot] = await db.select().from(resourcePoolSlots).where(eq(resourcePoolSlots.resourcePoolId, seeded.poolId));

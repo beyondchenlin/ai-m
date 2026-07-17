@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { eq, and } from "drizzle-orm";
@@ -16,6 +16,7 @@ import {
   generationAttempts,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
+import { terminateChildProcess } from "@/lib/test-helpers/child-process";
 import {
   acquireResourceSlot,
   InvalidResourceCardinalityError,
@@ -43,7 +44,10 @@ function spawnAcquireProcess(input: {
   workerId: string;
   readyPath: string;
   goPath: string;
-}): Promise<Awaited<ReturnType<typeof acquireResourceSlot>>> {
+}): {
+  child: ChildProcess;
+  result: Promise<Awaited<ReturnType<typeof acquireResourceSlot>>>;
+} {
   const script = `
     import { existsSync, writeFileSync } from "node:fs";
     import { acquireResourceSlot } from "./src/lib/generation/resources/leases.ts";
@@ -60,12 +64,12 @@ function spawnAcquireProcess(input: {
       process.stdout.write(JSON.stringify(result));
     })().catch((error) => { console.error(error); process.exitCode = 1; });
   `;
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.resolve("node_modules/tsx/dist/cli.mjs"), "-e", script], {
-      cwd: process.cwd(),
-      env: { ...process.env, DATABASE_URL: `file:${input.dbPath}` },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const child = spawn(process.execPath, [path.resolve("node_modules/tsx/dist/cli.mjs"), "-e", script], {
+    cwd: process.cwd(),
+    env: { ...process.env, DATABASE_URL: `file:${input.dbPath}` },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const result = new Promise<Awaited<ReturnType<typeof acquireResourceSlot>>>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += String(chunk); });
@@ -76,6 +80,7 @@ function spawnAcquireProcess(input: {
       else resolve(JSON.parse(stdout) as Awaited<ReturnType<typeof acquireResourceSlot>>);
     });
   });
+  return { child, result };
 }
 
 async function waitForFiles(paths: string[], timeoutMs = 10_000): Promise<void> {
@@ -291,6 +296,33 @@ describe("PR-11: 资源槽位租约", () => {
     )).toBe(false);
   });
 
+  it("does not resurrect a resource lease at its exact expiry boundary", async () => {
+    const now = Date.now();
+    const seeded = await createOwnedPreparingAttempt({ claimUntilMs: now + 60_000 });
+    const slot = await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId);
+    expect(slot).not.toBeNull();
+    await db.update(generationAttempts).set({
+      resourceSlotNo: slot!.slotNo,
+      resourceLeaseToken: slot!.leaseToken,
+      resourceFencingToken: slot!.fencingToken,
+    }).where(eq(generationAttempts.id, seeded.attemptId));
+    await db.update(resourcePoolSlots).set({ expiresAtMs: now })
+      .where(and(
+        eq(resourcePoolSlots.resourcePoolId, seeded.poolId),
+        eq(resourcePoolSlots.slotNo, slot!.slotNo),
+      ));
+
+    expect(await renewResourceSlot(
+      seeded.poolId,
+      slot!.slotNo,
+      slot!.leaseToken,
+      slot!.fencingToken,
+      seeded.workerId,
+      db,
+      () => now,
+    )).toBe(false);
+  });
+
   it("renews a terminal attempt slot while its claim is held for managed restart readiness", async () => {
     const seeded = await createOwnedPreparingAttempt({ claimUntilMs: Date.now() + 60_000 });
     const slot = (await acquireResourceSlot(seeded.poolId, seeded.attemptId, seeded.workerId))!;
@@ -354,28 +386,29 @@ describe("PR-11: 资源槽位租约", () => {
     const barrierId = crypto.randomUUID();
     const goPath = `${ctx.dbPath}.${barrierId}.go`;
     const readyPaths = [1, 2].map((number) => `${ctx.dbPath}.${barrierId}.ready-${number}`);
+    const acquisitions = readyPaths.map((readyPath) => spawnAcquireProcess({
+      dbPath: ctx.dbPath,
+      poolId,
+      attemptId,
+      workerId: "worker-1",
+      readyPath,
+      goPath,
+    }));
     try {
-      const acquisitions = readyPaths.map((readyPath) => spawnAcquireProcess({
-        dbPath: ctx.dbPath,
-        poolId,
-        attemptId,
-        workerId: "worker-1",
-        readyPath,
-        goPath,
-      }));
       await waitForFiles(readyPaths);
       writeFileSync(goPath, "go");
-      const [left, right] = await Promise.all(acquisitions);
+      const [left, right] = await Promise.all(acquisitions.map(({ result }) => result));
 
       expect(left).toEqual(right);
       const owned = await db.select().from(resourcePoolSlots)
         .where(eq(resourcePoolSlots.ownerAttemptId, attemptId));
       expect(owned).toHaveLength(1);
     } finally {
+      await Promise.allSettled(acquisitions.map(({ child }) => terminateChildProcess(child)));
       rmSync(goPath, { force: true });
       for (const readyPath of readyPaths) rmSync(readyPath, { force: true });
     }
-  });
+  }, 20_000);
 
   it("keeps a second worker out while the first worker holds the slot through managed readiness", async () => {
     const { poolId, backendId } = await createBackendAndPool("image", 1);
@@ -387,28 +420,29 @@ describe("PR-11: 资源槽位租约", () => {
     const barrierId = crypto.randomUUID();
     const readyPath = `${ctx.dbPath}.${barrierId}.ready`;
     const goPath = `${ctx.dbPath}.${barrierId}.go`;
+    const competing = spawnAcquireProcess({
+      dbPath: ctx.dbPath,
+      poolId,
+      attemptId: secondAttemptId,
+      workerId: "worker-2",
+      readyPath,
+      goPath,
+    });
     try {
-      const competing = spawnAcquireProcess({
-        dbPath: ctx.dbPath,
-        poolId,
-        attemptId: secondAttemptId,
-        workerId: "worker-2",
-        readyPath,
-        goPath,
-      });
       await waitForFiles([readyPath]);
       writeFileSync(goPath, "readiness-still-pending");
-      await expect(competing).resolves.toBeNull();
+      await expect(competing.result).resolves.toBeNull();
 
       expect(await releaseResourceSlot(
         poolId, first.slotNo, firstAttemptId, first.leaseToken, first.fencingToken,
       )).toBe(true);
       await expect(acquireResourceSlot(poolId, secondAttemptId, "worker-2")).resolves.not.toBeNull();
     } finally {
+      await terminateChildProcess(competing.child);
       rmSync(goPath, { force: true });
       rmSync(readyPath, { force: true });
     }
-  });
+  }, 20_000);
 
   it("槽位占满后应返回 null", async () => {
     const { poolId, backendId } = await createBackendAndPool("image", 1);
@@ -670,6 +704,25 @@ describe("PR-11: 工作任务领取", () => {
 
     const wrong = await renewJobClaim(job.id, "worker-1", 999);
     expect(wrong).toBe(false);
+  });
+
+  it("does not resurrect an expired job claim but renews a held terminal restart window", async () => {
+    const now = Date.now();
+    const jobId = await createQueuedJob();
+    await db.update(generationJobs).set({
+      status: "RUNNING",
+      claimOwner: "worker-1",
+      claimUntilMs: now,
+      claimFencingToken: 9,
+    }).where(eq(generationJobs.id, jobId));
+
+    expect(await renewJobClaim(jobId, "worker-1", 9, db, () => now)).toBe(false);
+
+    await db.update(generationJobs).set({
+      status: "SUCCEEDED",
+      claimUntilMs: now + 60_000,
+    }).where(eq(generationJobs.id, jobId));
+    expect(await renewJobClaim(jobId, "worker-1", 9, db, () => now)).toBe(true);
   });
 
   it("过期回收后旧 fencingToken 应失效", async () => {

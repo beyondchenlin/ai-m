@@ -13,7 +13,7 @@ import {
   generationAttempts,
   generationEvents,
 } from "@/lib/db/schema";
-import { eq, and, isNull, sql } from "drizzle-orm";
+import { eq, and, inArray, isNull, sql } from "drizzle-orm";
 import {
   applyExpiredJobCandidates,
   readExpiredJobCandidates,
@@ -30,8 +30,6 @@ export const LEASE_CONFIG = {
   RESOURCE_LEASE_MS: 120_000,
   /** 心跳间隔 (ms) */
   HEARTBEAT_INTERVAL_MS: 10_000,
-  /** 租约过期宽限期 (ms) */
-  GRACE_PERIOD_MS: 5_000,
 } as const;
 
 class ResourceCardinalityRollback extends Error {}
@@ -197,6 +195,7 @@ export async function renewResourceSlot(
       eq(resourcePoolSlots.fencingToken, fencingToken),
     )).get();
     if (!slot?.ownerAttemptId) return false;
+    if (slot.expiresAtMs === null || slot.expiresAtMs <= now) return false;
     const attempt = tx.select().from(generationAttempts)
       .where(eq(generationAttempts.id, slot.ownerAttemptId)).get();
     if (!attempt
@@ -388,7 +387,7 @@ export async function claimJob(
           SELECT "rowid" FROM ${generationJobs}
           WHERE ${generationJobs.status} = 'QUEUED'
             AND ${generationJobs.capability} = ${capability}
-            AND (${generationJobs.claimOwner} IS NULL OR ${generationJobs.claimUntilMs} < ${now})
+            AND (${generationJobs.claimOwner} IS NULL OR ${generationJobs.claimUntilMs} <= ${now})
           ORDER BY ${generationJobs.createdAtMs}
           LIMIT 1
         )`,
@@ -404,18 +403,24 @@ export async function renewJobClaim(
   jobId: string,
   workerId: string,
   fencingToken: number,
+  database: DB = db,
+  clock: () => number = Date.now,
 ): Promise<boolean> {
-  const now = Date.now();
+  const now = clock();
   const claimUntilMs = now + LEASE_CONFIG.CLAIM_LEASE_MS;
 
-  const [updated] = await db
+  const [updated] = await database
     .update(generationJobs)
     .set({ claimUntilMs, updatedAtMs: now })
     .where(
       and(
         eq(generationJobs.id, jobId),
+        // The worker intentionally retains ownership through managed-runtime
+        // restart/readiness after durable terminal finalization.
+        inArray(generationJobs.status, ["RUNNING", "CANCEL_REQUESTED", "SUCCEEDED", "CANCELLED", "FAILED"]),
         eq(generationJobs.claimOwner, workerId),
         eq(generationJobs.claimFencingToken, fencingToken),
+        sql`${generationJobs.claimUntilMs} > ${now}`,
       ),
     )
     .returning();
@@ -514,7 +519,7 @@ export async function readExpiredSlotCandidates(
   }).from(resourcePoolSlots)
     .leftJoin(generationAttempts, eq(generationAttempts.id, resourcePoolSlots.ownerAttemptId))
     .leftJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
-    .where(sql`${resourcePoolSlots.expiresAtMs} < ${scanNow} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`);
+    .where(sql`${resourcePoolSlots.expiresAtMs} <= ${scanNow} AND ${resourcePoolSlots.ownerAttemptId} IS NOT NULL`);
 
   return rows.flatMap(({
     slot,
@@ -606,7 +611,7 @@ export async function applyExpiredSlotCandidates(
         if (currentJob?.currentAttemptId === currentAttempt.id
           && currentJob.claimOwner !== null
           && currentJob.claimUntilMs !== null
-          && currentJob.claimUntilMs >= scanNow) {
+          && currentJob.claimUntilMs > scanNow) {
           return { disposition: "retained", reason: "live-job-claim" } as const;
         }
 
@@ -667,7 +672,7 @@ export async function applyExpiredSlotCandidates(
             eq(resourcePoolSlots.leaseToken, slot.leaseToken),
             eq(resourcePoolSlots.fencingToken, slot.fencingToken),
             eq(resourcePoolSlots.expiresAtMs, slot.expiresAtMs),
-            sql`${resourcePoolSlots.expiresAtMs} < ${scanNow}`,
+            sql`${resourcePoolSlots.expiresAtMs} <= ${scanNow}`,
           )).run();
           if (released.changes !== 1) throw new SlotReconciliationRollback();
 
@@ -718,7 +723,7 @@ export async function applyExpiredSlotCandidates(
           eq(resourcePoolSlots.leaseToken, slot.leaseToken),
           eq(resourcePoolSlots.fencingToken, slot.fencingToken),
           eq(resourcePoolSlots.expiresAtMs, slot.expiresAtMs),
-          sql`${resourcePoolSlots.expiresAtMs} < ${scanNow}`,
+          sql`${resourcePoolSlots.expiresAtMs} <= ${scanNow}`,
         )).returning({ slotNo: resourcePoolSlots.slotNo }).all();
         if (released.length !== 1) {
           return { disposition: "retained", reason: "slot-changed" } as const;

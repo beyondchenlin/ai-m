@@ -45,7 +45,6 @@ vi.mock("@/lib/generation/resources/leases", () => ({
     CLAIM_LEASE_MS: 30_000,
     RESOURCE_LEASE_MS: 120_000,
     HEARTBEAT_INTERVAL_MS: 10_000,
-    GRACE_PERIOD_MS: 5_000,
   },
 }));
 
@@ -116,6 +115,57 @@ describe("PR-11: Worker 信号处理", () => {
 
     expect(process.exitCode).toBe(0);
     expect(closeAllConnectionsMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe("job claim heartbeat", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("fails closed on renewal errors and never overlaps renewal calls", async () => {
+    vi.useFakeTimers();
+    const firstRenewal = deferred<boolean>();
+    const renew = vi.fn(() => firstRenewal.promise);
+    const onOwnershipLost = vi.fn();
+    const onFailure = vi.fn();
+    const { startJobClaimHeartbeat } = await import("../index");
+    const stop = startJobClaimHeartbeat({
+      intervalMs: 10_000,
+      renew,
+      onOwnershipLost,
+      onFailure,
+    });
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(renew).toHaveBeenCalledOnce();
+    firstRenewal.resolve(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({ message: "job_claim_lost" }));
+    expect(onOwnershipLost).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(renew).toHaveBeenCalledOnce();
+    stop();
+  });
+
+  it("treats a database renewal exception as ownership loss", async () => {
+    vi.useFakeTimers();
+    const databaseError = new Error("database unavailable");
+    const onOwnershipLost = vi.fn();
+    const { startJobClaimHeartbeat } = await import("../index");
+    startJobClaimHeartbeat({
+      intervalMs: 10_000,
+      renew: async () => { throw databaseError; },
+      onOwnershipLost,
+    });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(onOwnershipLost).toHaveBeenCalledWith(expect.objectContaining({
+      message: "job_claim_renewal_failed",
+      cause: databaseError,
+    }));
   });
 });
 

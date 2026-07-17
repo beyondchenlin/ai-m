@@ -145,38 +145,65 @@ export function initializeManagedRuntime<TJob, TResult extends { claimDispositio
 
 // 运行状态
 let running = true;
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let heartbeatStop: (() => void) | null = null;
 let recoveryTimer: ReturnType<typeof setInterval> | null = null;
 let currentAbortController: AbortController | null = null;
 let currentJobPromise: Promise<void> | null = null;
 let shutdownStarted = false;
 let recoveryScanRunning = false;
 
+export function startJobClaimHeartbeat(input: {
+  intervalMs: number;
+  renew(): Promise<boolean>;
+  onOwnershipLost(reason: Error): void;
+  onFailure?: (reason: Error) => void;
+}): () => void {
+  let stopped = false;
+  let renewalInFlight = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+  };
+  const failClosed = (reason: Error) => {
+    if (stopped) return;
+    stop();
+    input.onFailure?.(reason);
+    input.onOwnershipLost(reason);
+  };
+  const timer = setInterval(() => {
+    if (stopped || renewalInFlight) return;
+    renewalInFlight = true;
+    void input.renew().then((renewed) => {
+      if (!renewed) failClosed(new Error("job_claim_lost"));
+    }).catch((error: unknown) => {
+      failClosed(new Error("job_claim_renewal_failed", { cause: error }));
+    }).finally(() => {
+      renewalInFlight = false;
+    });
+  }, input.intervalMs);
+  return stop;
+}
+
 /** 心跳续期循环 */
 function startHeartbeat(jobId: string, fencingToken: number) {
   stopHeartbeat();
-
-  heartbeatTimer = setInterval(async () => {
-    try {
-      const ok = await renewJobClaim(jobId, WORKER_ID, fencingToken);
-      if (!ok) {
-        console.error(`[${WORKER_ID}] Heartbeat failed for job ${jobId}, fencing token mismatch`);
-        // Ownership was lost. Abort local coordination; external state will be reconciled.
-        currentAbortController?.abort(new Error("job_claim_lost"));
-        stopHeartbeat();
-      }
-    } catch (err) {
-      console.error(`[${WORKER_ID}] Heartbeat error:`, err);
-    }
-  }, LEASE_CONFIG.HEARTBEAT_INTERVAL_MS);
+  heartbeatStop = startJobClaimHeartbeat({
+    intervalMs: LEASE_CONFIG.HEARTBEAT_INTERVAL_MS,
+    renew: () => renewJobClaim(jobId, WORKER_ID, fencingToken),
+    onFailure: (reason) => {
+      console.error(`[${WORKER_ID}] Heartbeat failed for job ${jobId}: ${reason.message}`);
+    },
+    // If renewal cannot prove ownership, stop all local execution and let the
+    // fenced recovery path classify any possibly submitted external work.
+    onOwnershipLost: (reason) => currentAbortController?.abort(reason),
+  });
 }
 
 /** 停止心跳 */
 function stopHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
+  heartbeatStop?.();
+  heartbeatStop = null;
 }
 
 /** 恢复扫描器 */

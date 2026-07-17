@@ -399,7 +399,10 @@ describe("worker completion after cancellation intent", () => {
     expect((await db.select().from(generationJobs).where(eq(generationJobs.id, arranged.jobId)))[0]).toMatchObject({
       status: "SUCCEEDED",
     });
-    expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toEqual({ policyRevision: sha256({}) });
+    expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toMatchObject({
+      policyRevision: sha256({}),
+      lifecycleSignal: expect.any(AbortSignal),
+    });
   });
 
   it("holds the physical resource slot until the terminal lifecycle hook completes", async () => {
@@ -428,6 +431,31 @@ describe("worker completion after cancellation intent", () => {
     expect(events).toEqual(["restart-start", "readiness-complete", "release-slot"]);
   });
 
+  it("runs the terminal lifecycle gate before releasing a slot after environment drift", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    mocks.probeBackendFeatures.mockResolvedValue({
+      ...defaultBackendFeatures(),
+      environmentFingerprint: "env:drifted",
+    });
+    const events: string[] = [];
+    mocks.releaseResourceSlot.mockImplementation(async () => {
+      events.push("release-slot");
+      return true;
+    });
+
+    const result = await arranged.execute({
+      beforeTerminalResourceRelease: async () => {
+        events.push("restart-and-readiness");
+      },
+    });
+
+    expect(result).toMatchObject({
+      finalPhase: "NEEDS_ATTENTION",
+      claimDisposition: "release-terminal",
+    });
+    expect(events).toEqual(["restart-and-readiness", "release-slot"]);
+  });
+
   it("does not create a transport or probe when the shared slot is unavailable", async () => {
     const arranged = await arrangeExecution("known-completed");
     mocks.acquireResourceSlot.mockResolvedValue(null);
@@ -437,6 +465,35 @@ describe("worker completion after cancellation intent", () => {
     expect(result).toMatchObject({ success: false, errorClass: "resource_exhausted", claimDisposition: "release-terminal" });
     expect(mocks.createComfyUITransport).not.toHaveBeenCalled();
     expect(mocks.probeBackendFeatures).not.toHaveBeenCalled();
+  });
+
+  it("aborts pre-submission network work and retains ownership when resource renewal fails", async () => {
+    const arranged = await arrangeExecution("known-completed");
+    mocks.renewResourceSlot.mockResolvedValue(false);
+    mocks.probeBackendFeatures.mockImplementation(async () => {
+      const signal = mocks.createComfyUITransport.mock.calls[0]?.[4]?.lifecycleSignal as AbortSignal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const execution = arranged.execute();
+      await vi.waitFor(() => expect(mocks.probeBackendFeatures).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await expect(execution).resolves.toMatchObject({
+        success: false,
+        finalPhase: "OWNERSHIP_LOST",
+        claimDisposition: "retain-recovery",
+      });
+      const signal = mocks.createComfyUITransport.mock.calls[0]?.[4]?.lifecycleSignal as AbortSignal;
+      expect(signal.aborted).toBe(true);
+      expect(mocks.materializeWorkflowInputs).not.toHaveBeenCalled();
+      expect(mocks.releaseResourceSlot).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects a missing persisted feature snapshot before slot acquisition or network access", async () => {

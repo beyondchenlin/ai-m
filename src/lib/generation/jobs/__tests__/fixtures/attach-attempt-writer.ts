@@ -5,7 +5,7 @@ const [jobId, attemptId, poolId, backendId, nowText] = process.argv.slice(2);
 const now = Number(nowText);
 
 process.send?.({ ready: true });
-process.once("message", () => {
+process.once("message", async () => {
   try {
     const result = attachOwnedAttempt({
       jobId,
@@ -33,10 +33,17 @@ process.once("message", () => {
         updatedAtMs: now,
       },
     });
-    process.send?.({ result });
+    await new Promise<void>((resolve, reject) => {
+      if (!process.send) { resolve(); return; }
+      process.send({ result }, (error) => error ? reject(error) : resolve());
+    });
   } catch (error) {
-    process.send?.({ error: error instanceof Error ? error.message : String(error) });
+    await new Promise<void>((resolve) => {
+      if (!process.send) { resolve(); return; }
+      process.send({ error: error instanceof Error ? error.message : String(error) }, () => resolve());
+    });
   } finally {
     getSqlite().close();
+    process.disconnect?.();
   }
 });
