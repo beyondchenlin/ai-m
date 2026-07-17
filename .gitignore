@@ -55,3 +55,12 @@ run_kling.sh
 # Python cache
 __pycache__/
 *.py[cod]
+
+# generated media and local Codex runtime artifacts
+/hyperframes/renders/
+/hyperframes/assets/bili/*.mp4
+/hyperframes/assets/*.wav
+/hyperframes/assets/*.mp3
+/hyperframes/assets/trimmed/
+/.codex-runtime/
+/ai-m-*.zip
