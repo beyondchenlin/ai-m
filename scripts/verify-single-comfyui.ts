@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocketStream } from "undici";
 import { bindWorkflow } from "../src/lib/generation/workflows/binder";
+import { adaptComfyWorkflowRuntimeChoices } from "../src/lib/generation/transports/comfyui-runtime-workflow";
 import { canonicalize } from "../src/lib/generation/workflows/canonical";
 import { parseCompiledBindings } from "../src/lib/generation/workflows/compiled";
 import { parseWorkflowManifest } from "../src/lib/generation/workflows/manifest";
@@ -15,6 +16,13 @@ import { loadProductionTask4PrivateKey } from "./pixelle-trust-store";
 import { signTask4Evidence, verifyGenerationPackageForImport, verifyPreparedGenerationPackage } from "./verify-generation-package";
 import { createPowerShellCommandRunner } from "../src/lib/generation/runtime/managed-comfyui-runtime";
 import { comparePixelleProcessIdentity, getPixelleProcessIdentity, getPixelleProcessLiveness } from "./pixelle-process-identity";
+import { detectImageDimensions, detectMimeType, validateMimeType } from "../src/lib/generation/archiving/content-detection";
+import { validateCompleteMediaFile } from "../src/lib/generation/archiving/media-completeness";
+import { probeMediaDurationMs } from "../src/lib/generation/media-probe";
+import {
+  captureRequiredModelIdentityDigest,
+  verifyRequiredModelFiles,
+} from "../src/lib/generation/model-file-inventory";
 
 const BASE_URL = "http://127.0.0.1:8000" as const;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -39,11 +47,22 @@ export interface Task4Session {
   connectionId: string;
   systemStats(): Promise<Record<string, unknown>>;
   objectInfo(): Promise<Record<string, unknown>>;
+  responseSha256?(path: "/system_stats" | "/object_info"): string | undefined;
   models(folder: string): Promise<string[]>;
-  uploadReferenceAudio(input: { filename: string; bytes: Buffer; mimeType: string }): Promise<string>;
+  uploadReferenceInput(input: { filename: string; bytes: Buffer; mimeType: string }): Promise<string>;
   submit(workflow: Record<string, unknown>, clientId: string): Promise<string>;
   history(promptId: string): Promise<Task4History | undefined>;
-  downloadToFile(file: { filename: string; subfolder: string; type: string }, targetFile: string, maximumBytes: number): Promise<{ sha256: string; byteLength: number; mediaKind: "audio" | "image" | "video" }>;
+  downloadToFile(file: { filename: string; subfolder: string; type: string }, targetFile: string, maximumBytes: number): Promise<{
+    sha256: string;
+    byteLength: number;
+    mediaKind: "audio" | "image" | "video";
+    declaredMimeType: string;
+    detectedMimeType: string;
+    structureValidated: true;
+    width?: number;
+    height?: number;
+    durationMs?: number;
+  }>;
   assertHealthy(): void;
   close(): Promise<void>;
 }
@@ -58,6 +77,7 @@ export interface VerifySingleOptions {
   archiveDir: string;
   parameters: Record<string, Record<string, unknown>>;
   referenceAudioFile?: string;
+  referenceImageFiles?: readonly string[];
   completionTimeoutMs?: number;
   pollIntervalMs?: number;
   evidenceTtlMs?: number;
@@ -65,9 +85,13 @@ export interface VerifySingleOptions {
   publicKey?: string | Buffer;
   committedDir?: string;
   blockedMarkerFile?: string;
+  inputCleanupMarkerFile?: string;
   recoveryConfirmation?: string;
   lockFile?: string;
   prepareLockFile?: string;
+  modelsRoot?: string;
+  sharedInputRoot?: string;
+  packageNames?: readonly string[];
 }
 
 export interface Task4Dependencies {
@@ -76,8 +100,10 @@ export interface Task4Dependencies {
   restart(): Promise<{ stoppedAtMs: number; restartedAtMs: number }>;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
-  /** Test seam only. Production always requires the fixed six-package set. */
+  /** Test seam only. Production always requires the fixed package set. */
   expectedPackageNames?: readonly string[];
+  /** Test seam only. Simulates a filesystem that supports durable directory flushes. */
+  allowUnsupportedDirectorySyncForTest?: true;
   writeRestartMarker?: (file: string, payload: Record<string, unknown>) => Promise<void>;
   removeRestartMarker?: (file: string) => Promise<void>;
   afterRestartMarker?: () => Promise<void>;
@@ -85,18 +111,45 @@ export interface Task4Dependencies {
   isProcessAlive?: (pid: number) => Promise<boolean | "unknown">;
   lockStaleMs?: number;
   beforeFinalCurrentCheck?: () => Promise<void>;
+  removeUploadedReferenceInputs?: (names: readonly string[]) => Promise<void>;
 }
 
-const PIXELLE_PACKAGE_NAMES = ["tts-index2", "tts-index2-8g", "tts-omnivoice-longform-bf16", "tts-omnivoice-clone-duration-bf16", "image-z-image-turbo", "video-wan2.1-fusionx"] as const;
+const PIXELLE_PACKAGE_NAMES = [
+  "tts-index2",
+  "tts-index2-8g",
+  "tts-omnivoice-longform-bf16",
+  "tts-omnivoice-clone-duration-bf16",
+  "image-z-image-turbo",
+  "image-z-image-base-bf16",
+  "image-z-image-turbo-gguf-q4",
+  "image-z-image-turbo-gguf-q8",
+  "image-qwen-edit-2511-gguf-q4",
+  "video-wan2.1-fusionx",
+] as const;
 
 export function parseTask4Mode(env: Record<string, string | undefined>): VerifySingleOptions["mode"] {
   const raw = env.TASK4_MODE?.trim() || "inventory-only";
   const mode = raw === "dry-run" ? "inventory-only" : raw;
   if (mode !== "inventory-only" && mode !== "verify") throw new Error("TASK4_MODE must be dry-run, inventory-only or verify");
-  if (mode === "verify" && env.TASK4_CONFIRM_RESTART !== "RESTART-127.0.0.1:8000") {
-    throw new Error("TASK4_CONFIRM_RESTART must exactly equal RESTART-127.0.0.1:8000 in verify mode");
+  const endpoint = env.AI_M_MANAGED_COMFYUI_BASE_URL?.trim() || BASE_URL;
+  const port = canonicalManagedBaseUrl(endpoint).port;
+  if (mode === "verify" && env.TASK4_CONFIRM_RESTART !== `RESTART-127.0.0.1:${port}`) {
+    throw new Error(`TASK4_CONFIRM_RESTART must exactly equal RESTART-127.0.0.1:${port} in verify mode`);
   }
   return mode;
+}
+
+function canonicalManagedBaseUrl(raw: string): { baseUrl: string; port: number } {
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { throw new Error("Task 4 endpoint is invalid"); }
+  const hostname = parsed.hostname.toLowerCase();
+  const port = Number(parsed.port);
+  if (parsed.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(hostname)
+    || !Number.isSafeInteger(port) || port < 8000 || port > 8999
+    || parsed.pathname !== "/" || parsed.search || parsed.hash || parsed.username || parsed.password) {
+    throw new Error("Task 4 endpoint must be loopback on ports 8000-8999");
+  }
+  return { baseUrl: `http://127.0.0.1:${port}`, port };
 }
 
 interface PackageInventory {
@@ -196,6 +249,10 @@ function assertInventory(pkg: PackageInventory, objects: Record<string, unknown>
     if (binding.source === "voice-reference" && actualType !== "STRING" && !(Array.isArray(actualType) && actualType.every((item) => typeof item === "string"))) {
       throw new Error(`${pkg.packageName} voice reference actual type is malformed`);
     }
+    if (binding.source === "reference-image" && actualType !== "STRING"
+      && !(Array.isArray(actualType) && actualType.every((item) => typeof item === "string"))) {
+      throw new Error(`${pkg.packageName} image reference actual type is malformed`);
+    }
     if ((binding.valueType === "integer" || binding.valueType === "number") && (binding.minimum !== undefined || binding.maximum !== undefined)) {
       const config = tuple[1];
       if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error(`${pkg.packageName} numeric binding ${binding.key} lacks actual range metadata`);
@@ -218,7 +275,12 @@ function assertInventory(pkg: PackageInventory, objects: Record<string, unknown>
     }
   }
   for (const model of pkg.manifest.requirements.models) {
-    if (!(models.get(model.folder) ?? []).map((candidate) => candidate.replace(/\\/g, "/")).includes(model.filename.replace(/\\/g, "/"))) throw new Error(`${pkg.packageName} is missing required model ${model.folder}/${model.filename}`);
+    if (model.runtimeVisible === false) continue;
+    const runtimeFolder = model.runtimeFolder ?? model.folder;
+    if (models.has(runtimeFolder)
+      && !models.get(runtimeFolder)!.map((candidate) => candidate.replace(/\\/g, "/")).includes(model.filename.replace(/\\/g, "/"))) {
+      throw new Error(`${pkg.packageName} is missing required model ${model.folder}/${model.filename}`);
+    }
   }
 }
 
@@ -273,25 +335,192 @@ async function archiveBytes(file: string, bytes: Buffer): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+async function readStableControlledFile(file: string, minimum: number, maximum: number, label: string): Promise<Buffer> {
+  const resolved = path.resolve(file);
+  const beforePath = await fs.lstat(resolved);
+  if (!beforePath.isFile() || beforePath.isSymbolicLink()
+    || beforePath.size < minimum || beforePath.size > maximum) {
+    throw new Error(`${label} must be a bounded regular no-link file`);
+  }
+  const handle = await fs.open(resolved, "r");
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.size !== beforePath.size
+      || before.dev !== beforePath.dev || before.ino !== beforePath.ino) {
+      throw new Error(`${label} changed before it was read`);
+    }
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (read.bytesRead === 0) throw new Error(`${label} ended before its declared size`);
+      offset += read.bytesRead;
+    }
+    const after = await handle.stat();
+    const afterPath = await fs.lstat(resolved);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size
+      || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+      || afterPath.dev !== before.dev || afterPath.ino !== before.ino
+      || afterPath.size !== before.size || afterPath.mtimeMs !== before.mtimeMs
+      || afterPath.ctimeMs !== before.ctimeMs || afterPath.isSymbolicLink()) {
+      throw new Error(`${label} changed while it was read`);
+    }
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function validateControlledMediaBytes(
+  runDir: string,
+  bytes: Buffer,
+  mimeType: string,
+  mediaKind: "audio" | "image",
+): Promise<void> {
+  const temporary = path.join(runDir, `.controlled-input-${randomUUID()}`);
+  await fs.writeFile(temporary, bytes, { flag: "wx" });
+  try {
+    if (!await validateCompleteMediaFile(temporary, mimeType, bytes.length)) {
+      throw new Error(`Controlled ${mediaKind} file is structurally incomplete`);
+    }
+    if (mediaKind === "image") {
+      const dimensions = detectImageDimensions(bytes, mimeType);
+      if (!dimensions || dimensions.width < 1 || dimensions.height < 1
+        || dimensions.width * dimensions.height > 100_000_000) {
+        throw new Error("Controlled image dimensions are invalid or excessive");
+      }
+    } else {
+      const durationMs = await probeMediaDurationMs(temporary, { maxDurationMs: 60 * 60_000 });
+      if (!durationMs || durationMs <= 0) throw new Error("Controlled audio duration is invalid");
+    }
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+function controlledUploadName(name: string): boolean {
+  return /^task4-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-(?:[1-9][0-9]*-)?[A-Za-z0-9._-]{1,180}$/i.test(name);
+}
+
+export async function removeManagedControlledUploads(
+  sharedInputRoot: string,
+  names: readonly string[],
+): Promise<void> {
+  const root = path.resolve(sharedInputRoot);
+  const rootStat = await fs.lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("Managed shared input root must be a regular directory");
+  }
+  const realRoot = await fs.realpath(root);
+  if (path.normalize(realRoot).toLowerCase() !== path.normalize(root).toLowerCase()) {
+    throw new Error("Managed shared input root must use its canonical path");
+  }
+  for (const name of [...new Set(names)].sort()) {
+    if (!controlledUploadName(name) || path.basename(name) !== name) {
+      throw new Error("Controlled upload cleanup name is unsafe");
+    }
+    const file = path.join(root, name);
+    let stat;
+    try { stat = await fs.lstat(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink() || await fs.realpath(file) !== file) {
+      throw new Error("Controlled upload cleanup target is not a canonical regular file");
+    }
+    await fs.rm(file);
+    try {
+      await fs.lstat(file);
+      throw new Error("Controlled upload cleanup did not remove its target");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+async function cleanupUploadedReferenceInputs(
+  options: VerifySingleOptions,
+  dependencies: Task4Dependencies,
+  names: readonly string[],
+): Promise<void> {
+  if (names.length === 0) return;
+  if (dependencies.removeUploadedReferenceInputs) {
+    await dependencies.removeUploadedReferenceInputs(names);
+    return;
+  }
+  if (options.sharedInputRoot) {
+    await removeManagedControlledUploads(options.sharedInputRoot, names);
+    return;
+  }
+  if (process.env.NODE_ENV === "test" && dependencies.expectedPackageNames) return;
+  throw new Error("Shared input cleanup root is required for formal verification");
+}
+
+function allowUnsupportedDirectorySyncForTest(dependencies: Task4Dependencies): boolean {
+  return process.env.NODE_ENV === "test"
+    && (dependencies.expectedPackageNames !== undefined || dependencies.allowUnsupportedDirectorySyncForTest === true);
+}
+
+export async function syncDirectory(directory: string, allowUnsupportedForTest = false): Promise<void> {
   const handle = await fs.open(directory, "r");
   try { await handle.sync(); }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (process.platform !== "win32" || (code !== "EPERM" && code !== "EINVAL")) throw error;
+    if (allowUnsupportedForTest && process.platform === "win32" && (code === "EPERM" || code === "EINVAL")) return;
+    if (process.platform === "win32" && (code === "EPERM" || code === "EINVAL")) {
+      const nativeFlush = [
+        "$ErrorActionPreference='Stop'",
+        "$source=@'",
+        "using System;",
+        "using System.ComponentModel;",
+        "using System.Runtime.InteropServices;",
+        "using Microsoft.Win32.SafeHandles;",
+        "public static class AiMDirectoryDurability {",
+        "  [DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, SetLastError=true)]",
+        "  static extern SafeFileHandle CreateFileW(string n,uint a,uint s,IntPtr p,uint c,uint f,IntPtr t);",
+        "  [DllImport(\"kernel32.dll\", SetLastError=true)] static extern bool FlushFileBuffers(SafeFileHandle h);",
+        "  public static void Flush(string path) {",
+        "    const uint R=0x80000000,W=0x40000000,SR=1,SW=2,SD=4,OPEN=3,BACKUP=0x02000000,THROUGH=0x80000000;",
+        "    using(var h=CreateFileW(path,R|W,SR|SW|SD,IntPtr.Zero,OPEN,BACKUP|THROUGH,IntPtr.Zero)) {",
+        "      if(h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(),\"CreateFileW directory failed\");",
+        "      if(!FlushFileBuffers(h)) throw new Win32Exception(Marshal.GetLastWin32Error(),\"FlushFileBuffers directory failed\");",
+        "    }",
+        "  }",
+        "}",
+        "'@",
+        "Add-Type -TypeDefinition $source -Language CSharp",
+        "if(-not $env:AI_M_DIRECTORY_TO_FLUSH){throw 'AI_M_DIRECTORY_TO_FLUSH is required'}",
+        "[AiMDirectoryDurability]::Flush($env:AI_M_DIRECTORY_TO_FLUSH)",
+      ].join("\n");
+      try {
+        await execFileAsync("powershell.exe", [
+          "-NoProfile", "-NonInteractive", "-Command", nativeFlush,
+        ], {
+          windowsHide: true,
+          timeout: 30_000,
+          maxBuffer: 64 * 1024,
+          env: { ...process.env, AI_M_DIRECTORY_TO_FLUSH: path.resolve(directory) },
+        });
+        return;
+      } catch (nativeError) {
+        throw new Error(`Native Windows directory durability failed for ${directory}; verified evidence cannot be signed`, { cause: nativeError });
+      }
+    }
+    throw error;
   } finally { await handle.close(); }
 }
 
-async function writeBlockedMarker(file: string, payload: Record<string, unknown>): Promise<void> {
+async function writeBlockedMarker(file: string, payload: Record<string, unknown>, allowUnsupportedForTest = false): Promise<void> {
   const target = path.resolve(file); await fs.mkdir(path.dirname(target), { recursive: true });
   const temp = `${target}.${randomUUID()}.tmp`;
   await archiveBytes(temp, Buffer.from(`${canonicalize(payload)}\n`));
-  try { await fs.rename(temp, target); await syncDirectory(path.dirname(target)); }
+  try { await fs.rename(temp, target); await syncDirectory(path.dirname(target), allowUnsupportedForTest); }
   catch (error) { await fs.rm(temp, { force: true }); throw error; }
 }
 
-async function removeBlockedMarker(file: string): Promise<void> {
-  await fs.rm(path.resolve(file)); await syncDirectory(path.dirname(path.resolve(file)));
+async function removeBlockedMarker(file: string, allowUnsupportedForTest = false): Promise<void> {
+  await fs.rm(path.resolve(file)); await syncDirectory(path.dirname(path.resolve(file)), allowUnsupportedForTest);
 }
 
 function combinedError(primary: unknown, cleanup: unknown[], label: string): Error {
@@ -314,7 +543,11 @@ function parseTask4Lock(value: unknown, lockName = "task4.lock"): Task4LockRecor
     || !Number.isSafeInteger(lock.startedAtMs) || (lock.startedAtMs as number) <= 0) throw new Error(`${lockName} is invalid; ownership is uncertain`);
   return lock as unknown as Task4LockRecord;
 }
-async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): Promise<Task4LockRecord> {
+async function acquireTask4Lock(
+  file: string,
+  dependencies: Task4Dependencies,
+  allowUnsupportedDirectorySyncForInventory = false,
+): Promise<Task4LockRecord> {
   const target = path.resolve(file); const lockName = path.basename(target); const now = dependencies.now ?? Date.now; const staleMs = dependencies.lockStaleMs ?? 15 * 60_000;
   if (!Number.isSafeInteger(staleMs) || staleMs < 1_000) throw new Error("Task 4 lock stale threshold is invalid");
   const identityFor = dependencies.processIdentityForPid ?? defaultProcessIdentityForPid;
@@ -322,7 +555,11 @@ async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): 
   const owned = { schemaVersion: 2 as const, pid: process.pid, processIdentity, token: randomUUID().replace(/-/g, ""), startedAtMs: now() };
   await fs.mkdir(path.dirname(target), { recursive: true });
   for (;;) {
-    try { await archiveBytes(target, Buffer.from(`${canonicalize(owned)}\n`)); await syncDirectory(path.dirname(target)); return owned; }
+    try {
+      await archiveBytes(target, Buffer.from(`${canonicalize(owned)}\n`));
+      await syncDirectory(path.dirname(target), allowUnsupportedDirectorySyncForInventory || allowUnsupportedDirectorySyncForTest(dependencies));
+      return owned;
+    }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const stat = await fs.lstat(target); if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4_096) throw new Error(`${lockName} is unsafe`);
@@ -338,14 +575,21 @@ async function acquireTask4Lock(file: string, dependencies: Task4Dependencies): 
         if (sameIdentity) throw new Error("Task 4 is locked by the original live process");
       }
       if (!(await fs.readFile(target)).equals(raw)) throw new Error(`${lockName} changed during stale recovery`);
-      await fs.rename(target, `${target}.stale.${existing.token}`); await syncDirectory(path.dirname(target));
+      await fs.rename(target, `${target}.stale.${existing.token}`);
+      await syncDirectory(path.dirname(target), allowUnsupportedDirectorySyncForInventory || allowUnsupportedDirectorySyncForTest(dependencies));
     }
   }
 }
-async function releaseTask4Lock(file: string, owned: Task4LockRecord): Promise<void> {
+async function releaseTask4Lock(
+  file: string,
+  owned: Task4LockRecord,
+  dependencies: Task4Dependencies,
+  allowUnsupportedDirectorySyncForInventory = false,
+): Promise<void> {
   const target = path.resolve(file); const lockName = path.basename(target); const current = parseTask4Lock(parseJson(await fs.readFile(target), lockName), lockName);
   if (canonicalize(current) !== canonicalize(owned)) throw new Error(`${lockName} ownership was lost`);
-  await fs.rm(target); await syncDirectory(path.dirname(target));
+  await fs.rm(target);
+  await syncDirectory(path.dirname(target), allowUnsupportedDirectorySyncForInventory || allowUnsupportedDirectorySyncForTest(dependencies));
 }
 
 async function responseBytes(response: Response, maximumBytes: number, label: string): Promise<Buffer> {
@@ -374,6 +618,14 @@ async function fetchJson(url: string, init: RequestInit, maximumBytes: number, l
   const signal = AbortSignal.timeout(30_000);
   return parseJson(await responseBytes(await fetch(url, { ...init, signal }), maximumBytes, label), label, maximumNodes);
 }
+
+async function fetchJsonWithDigest(url: string, maximumBytes: number, label: string, maximumNodes?: number): Promise<{
+  value: unknown;
+  sha256: string;
+}> {
+  const bytes = await responseBytes(await fetch(url, { signal: AbortSignal.timeout(30_000) }), maximumBytes, label);
+  return { value: parseJson(bytes, label, maximumNodes), sha256: hash(bytes) };
+}
 export async function writeAllBytes(handle: Pick<Awaited<ReturnType<typeof fs.open>>, "write">, bytes: Uint8Array): Promise<void> {
   let offset = 0;
   while (offset < bytes.byteLength) {
@@ -383,12 +635,13 @@ export async function writeAllBytes(handle: Pick<Awaited<ReturnType<typeof fs.op
   }
 }
 
-export async function createHttpSession(baseUrl = BASE_URL): Promise<Task4Session> {
+export async function createHttpSession(baseUrl: string = BASE_URL): Promise<Task4Session> {
   const connectionId = `task4-${randomUUID()}`;
   let closed = false;
   let unhealthy: Error | undefined;
   const websocketUrl = new URL(baseUrl); websocketUrl.protocol = websocketUrl.protocol === "https:" ? "wss:" : "ws:"; websocketUrl.pathname = "/ws"; websocketUrl.search = `clientId=${encodeURIComponent(connectionId)}`;
   const abortController = new AbortController(); const socket = new WebSocketStream(websocketUrl, { signal: abortController.signal }); const socketClosed = socket.closed;
+  const responseDigests = new Map<"/system_stats" | "/object_info", string>();
   void socketClosed.catch(() => undefined);
   const bounded = async <T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -411,8 +664,19 @@ export async function createHttpSession(baseUrl = BASE_URL): Promise<Task4Sessio
   const ensureOpen = () => { if (closed) throw new Error("ComfyUI session is closed"); };
   return {
     connectionId,
-    async systemStats() { ensureOpen(); return record(await fetchJson(`${baseUrl}/system_stats`, {}, 1024 * 1024, "system_stats"), "system_stats"); },
-    async objectInfo() { ensureOpen(); return record(await fetchJson(`${baseUrl}/object_info`, {}, 16 * 1024 * 1024, "object_info", 200_000), "object_info"); },
+    async systemStats() {
+      ensureOpen();
+      const response = await fetchJsonWithDigest(`${baseUrl}/system_stats`, 1024 * 1024, "system_stats");
+      responseDigests.set("/system_stats", response.sha256);
+      return record(response.value, "system_stats");
+    },
+    async objectInfo() {
+      ensureOpen();
+      const response = await fetchJsonWithDigest(`${baseUrl}/object_info`, 16 * 1024 * 1024, "object_info", 200_000);
+      responseDigests.set("/object_info", response.sha256);
+      return record(response.value, "object_info");
+    },
+    responseSha256(pathname) { return responseDigests.get(pathname); },
     async models(folder) {
       ensureOpen();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(folder)) throw new Error("Model folder is unsafe");
@@ -420,14 +684,17 @@ export async function createHttpSession(baseUrl = BASE_URL): Promise<Task4Sessio
       if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.length <= 500)) throw new Error("models schema is malformed");
       return value;
     },
-    async uploadReferenceAudio(input) {
+    async uploadReferenceInput(input) {
       ensureOpen();
       const data = new FormData();
       data.set("image", new Blob([Uint8Array.from(input.bytes)], { type: input.mimeType }), input.filename);
       data.set("type", "input"); data.set("overwrite", "false");
       const result = record(await fetchJson(`${baseUrl}/upload/image`, { method: "POST", body: data }, 64 * 1024, "reference upload"), "reference upload");
       if (typeof result.name !== "string" || !result.name || result.name.length > 300 || typeof result.subfolder !== "string") throw new Error("Reference upload schema is malformed");
-      return result.subfolder ? `${result.subfolder.replace(/\\/g, "/")}/${result.name}` : result.name;
+      if (result.name !== input.filename || result.subfolder !== "") {
+        throw new Error("Reference upload was not stored at the requested managed input name");
+      }
+      return result.name;
     },
     async submit(workflow, clientId) {
       ensureOpen();
@@ -485,7 +752,44 @@ export async function createHttpSession(baseUrl = BASE_URL): Promise<Task4Sessio
       } finally { await verifyHandle.close(); }
       const sha256 = verifiedDigest.digest("hex");
       if (verifiedBytes !== byteLength || sha256 !== expectedSha256) { await fs.rm(targetFile, { force: true }); throw new Error("Output temp file digest changed after fsync"); }
-      return { sha256, byteLength, mediaKind };
+      const probeHandle = await fs.open(targetFile, "r");
+      let header: Buffer;
+      try {
+        header = Buffer.alloc(Math.min(byteLength, 64 * 1024));
+        const { bytesRead } = await probeHandle.read(header, 0, header.length, 0);
+        header = header.subarray(0, bytesRead);
+      } finally { await probeHandle.close(); }
+      const detectedMimeType = detectMimeType(header);
+      if (!detectedMimeType || !validateMimeType(header, mime)) {
+        await fs.rm(targetFile, { force: true });
+        throw new Error("Output media signature does not match its declared content type");
+      }
+      if (!await validateCompleteMediaFile(targetFile, detectedMimeType, byteLength)) {
+        await fs.rm(targetFile, { force: true });
+        throw new Error("Output media container is incomplete");
+      }
+      if (mediaKind === "image") {
+        const dimensions = detectImageDimensions(header, detectedMimeType);
+        if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
+          await fs.rm(targetFile, { force: true });
+          throw new Error("Output image dimensions are invalid");
+        }
+        return {
+          sha256, byteLength, mediaKind, declaredMimeType: mime, detectedMimeType,
+          structureValidated: true, width: dimensions.width, height: dimensions.height,
+        };
+      }
+      const durationMs = await probeMediaDurationMs(targetFile, {
+        timeoutMs: 30_000,
+        maxDurationMs: 6 * 60 * 60 * 1000,
+      }).catch(async (error) => {
+        await fs.rm(targetFile, { force: true });
+        throw error;
+      });
+      return {
+        sha256, byteLength, mediaKind, declaredMimeType: mime, detectedMimeType,
+        structureValidated: true, durationMs,
+      };
     },
     assertHealthy() {
       ensureOpen();
@@ -509,7 +813,8 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   archiveFiles: string[];
   evidenceFiles: string[];
 }> {
-  if (options.baseUrl !== BASE_URL) throw new Error("Task 4 only permits http://127.0.0.1:8000");
+  const managedEndpoint = canonicalManagedBaseUrl(options.baseUrl);
+  if (managedEndpoint.baseUrl !== options.baseUrl) throw new Error("Task 4 base URL must use the canonical IPv4 loopback form, such as http://127.0.0.1:8000");
   await assertFixedScripts(options.pixelleRoot);
   await assertCurrentGeneration(options);
   const completionTimeoutMs = safeInteger(options.completionTimeoutMs, 10 * 60_000, 30 * 60_000, "completion timeout");
@@ -517,27 +822,100 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   const evidenceTtlMs = safeInteger(options.evidenceTtlMs, 60 * 60_000, 24 * 60 * 60_000, "evidence TTL");
   const now = dependencies.now ?? Date.now;
   const sleep = dependencies.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
-  const packages = await inventoryGeneration(options);
-  const expectedPackageNames = [...(dependencies.expectedPackageNames ?? PIXELLE_PACKAGE_NAMES)].sort();
-  const actualPackageNames = packages.map((pkg) => pkg.packageName).sort();
-  if (canonicalize(actualPackageNames) !== canonicalize(expectedPackageNames)) throw new Error("Current generation must contain the exact fixed Pixelle package set");
+  const inventoriedPackages = await inventoryGeneration(options);
+  const expectedPackageNames = [...(options.packageNames ?? dependencies.expectedPackageNames ?? PIXELLE_PACKAGE_NAMES)];
+  if (new Set(expectedPackageNames).size !== expectedPackageNames.length) throw new Error("Expected package order contains duplicates");
+  if (expectedPackageNames.length === 0
+    || (options.packageNames
+      && expectedPackageNames.some((name) => !PIXELLE_PACKAGE_NAMES.includes(name as typeof PIXELLE_PACKAGE_NAMES[number])))) {
+    throw new Error("Expected package order contains an unsupported package");
+  }
+  const actualPackageNames = inventoriedPackages.map((pkg) => pkg.packageName).sort();
+  const requiredGenerationNames = dependencies.expectedPackageNames
+    ? [...expectedPackageNames].sort()
+    : [...PIXELLE_PACKAGE_NAMES].sort();
+  if (canonicalize(actualPackageNames) !== canonicalize(requiredGenerationNames)) throw new Error("Current generation must contain the exact fixed Pixelle package set");
+  const inventoryByName = new Map(inventoriedPackages.map((pkg) => [pkg.packageName, pkg]));
+  const packages = expectedPackageNames.map((packageName) => inventoryByName.get(packageName)!);
   const packageNames = new Set(packages.map((pkg) => pkg.packageName));
   for (const packageName of Object.keys(options.parameters)) if (!packageNames.has(packageName)) throw new Error(`Parameters name unknown package ${packageName}`);
   const blockedMarkerFile = path.resolve(options.blockedMarkerFile ?? path.join(path.dirname(path.dirname(options.generationRoot)), "task4-restart-blocked.json"));
-  const writeRestartMarker = dependencies.writeRestartMarker ?? writeBlockedMarker;
-  const removeRestartMarker = dependencies.removeRestartMarker ?? removeBlockedMarker;
+  const inputCleanupMarkerFile = path.resolve(
+    options.inputCleanupMarkerFile
+      ?? path.join(path.dirname(path.dirname(options.generationRoot)), "task4-input-cleanup-blocked.json"),
+  );
+  const directorySyncTestBypass = allowUnsupportedDirectorySyncForTest(dependencies);
+  const writeRestartMarker = dependencies.writeRestartMarker
+    ?? ((file: string, payload: Record<string, unknown>) => writeBlockedMarker(file, payload, directorySyncTestBypass));
+  const removeRestartMarker = dependencies.removeRestartMarker
+    ?? ((file: string) => removeBlockedMarker(file, directorySyncTestBypass));
+  try {
+    const stat = await fs.lstat(inputCleanupMarkerFile);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) {
+      throw new Error("Task 4 input cleanup blocked marker is unsafe");
+    }
+    if (options.recoveryConfirmation !== `RECOVER-${options.expectedGenerationDigest}`) {
+      throw new Error("Task 4 input cleanup is blocked pending explicit recovery");
+    }
+    const marker = record(
+      parseJson(await fs.readFile(inputCleanupMarkerFile), "Task 4 input cleanup marker"),
+      "Task 4 input cleanup marker",
+    );
+    if (marker.generationDigest !== options.expectedGenerationDigest
+      || !Array.isArray(marker.uploadedInputs)
+      || !marker.uploadedInputs.every((name) => typeof name === "string" && controlledUploadName(name))) {
+      throw new Error("Task 4 input cleanup marker is malformed");
+    }
+    await cleanupUploadedReferenceInputs(options, dependencies, marker.uploadedInputs as string[]);
+    await removeRestartMarker(inputCleanupMarkerFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   try {
     const stat = await fs.lstat(blockedMarkerFile);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Task 4 restart blocked marker is unsafe");
-    if (options.recoveryConfirmation !== `RECOVER-${options.expectedGenerationDigest}`) throw new Error("Task 4 restart is blocked pending explicit external recovery verification");
-    const recoverySession = await dependencies.connect();
-    try {
-      recoverySession.assertHealthy(); const recoveryIdentity = await dependencies.observeListener(); assertIdentity(recoveryIdentity, "recovery");
-      assertProbeSchemas(await recoverySession.systemStats(), await recoverySession.objectInfo()); recoverySession.assertHealthy();
-      const recoveryAfterProbe = await dependencies.observeListener(); assertIdentity(recoveryAfterProbe, "recovery post-probe");
-      if (!sameListener(recoveryIdentity, recoveryAfterProbe)) throw new Error("Recovery listener changed during readiness probes");
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) {
+      throw new Error("Task 4 restart blocked marker is unsafe");
     }
-    finally { await recoverySession.close(); }
+    if (options.recoveryConfirmation !== `RECOVER-${options.expectedGenerationDigest}`) throw new Error("Task 4 restart is blocked pending explicit external recovery verification");
+    const blocked = record(
+      parseJson(await fs.readFile(blockedMarkerFile), "Task 4 blocked marker"),
+      "Task 4 blocked marker",
+    );
+    if (blocked.generationDigest !== options.expectedGenerationDigest) {
+      throw new Error("Task 4 blocked marker belongs to a different generation");
+    }
+    if (blocked.state === "input-cleanup-required") {
+      if (!Array.isArray(blocked.uploadedInputs)
+        || !blocked.uploadedInputs.every((name) => typeof name === "string" && controlledUploadName(name))) {
+        throw new Error("Task 4 input cleanup marker is malformed");
+      }
+      await cleanupUploadedReferenceInputs(
+        options,
+        dependencies,
+        blocked.uploadedInputs as string[],
+      );
+      if (blocked.restartRecoveryRequired === true) {
+        const recoverySession = await dependencies.connect();
+        try {
+          recoverySession.assertHealthy(); const recoveryIdentity = await dependencies.observeListener(); assertIdentity(recoveryIdentity, "recovery");
+          assertProbeSchemas(await recoverySession.systemStats(), await recoverySession.objectInfo()); recoverySession.assertHealthy();
+          const recoveryAfterProbe = await dependencies.observeListener(); assertIdentity(recoveryAfterProbe, "recovery post-probe");
+          if (!sameListener(recoveryIdentity, recoveryAfterProbe)) throw new Error("Recovery listener changed during readiness probes");
+        }
+        finally { await recoverySession.close(); }
+      } else if (blocked.restartRecoveryRequired !== false) {
+        throw new Error("Task 4 input cleanup marker restart state is malformed");
+      }
+    } else {
+      const recoverySession = await dependencies.connect();
+      try {
+        recoverySession.assertHealthy(); const recoveryIdentity = await dependencies.observeListener(); assertIdentity(recoveryIdentity, "recovery");
+        assertProbeSchemas(await recoverySession.systemStats(), await recoverySession.objectInfo()); recoverySession.assertHealthy();
+        const recoveryAfterProbe = await dependencies.observeListener(); assertIdentity(recoveryAfterProbe, "recovery post-probe");
+        if (!sameListener(recoveryIdentity, recoveryAfterProbe)) throw new Error("Recovery listener changed during readiness probes");
+      }
+      finally { await recoverySession.close(); }
+    }
     await removeRestartMarker(blockedMarkerFile);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -551,10 +929,22 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
     throw combinedError(error, cleanup, "Initial Task 4 session validation failed and close was not fully verified");
   }
   let system: Record<string, unknown>; let objects: Record<string, unknown>;
+  const requiredModels = packages.flatMap((pkg) => pkg.manifest.requirements.models);
+  let verifiedModelIdentityDigest: string | undefined;
   try {
     system = await session.systemStats(); objects = await session.objectInfo(); assertProbeSchemas(system, objects);
-    const folders = [...new Set(packages.flatMap((pkg) => pkg.manifest.requirements.models.map((model) => model.folder)))];
-    const models = new Map<string, string[]>(); for (const folder of folders) models.set(folder, await session.models(folder));
+    const folders = [...new Set(requiredModels
+      .filter((model) => model.runtimeVisible !== false)
+      .map((model) => model.runtimeFolder ?? model.folder))];
+    const models = new Map<string, string[]>();
+    if (options.modelsRoot) {
+      await verifyRequiredModelFiles(path.resolve(options.modelsRoot), requiredModels);
+      verifiedModelIdentityDigest = await captureRequiredModelIdentityDigest(
+        path.resolve(options.modelsRoot),
+        requiredModels,
+      );
+    }
+    for (const folder of folders) models.set(folder, await session.models(folder));
     for (const pkg of packages) assertInventory(pkg, objects, models);
   } catch (error) { await session.close().catch(() => undefined); throw error; }
   if (options.mode === "inventory-only") {
@@ -572,47 +962,130 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
   const windowStartedAtMs = now(); const archiveRelative: string[] = []; const evidenceRelative: string[] = [];
   const evidenceFacts: Array<{ pkg: PackageInventory; payload: Record<string, unknown> }> = [];
   let previousAfter: (Task4ListenerIdentity & { connectionId: string }) | undefined;
-  let referenceAudioName: string | undefined; const privateKey = options.privateKey ?? await loadProductionTask4PrivateKey();
+  let referenceAudioName: string | undefined;
+  let referenceAudioFact: { mediaKind: "audio"; mimeType: string; byteLength: number; sha256: string } | undefined;
+  const referenceImageNames = new Map<string, {
+    uploadedName: string;
+    fact: { mediaKind: "image"; mimeType: string; byteLength: number; sha256: string };
+  }>();
+  const uploadedReferenceInputs = new Set<string>();
+  const cleanupUploadedInputs = async (): Promise<void> => {
+    const names = [...uploadedReferenceInputs];
+    if (names.length === 0) return;
+    await cleanupUploadedReferenceInputs(options, dependencies, names);
+    uploadedReferenceInputs.clear();
+  };
+  const privateKey = options.privateKey ?? await loadProductionTask4PrivateKey();
   try {
     for (const pkg of packages) {
       session.assertHealthy();
+      if (options.modelsRoot && await captureRequiredModelIdentityDigest(
+        path.resolve(options.modelsRoot),
+        requiredModels,
+      ) !== verifiedModelIdentityDigest) {
+        throw new Error(`${pkg.packageName} model files changed after the verified inventory was captured`);
+      }
       const packageIdentity = await dependencies.observeListener(); assertIdentity(packageIdentity, `${pkg.packageName} pre-run`);
       const beforeConnectionId = session.connectionId;
       const packageBefore = { ...packageIdentity, connectionId: beforeConnectionId };
       if (previousAfter && canonicalize(previousAfter) !== canonicalize(packageBefore)) throw new Error(`${pkg.packageName} listener.before does not continue the previous package restart.after chain`);
       if (!sameListener(packageIdentity, currentIdentity)) throw new Error(`${pkg.packageName} listener changed spontaneously before submit`);
-      const backendFingerprint = hash(canonicalize({ baseUrl: BASE_URL, system, objects, listener: packageIdentity }));
+       const systemSha256 = session.responseSha256?.("/system_stats") ?? hash(canonicalize(system));
+      const objectInfoSha256 = session.responseSha256?.("/object_info") ?? hash(canonicalize(objects));
+      const backendFingerprint = hash(canonicalize({ baseUrl: options.baseUrl, systemSha256, objectInfoSha256, listener: packageIdentity }));
       const parameters = { ...(options.parameters[pkg.packageName] ?? {}) };
-      for (const binding of pkg.compiled.bindings) {
-        if (binding.source !== "voice-reference") continue;
-        if (!options.referenceAudioFile) throw new Error(`${pkg.packageName} requires a controlled reference audio file`);
-        if (!referenceAudioName) {
-          const stat = await fs.lstat(options.referenceAudioFile);
-          if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 12 || stat.size > 20 * 1024 * 1024) throw new Error("Reference audio must be a bounded regular no-link file");
-          const referenceBytes = await fs.readFile(options.referenceAudioFile);
-          if (path.extname(options.referenceAudioFile).toLowerCase() !== ".wav" || referenceBytes.subarray(0, 4).toString("ascii") !== "RIFF" || referenceBytes.subarray(8, 12).toString("ascii") !== "WAVE") throw new Error("Reference audio must be a controlled WAV file");
-          referenceAudioName = await session.uploadReferenceAudio({ filename: path.basename(options.referenceAudioFile), bytes: referenceBytes, mimeType: "audio/wav" });
-        }
-        parameters[binding.key] = referenceAudioName;
+      const controlledInputs: Array<{
+        bindingKey: string; mediaKind: "audio" | "image"; mimeType: string; byteLength: number; sha256: string;
+      }> = [];
+      const expectedReferenceImages = pkg.compiled.bindings.filter((binding) => binding.source === "reference-image").length;
+      if (expectedReferenceImages > 0 && options.referenceImageFiles?.length !== expectedReferenceImages) {
+        throw new Error(`${pkg.packageName} requires exactly ${expectedReferenceImages} controlled reference image files`);
       }
-      const workflow = bindWorkflow(pkg.workflow, pkg.compiled, parameters, `task4/${pkg.packageName}/${randomUUID()}`);
-      const startedAtMs = now(); let promptId = ""; let primaryError: unknown; let submitted = false;
-      let artifact: { sha256: string; byteLength: number; mediaKind: "audio" | "image" | "video" } | undefined;
-      let artifactRelative = ""; let completedAtMs = 0;
+      let referenceImageIndex = 0;
+      for (const binding of pkg.compiled.bindings) {
+        if (binding.source === "voice-reference") {
+          if (!options.referenceAudioFile) throw new Error(`${pkg.packageName} requires a controlled reference audio file`);
+          if (!referenceAudioName) {
+            const referenceBytes = await readStableControlledFile(
+              options.referenceAudioFile, 12, 20 * 1024 * 1024, "Reference audio",
+            );
+            if (path.extname(options.referenceAudioFile).toLowerCase() !== ".wav" || referenceBytes.subarray(0, 4).toString("ascii") !== "RIFF" || referenceBytes.subarray(8, 12).toString("ascii") !== "WAVE") throw new Error("Reference audio must be a controlled WAV file");
+            await validateControlledMediaBytes(runDir, referenceBytes, "audio/wav", "audio");
+            const uploadName = `task4-${runToken}-${path.basename(options.referenceAudioFile)}`;
+            uploadedReferenceInputs.add(uploadName);
+            referenceAudioName = await session.uploadReferenceInput({
+              filename: uploadName,
+              bytes: referenceBytes,
+              mimeType: "audio/wav",
+            });
+            referenceAudioFact = {
+              mediaKind: "audio", mimeType: "audio/wav", byteLength: referenceBytes.length, sha256: hash(referenceBytes),
+            };
+          }
+          parameters[binding.key] = referenceAudioName;
+          controlledInputs.push({ bindingKey: binding.key, ...referenceAudioFact! });
+          continue;
+        }
+        if (binding.source !== "reference-image") continue;
+        const referenceImageFile = options.referenceImageFiles?.[referenceImageIndex++];
+        if (!referenceImageFile) throw new Error(`${pkg.packageName} requires controlled reference image files`);
+        let uploaded = referenceImageNames.get(referenceImageFile);
+        if (!uploaded) {
+          const referenceBytes = await readStableControlledFile(
+            referenceImageFile, 8, 20 * 1024 * 1024, "Reference image",
+          );
+          const mimeType = detectMimeType(referenceBytes.subarray(0, Math.min(referenceBytes.length, 64 * 1024)));
+          if (!mimeType || !["image/png", "image/jpeg", "image/webp"].includes(mimeType)
+            || !validateMimeType(referenceBytes, mimeType)) {
+            throw new Error("Reference image has an unsupported or invalid media signature");
+          }
+          await validateControlledMediaBytes(runDir, referenceBytes, mimeType, "image");
+          const uploadName = `task4-${runToken}-${referenceImageIndex}-${path.basename(referenceImageFile)}`;
+          uploadedReferenceInputs.add(uploadName);
+          const uploadedName = await session.uploadReferenceInput({
+            filename: uploadName,
+            bytes: referenceBytes,
+            mimeType,
+          });
+          uploaded = {
+            uploadedName,
+            fact: { mediaKind: "image", mimeType, byteLength: referenceBytes.length, sha256: hash(referenceBytes) },
+          };
+          referenceImageNames.set(referenceImageFile, uploaded);
+        }
+        parameters[binding.key] = uploaded.uploadedName;
+        controlledInputs.push({ bindingKey: binding.key, ...uploaded.fact });
+      }
+      const workflow = adaptComfyWorkflowRuntimeChoices(
+        bindWorkflow(pkg.workflow, pkg.compiled, parameters, `task4/${pkg.packageName}/${randomUUID()}`),
+        objects as import("../src/lib/generation/transports/comfyui").ComfyObjectInfo,
+        new Set(pkg.compiled.bindings
+          .filter((binding) => binding.source !== "request")
+          .map((binding) => `${binding.nodeId}:${binding.inputName}`)),
+      );
+      const startedAtMs = now(); let promptId = ""; let primaryError: unknown;
+      let terminalHistoryObserved = false;
+      let artifact: Awaited<ReturnType<Task4Session["downloadToFile"]>> | undefined;
+      let artifactRelative = ""; let completedAtMs = 0; let archivedAtMs = 0;
       try {
         await writeRestartMarker(blockedMarkerFile, { schemaVersion: 2, state: "restart-required", generationDigest: options.expectedGenerationDigest,
           packageName: pkg.packageName, runToken, listener: packageIdentity, connectionId: beforeConnectionId, token: randomUUID(), createdAtMs: now() });
         await dependencies.afterRestartMarker?.();
-        submitted = true;
         try { promptId = await session.submit(workflow, session.connectionId); }
         catch (error) { throw new Error(`ComfyUI submission outcome is uncertain for ${pkg.packageName}`, { cause: error }); }
         if (!/^[A-Za-z0-9._:-]{1,200}$/.test(promptId)) throw new Error("ComfyUI returned an invalid prompt ID");
         const deadline = Date.now() + completionTimeoutMs; let history: Task4History | undefined;
         for (;;) {
           session.assertHealthy(); history = await session.history(promptId); const outcome = historyOutcome(history);
-          if (outcome === "completed") break;
-          if (outcome === "cancelled") throw new Error(`${pkg.packageName} execution was cancelled`);
-          if (outcome === "failed") throw new Error(`${pkg.packageName} execution failed`);
+          if (outcome === "completed") { terminalHistoryObserved = true; break; }
+          if (outcome === "cancelled") {
+            terminalHistoryObserved = true;
+            throw new Error(`${pkg.packageName} execution was cancelled`);
+          }
+          if (outcome === "failed") {
+            terminalHistoryObserved = true;
+            throw new Error(`${pkg.packageName} execution failed`);
+          }
           if (Date.now() >= deadline) throw new Error(`${pkg.packageName} completion remained unknown until timeout`);
           await sleep(pollIntervalMs);
         }
@@ -623,15 +1096,32 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
         if (typeof item.filename !== "string" || typeof item.subfolder !== "string" || typeof item.type !== "string") throw new Error(`${pkg.packageName} output descriptor is malformed`);
         const extension = path.extname(item.filename).toLowerCase(); if (!/^\.[a-z0-9]{1,10}$/.test(extension)) throw new Error("ComfyUI output extension is unsafe");
         artifactRelative = path.join("artifacts", `${pkg.packageName}-${promptId}${extension}`);
-        artifact = await session.downloadToFile({ filename: item.filename, subfolder: item.subfolder, type: item.type }, path.join(runDir, artifactRelative), pkg.manifest.limits.maxOutputBytes);
+        const artifactPath = path.join(runDir, artifactRelative);
+        const artifactTempPath = `${artifactPath}.partial-${randomUUID()}`;
+        try {
+          artifact = await session.downloadToFile({ filename: item.filename, subfolder: item.subfolder, type: item.type }, artifactTempPath, pkg.manifest.limits.maxOutputBytes);
+          await fs.rename(artifactTempPath, artifactPath);
+          await syncDirectory(path.dirname(artifactPath), directorySyncTestBypass);
+        } catch (error) {
+          await fs.rm(artifactTempPath, { force: true }).catch(() => undefined);
+          throw error;
+        }
         if (artifact.mediaKind !== output.mediaKind || artifact.byteLength < 1 || artifact.byteLength > pkg.manifest.limits.maxOutputBytes) throw new Error(`${pkg.packageName} downloaded output is invalid or oversized`);
+        if (artifact.structureValidated !== true) throw new Error(`${pkg.packageName} output structure was not validated`);
+        if (artifact.mediaKind === "image" && (!artifact.width || !artifact.height || artifact.width * artifact.height > pkg.manifest.limits.maxPixels)) {
+          throw new Error(`${pkg.packageName} output image dimensions exceed the manifest limit`);
+        }
+        if (artifact.mediaKind !== "image" && (!artifact.durationMs || artifact.durationMs <= 0)) {
+          throw new Error(`${pkg.packageName} output duration is invalid`);
+        }
+        archivedAtMs = now();
         completedAtMs = now();
       } catch (error) { primaryError = error; }
 
       let restart: { stoppedAtMs: number; restartedAtMs: number } | undefined; let afterIdentity: Task4ListenerIdentity | undefined;
       let afterSystem: Record<string, unknown> | undefined; let afterObjects: Record<string, unknown> | undefined; let reconnectedAtMs = 0; let readinessAtMs = 0;
       const cleanupErrors: unknown[] = [];
-      if (submitted) {
+      if (terminalHistoryObserved) {
         try {
           const preStopIdentity = await dependencies.observeListener(); assertIdentity(preStopIdentity, `${pkg.packageName} pre-stop`);
           if (!sameListener(preStopIdentity, packageIdentity)) throw new Error(`${pkg.packageName} listener changed spontaneously before stop`);
@@ -644,7 +1134,11 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
           if (sameListener(packageIdentity, afterIdentity) || session.connectionId.length < 8 || session.connectionId === beforeConnectionId) throw new Error("ComfyUI listener process/connection identity did not change after restart");
           afterSystem = await session.systemStats(); afterObjects = await session.objectInfo(); assertProbeSchemas(afterSystem, afterObjects); readinessAtMs = now();
           const afterModels = new Map<string, string[]>();
-          for (const folder of [...new Set(pkg.manifest.requirements.models.map((model) => model.folder))]) afterModels.set(folder, await session.models(folder));
+          for (const folder of [...new Set(pkg.manifest.requirements.models
+            .filter((model) => model.runtimeVisible !== false)
+            .map((model) => model.runtimeFolder ?? model.folder))]) {
+            afterModels.set(folder, await session.models(folder));
+          }
           assertInventory(pkg, afterObjects, afterModels); session.assertHealthy();
           const postProbeIdentity = await dependencies.observeListener(); assertIdentity(postProbeIdentity, `${pkg.packageName} post-probe`);
           if (!sameListener(afterIdentity, postProbeIdentity)) throw new Error(`${pkg.packageName} listener changed during readiness probes`);
@@ -656,16 +1150,34 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
       if (!artifact || !restart || !afterIdentity || !afterSystem || !afterObjects) throw new Error(`${pkg.packageName} verification state is incomplete`);
       const beforeEvidence = packageBefore;
       const afterEvidence = { ...afterIdentity, connectionId: session.connectionId };
-      const run = { runId: promptId, startedAtMs, completedAtMs, backendFingerprint, listener: { ...packageIdentity, connectionId: beforeEvidence.connectionId }, artifact };
-      const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs,
+      const run = {
+        runId: promptId, startedAtMs, completedAtMs, backendFingerprint,
+        listener: { ...packageIdentity, connectionId: beforeEvidence.connectionId },
+        artifact: {
+          ...artifact,
+          storageKey: artifactRelative.split(path.sep).join("/"),
+          archivedAtMs,
+          archiveCommittedBeforeRestart: archivedAtMs > 0 && archivedAtMs < restart.stoppedAtMs,
+        },
+      };
+       const afterSystemSha256 = session.responseSha256?.("/system_stats") ?? hash(canonicalize(afterSystem));
+       const afterObjectInfoSha256 = session.responseSha256?.("/object_info") ?? hash(canonicalize(afterObjects));
+       const payload = { schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v2", windowStartedAtMs,
         generationDigest: options.expectedGenerationDigest, packageName: pkg.packageName, packageDigest: pkg.packageDigest, backendFingerprint,
-        listener: { baseUrl: BASE_URL, ...afterEvidence }, liveRuns: [run], restart: { before: beforeEvidence, after: afterEvidence, ...restart, readinessAtMs, reconnectedAtMs },
-        readiness: { checkedAtMs: readinessAtMs, systemStats: { path: "/system_stats", statusCode: 200, responseSha256: hash(canonicalize(afterSystem)) }, objectInfo: { path: "/object_info", statusCode: 200, responseSha256: hash(canonicalize(afterObjects)) } } };
+         listener: { baseUrl: options.baseUrl, ...afterEvidence }, controlledInputs, liveRuns: [run], restart: { before: beforeEvidence, after: afterEvidence, ...restart, readinessAtMs, reconnectedAtMs },
+         readiness: { checkedAtMs: readinessAtMs, systemStats: { path: "/system_stats", statusCode: 200, responseSha256: afterSystemSha256 }, objectInfo: { path: "/object_info", statusCode: 200, responseSha256: afterObjectInfoSha256 } } };
       archiveRelative.push(artifactRelative); evidenceFacts.push({ pkg, payload }); previousAfter = afterEvidence;
     }
     if (!previousAfter) throw new Error("Task 4 package chain is empty");
+    if (options.modelsRoot && await captureRequiredModelIdentityDigest(
+      path.resolve(options.modelsRoot),
+      requiredModels,
+    ) !== verifiedModelIdentityDigest) {
+      throw new Error("Model files changed before Task 4 evidence signing");
+    }
     session.assertHealthy(); const finalIdentity = await dependencies.observeListener(); assertIdentity(finalIdentity, "final endpoint");
     if (canonicalize({ ...finalIdentity, connectionId: session.connectionId }) !== canonicalize(previousAfter)) throw new Error("Final endpoint is not the last package restart.after identity");
+    await cleanupUploadedInputs();
     await session.close();
     await dependencies.beforeFinalCurrentCheck?.(); await assertCurrentGeneration(options);
     const issuedAtMs = now(); const expiresAtMs = issuedAtMs + evidenceTtlMs;
@@ -684,11 +1196,30 @@ async function verifySingleComfyUILocked(options: VerifySingleOptions, dependenc
     }
     await assertCurrentGeneration(options);
     await archiveBytes(path.join(runDir, "commit.json"), Buffer.from(`${canonicalize({ schemaVersion: 1, generationDigest: options.expectedGenerationDigest, packageOrder: packages.map((pkg) => pkg.packageName), finalEndpoint: previousAfter, finalVerificationAtMs, evidenceDigests })}\n`));
-    await syncDirectory(path.join(runDir, "artifacts")); await syncDirectory(path.join(runDir, "evidence")); await syncDirectory(runDir);
-    await fs.rename(runDir, committedDir); await syncDirectory(path.dirname(committedDir));
+    await syncDirectory(path.join(runDir, "artifacts"), directorySyncTestBypass); await syncDirectory(path.join(runDir, "evidence"), directorySyncTestBypass); await syncDirectory(runDir, directorySyncTestBypass);
+    await fs.rename(runDir, committedDir); await syncDirectory(path.dirname(committedDir), directorySyncTestBypass);
     return { mode: options.mode, packages: packages.map((pkg) => pkg.packageName), archiveFiles: archiveRelative.map((file) => path.join(committedDir, file)), evidenceFiles: evidenceRelative.map((file) => path.join(committedDir, file)) };
   } catch (error) {
-    await session.close().catch(() => undefined); await fs.rm(runDir, { recursive: true, force: true }); throw error;
+    const cleanupErrors: unknown[] = [];
+    try {
+      await cleanupUploadedInputs();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+      try {
+        await writeRestartMarker(inputCleanupMarkerFile, {
+          schemaVersion: 2,
+          state: "input-cleanup-required",
+          generationDigest: options.expectedGenerationDigest,
+          uploadedInputs: [...uploadedReferenceInputs].sort(),
+          createdAtMs: now(),
+        });
+      } catch (markerError) {
+        cleanupErrors.push(markerError);
+      }
+    }
+    await session.close().catch((closeError) => cleanupErrors.push(closeError));
+    await fs.rm(runDir, { recursive: true, force: true });
+    throw combinedError(error, cleanupErrors, "Task 4 failed and controlled input cleanup was not fully verified");
   }
 }
 
@@ -701,19 +1232,22 @@ export async function verifySingleComfyUI(options: VerifySingleOptions, dependen
   const stagingDir = path.dirname(path.dirname(path.resolve(options.generationRoot)));
   const prepareLockFile = path.resolve(options.prepareLockFile ?? path.join(stagingDir, "prepare.lock"));
   const lockFile = path.resolve(options.lockFile ?? path.join(stagingDir, "task4.lock"));
+  const inventoryOnly = options.mode === "inventory-only";
   if (prepareLockFile === lockFile) throw new Error("prepare.lock and task4.lock must be distinct");
-  const prepareOwned = await acquireTask4Lock(prepareLockFile, dependencies);
+  const prepareOwned = await acquireTask4Lock(prepareLockFile, dependencies, inventoryOnly);
   let owned: Task4LockRecord;
-  try { owned = await acquireTask4Lock(lockFile, dependencies); }
+  try { owned = await acquireTask4Lock(lockFile, dependencies, inventoryOnly); }
   catch (error) {
-    const cleanup: unknown[] = []; try { await releaseTask4Lock(prepareLockFile, prepareOwned); } catch (releaseError) { cleanup.push(releaseError); }
+    const cleanup: unknown[] = [];
+    try { await releaseTask4Lock(prepareLockFile, prepareOwned, dependencies, inventoryOnly); }
+    catch (releaseError) { cleanup.push(releaseError); }
     throw combinedError(error, cleanup, "Task 4 lock acquisition failed and prepare.lock release was not fully verified");
   }
   let result: Awaited<ReturnType<typeof verifySingleComfyUILocked>> | undefined; let primary: unknown;
   try { result = await verifySingleComfyUILocked(options, dependencies); } catch (error) { primary = error; }
   const cleanup: unknown[] = [];
-  try { await releaseTask4Lock(lockFile, owned); } catch (error) { cleanup.push(error); }
-  try { await releaseTask4Lock(prepareLockFile, prepareOwned); } catch (error) { cleanup.push(error); }
+  try { await releaseTask4Lock(lockFile, owned, dependencies, inventoryOnly); } catch (error) { cleanup.push(error); }
+  try { await releaseTask4Lock(prepareLockFile, prepareOwned, dependencies, inventoryOnly); } catch (error) { cleanup.push(error); }
   if (primary || cleanup.length) throw combinedError(primary, cleanup, "Task 4 failed and lock release was not fully verified");
   return result!;
 }
@@ -739,24 +1273,57 @@ async function main(): Promise<void> {
     const raw = record(parseJson(await fs.readFile(resolved), "TASK4_PARAMETERS_FILE"), "TASK4_PARAMETERS_FILE");
     parameters = Object.fromEntries(Object.entries(raw).map(([packageName, value]) => [packageName, record(value, `parameters.${packageName}`)]));
   }
+  let referenceImageFiles: string[] | undefined;
+  const referenceImageFilesJson = process.env.TASK4_REFERENCE_IMAGE_FILES_JSON?.trim();
+  if (referenceImageFilesJson) {
+    if (Buffer.byteLength(referenceImageFilesJson, "utf8") > 32 * 1024) throw new Error("TASK4_REFERENCE_IMAGE_FILES_JSON is oversized");
+    const parsed = parseJson(Buffer.from(referenceImageFilesJson, "utf8"), "TASK4_REFERENCE_IMAGE_FILES_JSON");
+    if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 16
+      || !parsed.every((item) => typeof item === "string" && item.length > 0 && item.length <= 1_024)) {
+      throw new Error("TASK4_REFERENCE_IMAGE_FILES_JSON must be a bounded JSON string array");
+    }
+    referenceImageFiles = parsed.map((item) => path.resolve(item as string));
+  }
   const pixelleRoot = path.resolve(required("PIXELLE_ROOT"));
-  if (required("AI_M_MANAGED_COMFYUI_BASE_URL") !== BASE_URL) throw new Error("AI_M_MANAGED_COMFYUI_BASE_URL must exactly equal http://127.0.0.1:8000");
+  const managedEndpoint = canonicalManagedBaseUrl(required("AI_M_MANAGED_COMFYUI_BASE_URL"));
+  if (required("AI_M_MANAGED_COMFYUI_BASE_URL") !== managedEndpoint.baseUrl) {
+    throw new Error("AI_M_MANAGED_COMFYUI_BASE_URL must use the canonical IPv4 loopback form");
+  }
+  const baseUrl = managedEndpoint.baseUrl;
+  const port = managedEndpoint.port;
   const dataRoot = path.resolve(required("AI_M_MANAGED_COMFYUI_DATA_ROOT"));
+  const sharedInputRoot = path.resolve(required("AI_M_COMFYUI_SHARED_INPUT_ROOT"));
   const pythonExe = path.resolve(required("AI_M_MANAGED_COMFYUI_PYTHON_EXE"));
   const comfyUIRoot = path.resolve(required("AI_M_MANAGED_COMFYUI_ROOT"));
+  const extraModelsConfig = path.resolve(required("AI_M_MANAGED_COMFYUI_EXTRA_MODELS_CONFIG"));
+  const modelsRoot = path.resolve(required("AI_M_MANAGED_COMFYUI_MODELS_ROOT"));
   const commandTimeoutMs = safeInteger(Number(required("AI_M_MANAGED_COMFYUI_COMMAND_TIMEOUT_MS")), 0, 600_000, "command timeout");
   const readyTimeoutMs = safeInteger(Number(required("AI_M_MANAGED_COMFYUI_READY_TIMEOUT_MS")), 0, 900_000, "ready timeout");
-  for (const [value, kind, label] of [[dataRoot, "directory", "data root"], [comfyUIRoot, "directory", "ComfyUI root"], [pythonExe, "file", "Python executable"]] as const) {
+  if (path.normalize(sharedInputRoot).toLowerCase() !== path.normalize(path.join(dataRoot, "input")).toLowerCase()) {
+    throw new Error("AI_M_COMFYUI_SHARED_INPUT_ROOT must equal the managed data root input directory");
+  }
+  for (const [value, kind, label] of [[dataRoot, "directory", "data root"], [sharedInputRoot, "directory", "shared input root"], [modelsRoot, "directory", "models root"], [comfyUIRoot, "directory", "ComfyUI root"], [extraModelsConfig, "file", "extra models config"], [pythonExe, "file", "Python executable"]] as const) {
     const stat = await fs.stat(value);
     if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) throw new Error(`${label} has the wrong path type`);
   }
-  const connect = async () => createHttpSession();
+  let packageNames: string[] | undefined;
+  const packageNamesJson = process.env.TASK4_PACKAGE_NAMES_JSON?.trim();
+  if (packageNamesJson) {
+    const parsed = parseJson(Buffer.from(packageNamesJson, "utf8"), "TASK4_PACKAGE_NAMES_JSON");
+    if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > PIXELLE_PACKAGE_NAMES.length
+      || !parsed.every((item) => typeof item === "string"
+        && PIXELLE_PACKAGE_NAMES.includes(item as typeof PIXELLE_PACKAGE_NAMES[number]))) {
+      throw new Error("TASK4_PACKAGE_NAMES_JSON must contain supported package names");
+    }
+    packageNames = parsed as string[];
+  }
+  const connect = async () => createHttpSession(baseUrl);
   const observeListener = async (): Promise<Task4ListenerIdentity> => {
     if (process.platform !== "win32") throw new Error("Task 4 listener identity observation requires Windows");
     const script = [
       "$ErrorActionPreference='Stop'",
-      "$listeners=@(Get-NetTCPConnection -State Listen -LocalPort 8000 | Where-Object {$_.LocalAddress -eq '127.0.0.1'})",
-      "if($listeners.Count -ne 1){throw ('Expected exactly one 127.0.0.1:8000 listener; found '+$listeners.Count)}",
+      `$listeners=@(Get-NetTCPConnection -State Listen -LocalPort ${port} | Where-Object {$_.LocalAddress -eq '127.0.0.1'})`,
+      `if($listeners.Count -ne 1){throw ('Expected exactly one 127.0.0.1:${port} listener; found '+$listeners.Count)}`,
       "$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$listeners[0].OwningProcess)",
       "$os=Get-CimInstance Win32_OperatingSystem",
       "[ordered]@{pid=[int]$p.ProcessId;createdMs=([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds();bootMs=([DateTimeOffset]$os.LastBootUpTime).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress",
@@ -766,18 +1333,23 @@ async function main(): Promise<void> {
   };
   const runner = createPowerShellCommandRunner();
   const runScript = async (name: "stop_backend.ps1" | "start_backend.ps1") => {
-    const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(pixelleRoot, "scripts", "comfyui", name), "-Json", "-DataRoot", dataRoot, "-PythonExe", pythonExe, "-ComfyUIRoot", comfyUIRoot, "-HostAddress", "127.0.0.1", "-Port", "8000"];
+    const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(pixelleRoot, "scripts", "comfyui", name), "-Json", "-DataRoot", dataRoot, "-PythonExe", pythonExe, "-ComfyUIRoot", comfyUIRoot, "-ExtraModelsConfig", extraModelsConfig, "-HostAddress", "127.0.0.1", "-Port", String(port)];
     if (name === "start_backend.ps1") args.push("-ReadyTimeoutSeconds", String(Math.max(1, Math.ceil(readyTimeoutMs / 1000))));
-    const result = await runner({ executable: "powershell.exe", args, cwd: pixelleRoot, timeoutMs: commandTimeoutMs, maxOutputBytes: 64 * 1024, windowsHide: true });
+    const result = await runner({
+      executable: "powershell.exe", args, cwd: pixelleRoot, timeoutMs: commandTimeoutMs,
+      maxOutputBytes: 64 * 1024, windowsHide: true,
+      allowDetachedStdioAfterExit: name === "start_backend.ps1",
+    });
     if (result.exitCode !== 0 || result.truncated) throw new Error(`${name} failed or returned oversized output`);
   };
   const committedDir = path.resolve(process.env.TASK4_COMMITTED_DIR?.trim() || path.join(stagingDir, "task4-committed", current.generationDigest));
   const result = await verifySingleComfyUI({
-    baseUrl: BASE_URL, mode, pixelleRoot,
+    baseUrl, mode, pixelleRoot,
     generationRoot: path.join(stagingDir, "generations", current.generationDigest), expectedGenerationDigest: current.generationDigest,
     evidenceDir: committedDir, archiveDir: path.join(committedDir, "artifacts"), committedDir,
     blockedMarkerFile: path.join(stagingDir, "task4-restart-blocked.json"), recoveryConfirmation: process.env.TASK4_RECOVERY_CONFIRM?.trim(),
-    parameters, referenceAudioFile: process.env.TASK4_REFERENCE_AUDIO_FILE?.trim(),
+    parameters, referenceAudioFile: process.env.TASK4_REFERENCE_AUDIO_FILE?.trim(), referenceImageFiles,
+    modelsRoot, sharedInputRoot, packageNames,
     completionTimeoutMs: process.env.TASK4_COMPLETION_TIMEOUT_MS ? Number(process.env.TASK4_COMPLETION_TIMEOUT_MS) : undefined,
     pollIntervalMs: process.env.TASK4_POLL_INTERVAL_MS ? Number(process.env.TASK4_POLL_INTERVAL_MS) : undefined,
   }, {

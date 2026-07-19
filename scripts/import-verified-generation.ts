@@ -7,8 +7,13 @@ import { desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { generationProfileRevisions, generationProfileStates } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
-import { canonicalize, compileWorkflowBindings, importWorkflowPackage, normalizeComfyWorkflow, parseCompiledBindings, parseWorkflowManifest, parseWorkflowPackageLock, sha256 } from "@/lib/generation/workflows";
+import {
+  authenticatedOperatorActorId,
+  resolveAuthenticatedLocalOperator,
+} from "@/lib/security/authenticated-local-operator";
+import { canonicalize, compileWorkflowBindings, importWorkflowPackage, normalizeComfyWorkflow, parseCompiledBindings, parseWorkflowManifest, parseWorkflowPackageLock, sha256Canonical } from "@/lib/generation/workflows";
 import { readTask4EvidenceFile, verifyGenerationPackageForImport } from "./verify-generation-package";
+import { protectPublishedWorkflowTree } from "./workflow-package-storage";
 
 async function readJson(file: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(file, "utf8")) as unknown;
@@ -48,12 +53,14 @@ export async function main(): Promise<void> {
   const compiledRaw = parseCompiledBindings(parseJsonBytes(verified.files["compiled-bindings.json"], "compiled-bindings.json"));
   const recomputedCompiled = compileWorkflowBindings(normalizeComfyWorkflow(workflowApi), manifest);
   if (canonicalize(compiledRaw) !== canonicalize(recomputedCompiled)) throw new Error("compiled-bindings.json does not match the workflow and manifest contract");
-  const actorId = process.env.WORKFLOW_IMPORTER_ID?.trim() || "local-admin";
+  await protectPublishedWorkflowTree(verified.packageDir);
+  const actorId = authenticatedOperatorActorId(await resolveAuthenticatedLocalOperator());
   const imported = await importWorkflowPackage({
     workflowApi, manifest, packageLock, verifiedFileDigests, packagePath: verified.packageDir,
     generationProvenance: {
       generationDigest: verified.generationDigest, packageName: verified.packageName,
       packageDigest: verified.packageDigest, verifiedEvidenceDigest: verified.verifiedEvidenceDigest!,
+      verifiedEvidenceExpiresAtMs: verified.verifiedEvidenceExpiresAtMs!,
     },
   }, actorId);
   console.log(JSON.stringify({ workflowDigest: imported.digest, state: imported.state, generationDigest: verified.generationDigest, packageDigest: verified.packageDigest }, null, 2));
@@ -63,26 +70,51 @@ export async function main(): Promise<void> {
   if (!/^[a-z0-9][a-z0-9._-]*$/.test(profileKey)) throw new Error("PROFILE_KEY is invalid");
   const backendId = process.env.EXECUTION_BACKEND_ID?.trim();
   if (!backendId) throw new Error("EXECUTION_BACKEND_ID is required when PROFILE_KEY is set");
-  const [latest] = await db.select({ revisionNo: generationProfileRevisions.revisionNo })
-    .from(generationProfileRevisions).where(eq(generationProfileRevisions.profileKey, profileKey))
-    .orderBy(desc(generationProfileRevisions.revisionNo)).limit(1);
-  const revisionNo = (latest?.revisionNo ?? 0) + 1;
   const configFile = process.env.PROFILE_CONFIG_FILE?.trim();
   const configJson = configFile ? await readJson(path.resolve(configFile)) : { defaultParameters: {} };
   if (!configJson || typeof configJson !== "object" || Array.isArray(configJson)) throw new Error("Profile config must be an object");
-  const id = genId();
-  const now = Date.now();
-  const revisionDigest = sha256(canonicalize({ profileKey, revisionNo, backendId, workflowDigest: imported.digest, configJson }));
-  await db.transaction(async (tx) => {
-    await tx.insert(generationProfileRevisions).values({
-      id, profileKey, revisionNo, revisionDigest,
-      displayName: process.env.PROFILE_DISPLAY_NAME?.trim() || manifest.displayName,
+  const displayName = process.env.PROFILE_DISPLAY_NAME?.trim() || manifest.displayName;
+  const profile = db.transaction((tx) => {
+    const revisions = tx.select().from(generationProfileRevisions)
+      .where(eq(generationProfileRevisions.profileKey, profileKey))
+      .orderBy(desc(generationProfileRevisions.revisionNo)).all();
+    const existing = revisions.find((revision) =>
+      revision.executionBackendId === backendId
+      && revision.workflowPackageDigest === imported.digest
+      && revision.adapterKind === "comfyui"
+      && revision.capability === manifest.capability
+      && revision.displayName === displayName
+      && sha256Canonical(revision.configJson) === sha256Canonical(configJson));
+    if (existing) {
+      tx.insert(generationProfileStates).values({
+        generationProfileRevisionId: existing.id,
+        enabled: 0,
+        visibility: "admin",
+        updatedAtMs: Date.now(),
+      }).onConflictDoNothing().run();
+      return { id: existing.id, revisionNo: existing.revisionNo, reused: true };
+    }
+    const revisionNo = (revisions[0]?.revisionNo ?? 0) + 1;
+    const id = genId();
+    const now = Date.now();
+    const revisionDigest = sha256Canonical({ profileKey, revisionNo, backendId, workflowDigest: imported.digest, configJson });
+    tx.insert(generationProfileRevisions).values({
+      id, profileKey, revisionNo, revisionDigest, displayName,
       capability: manifest.capability, adapterKind: "comfyui", executionBackendId: backendId,
       workflowPackageDigest: imported.digest, configJson: configJson as Record<string, unknown>, createdBy: actorId, createdAtMs: now,
-    });
-    await tx.insert(generationProfileStates).values({ generationProfileRevisionId: id, enabled: 0, visibility: "admin", updatedAtMs: now });
+    }).run();
+    tx.insert(generationProfileStates).values({
+      generationProfileRevisionId: id, enabled: 0, visibility: "admin", updatedAtMs: now,
+    }).run();
+    return { id, revisionNo, reused: false };
   });
-  console.log(JSON.stringify({ profileRevisionId: id, profileKey, revisionNo, state: "disabled" }, null, 2));
+  console.log(JSON.stringify({
+    profileRevisionId: profile.id,
+    profileKey,
+    revisionNo: profile.revisionNo,
+    state: "disabled",
+    reused: profile.reused,
+  }, null, 2));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

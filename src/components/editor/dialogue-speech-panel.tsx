@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { apiFetch, ApiError } from "@/lib/api-fetch";
 import { Button } from "@/components/ui/button";
 import { InlineModelPicker } from "@/components/editor/model-selector";
+import { selectedProfileRevisionId } from "@/components/editor/model-picker-options";
 import { useModelStore, type ModelRef } from "@/stores/model-store";
 
 interface DialogueItem {
@@ -105,7 +106,8 @@ export function DialogueSpeechPanel({
 
   async function generate(dialogue: DialogueItem) {
     if (inFlight.current.has(dialogue.id)) return;
-    if (!selectedModel?.modelId || selectedModel.providerId !== "local") {
+    const profileRevisionId = selectedProfileRevisionId(selectedModel);
+    if (!profileRevisionId) {
       toast.warning(t("selectModel"));
       return;
     }
@@ -123,7 +125,7 @@ export function DialogueSpeechPanel({
           text: dialogue.text,
           dialogueId: dialogue.id,
           voiceProfileId: selectedVoiceProfileId,
-          profileRevisionId: selectedModel.modelId,
+          profileRevisionId,
           language: selectedVoice?.language,
         }),
       });

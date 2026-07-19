@@ -6,7 +6,7 @@ import { DefaultModelPicker } from "@/components/settings/default-model-picker";
 import { ProviderSection } from "@/components/settings/provider-section";
 import { VersionInformation } from "@/components/settings/version-information";
 import type { PublicBuildMetadata } from "@/lib/build-metadata";
-import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, AudioLines, Wand2 } from "lucide-react";
+import { ArrowLeft, Settings, Zap, Type, ImageIcon, VideoIcon, AudioLines, Wand2, ShieldAlert } from "lucide-react";
 import { useTranslations } from "next-intl";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -61,6 +61,19 @@ export function SettingsPageClient({ metadata }: SettingsPageClientProps) {
             <div>
               <div className="font-display text-sm font-semibold">{t("promptTemplates")}</div>
               <div className="text-xs text-[--text-muted]">{t("promptTemplatesDesc")}</div>
+            </div>
+          </Link>
+
+          <Link
+            href="/operations"
+            className="flex items-center gap-3 rounded-2xl border border-amber-300/70 bg-amber-50 p-5 transition-all duration-200 hover:border-amber-500 hover:shadow-[0_2px_12px_rgba(120,78,0,0.10)]"
+          >
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-200/70 text-amber-900">
+              <ShieldAlert className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="font-display text-sm font-semibold">不确定任务处置台</div>
+              <div className="text-xs text-[--text-muted]">查看 NEEDS_ATTENTION / SUBMISSION_UNKNOWN，并登记证据引用</div>
             </div>
           </Link>
 

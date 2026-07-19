@@ -1,4 +1,4 @@
-import { sha256 } from "./canonical";
+import { sha256Canonical } from "./canonical";
 import type { BindingValueType, ComfyWorkflow, CompiledBinding, CompiledBindings } from "./types";
 
 export class WorkflowBindingError extends Error {
@@ -43,7 +43,7 @@ export function bindWorkflow(
   parameters: Record<string, unknown>,
   systemOutputPrefix: string,
 ): ComfyWorkflow {
-  if (compiled.workflowSha256 !== sha256(workflow)) throw new WorkflowBindingError("Compiled bindings do not match workflow content");
+  if (compiled.workflowSha256 !== sha256Canonical(workflow)) throw new WorkflowBindingError("Compiled bindings do not match workflow content");
   const result = structuredClone(workflow);
   const allowed = new Set(compiled.bindings.map((binding) => binding.key));
   const unknown = Object.keys(parameters).filter((key) => !allowed.has(key));

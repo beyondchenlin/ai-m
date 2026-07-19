@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
-import { generateKeyPairSync, sign as signBytes, type KeyObject } from "node:crypto";
+import { createHash, generateKeyPairSync, sign as signBytes, type KeyObject } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -69,6 +69,47 @@ function imageWorkflow(): Record<string, unknown> {
   };
 }
 
+function zImageBaseWorkflow(): Record<string, unknown> {
+  const workflow = imageWorkflow();
+  (workflow["37"] as { inputs: { unet_name: string } }).inputs.unet_name = "z_image_bf16.safetensors";
+  return workflow;
+}
+
+function zImageGgufWorkflow(): Record<string, unknown> {
+  return {
+    "3": node("KSampler", "KSampler", { seed: 0 }),
+    "37": node("UnetLoaderGGUF", "Load GGUF Diffusion Model", { unet_name: "z-image-turbo-Q8_0.gguf" }),
+    "38": node("CLIPLoaderGGUF", "Load GGUF CLIP", { clip_name: "Qwen3-4B-Q8_0.gguf" }),
+    "39": node("VAELoader", "Load VAE", { vae_name: "ae.safetensors" }),
+    "46": node("PrimitiveStringMultiline", "$prompt.value!", { value: "a dog" }),
+    "60": node("SaveImage", "Save Image", { filename_prefix: "ComfyUI", images: ["8", 0] }),
+    "90": node("easy int", "$width.value", { value: 768 }),
+    "91": node("easy int", "$height.value", { value: 768 }),
+  };
+}
+
+function qwenEditWorkflow(): Record<string, unknown> {
+  return {
+    "1": node("UnetLoaderGGUF", "Load GGUF Diffusion Model", { unet_name: "qwen-image-edit-2511-Q4_K_M.gguf" }),
+    "2": node("CLIPLoaderGGUF", "Load GGUF CLIP", { clip_name: "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf" }),
+    "3": node("VAELoader", "Load VAE", { vae_name: "qwen_image_vae.safetensors" }),
+    "4": node("LoraLoader", "Load Lightning LoRA", { lora_name: "lightx2v/Qwen-Image-Edit-2511-Lightning/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors" }),
+    "5": node("ModelSamplingAuraFlow", "ModelSamplingAuraFlow", {}),
+    "6": node("CFGNorm", "CFGNorm", {}),
+    "7": node("LoadImage", "Source Image, $~image.image!", { image: "source.png" }),
+    "8": node("FluxKontextImageScale", "FluxKontextImageScale", {}),
+    "9": node("LoadImage", "Reference Image, $~image2.image!", { image: "reference.png" }),
+    "10": node("TextEncodeQwenImageEditPlus", "Edit Prompt, $prompt.prompt!", { prompt: "" }),
+    "11": node("ConditioningZeroOut", "ConditioningZeroOut", {}),
+    "12": node("FluxKontextMultiReferenceLatentMethod", "Positive Reference Method", {}),
+    "13": node("FluxKontextMultiReferenceLatentMethod", "Negative Reference Method", {}),
+    "14": node("VAEEncodeTiled", "VAE Encode (Tiled)", {}),
+    "15": node("KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", { seed: 0, steps: 4, cfg: 1 }),
+    "16": node("VAEDecodeTiled", "VAE Decode (Tiled)", {}),
+    "17": node("SaveImage", "Save Image", { filename_prefix: "ComfyUI", images: ["16", 0] }),
+  };
+}
+
 function videoWorkflow(): Record<string, unknown> {
   return {
     "3": node("KSampler", "KSampler", { seed: 12 }),
@@ -85,7 +126,11 @@ function videoWorkflow(): Record<string, unknown> {
 const workflows: Record<string, Record<string, unknown>> = {
   "tts_index2.json": indexWorkflow(), "tts_index2_8g.json": indexWorkflow(true),
   "tts_omnivoice_longform_bf16.json": omniWorkflow(false), "tts_omnivoice_clone_duration_bf16.json": omniWorkflow(true),
-  "image_z_image_turbo.json": imageWorkflow(), "video_wan2.1_fusionx.json": videoWorkflow(),
+  "image_z_image_turbo.json": imageWorkflow(),
+  "image_z_image.json": zImageBaseWorkflow(),
+  "image_z_image_turbo_gguf.json": zImageGgufWorkflow(),
+  "image_qwen_edit_2511_gguf_q4_k_m.json": qwenEditWorkflow(),
+  "video_wan2.1_fusionx.json": videoWorkflow(),
 };
 
 async function makeTree() {
@@ -129,7 +174,7 @@ describe("immutable Pixelle workflow preparation", () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     const result = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     expect(result.state).toBe("prepared-environment-unverified");
-    expect(result.packages).toHaveLength(6);
+    expect(result.packages).toHaveLength(10);
     expect(result.generationDigest).toMatch(/^[a-f0-9]{64}$/);
     expect("stagingDir" in result).toBe(false);
     const generationDir = path.join(stagingDir, "generations", result.generationDigest);
@@ -165,14 +210,63 @@ describe("immutable Pixelle workflow preparation", () => {
     const { pixelleRoot, stagingDir } = await makeTree();
     const result = await preparePixelleSingleBackendPackages({ pixelleRoot, stagingDir });
     const generationRoot = path.join(stagingDir, "generations", result.generationDigest);
+    const indexModels = [
+      "bpe.model", "campplus_cn_common.bin", "config.yaml", "feat1.pt", "feat2.pt", "gpt.pth",
+      "qwen0.6bemo4-merge/Modelfile", "qwen0.6bemo4-merge/added_tokens.json",
+      "qwen0.6bemo4-merge/chat_template.jinja", "qwen0.6bemo4-merge/config.json",
+      "qwen0.6bemo4-merge/generation_config.json", "qwen0.6bemo4-merge/merges.txt",
+      "qwen0.6bemo4-merge/model.safetensors", "qwen0.6bemo4-merge/special_tokens_map.json",
+      "qwen0.6bemo4-merge/tokenizer.json", "qwen0.6bemo4-merge/tokenizer_config.json",
+      "qwen0.6bemo4-merge/vocab.json",
+      "s2mel.pth", "semantic_codec/model.safetensors", "w2v-bert-2.0/config.json",
+      "w2v-bert-2.0/model.safetensors", "w2v-bert-2.0/preprocessor_config.json", "wav2vec2bert_stats.pt",
+      "bigvgan/bigvgan_v2_22khz_80band_256x/config.json",
+      "bigvgan/bigvgan_v2_22khz_80band_256x/bigvgan_generator.pt",
+    ].map((name) => `IndexTTS-2/${name}`).sort();
+    const omniModels = [
+      "config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
+      "chat_template.jinja", "audio_tokenizer/config.json",
+      "audio_tokenizer/model.safetensors", "audio_tokenizer/preprocessor_config.json",
+    ].map((name) => `omnivoice/OmniVoice-bf16/${name}`).sort();
+    const whisperModels = [
+      ".msc", ".mv", "added_tokens.json", "config.json", "configuration.json",
+      "generation_config.json", "merges.txt", "model.safetensors",
+      "model.safetensors.index.fp32.json", "normalizer.json", "preprocessor_config.json",
+      "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.json",
+    ].map((name) => `audio_encoders/whisper-large-v3/${name}`).sort();
     const expected: Record<string, { bindings: string[]; models: string[]; outputClass: string; outputField: string }> = {
-      "tts-index2": { bindings: ["text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
-      "tts-index2-8g": { bindings: ["text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
-      "tts-omnivoice-longform-bf16": { bindings: ["referenceText", "speed", "text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
-      "tts-omnivoice-clone-duration-bf16": { bindings: ["duration", "referenceText", "speed", "text", "voiceReference"], models: [], outputClass: "SaveAudio", outputField: "audio" },
+      "tts-index2": { bindings: ["text", "voiceReference"], models: indexModels, outputClass: "SaveAudio", outputField: "audio" },
+      "tts-index2-8g": { bindings: ["text", "voiceReference"], models: indexModels, outputClass: "SaveAudio", outputField: "audio" },
+      "tts-omnivoice-longform-bf16": { bindings: ["referenceText", "speed", "text", "voiceReference"], models: [...omniModels, ...whisperModels].sort(), outputClass: "SaveAudio", outputField: "audio" },
+      "tts-omnivoice-clone-duration-bf16": { bindings: ["duration", "referenceText", "speed", "text", "voiceReference"], models: omniModels, outputClass: "SaveAudio", outputField: "audio" },
       "image-z-image-turbo": {
         bindings: ["height", "prompt", "seed", "width"],
         models: ["diffusion_models/z_image_turbo_bf16.safetensors", "text_encoders/qwen_3_4b.safetensors", "vae/ae.safetensors"],
+        outputClass: "SaveImage", outputField: "images",
+      },
+      "image-z-image-base-bf16": {
+        bindings: ["height", "prompt", "seed", "width"],
+        models: ["diffusion_models/z_image_bf16.safetensors", "text_encoders/qwen_3_4b.safetensors", "vae/ae.safetensors"],
+        outputClass: "SaveImage", outputField: "images",
+      },
+      "image-z-image-turbo-gguf-q4": {
+        bindings: ["height", "prompt", "seed", "width"],
+        models: ["text_encoders/Qwen3-4B-Q4_K_M.gguf", "unet/z-image-turbo-Q4_K_M.gguf", "vae/ae.safetensors"],
+        outputClass: "SaveImage", outputField: "images",
+      },
+      "image-z-image-turbo-gguf-q8": {
+        bindings: ["height", "prompt", "seed", "width"],
+        models: ["text_encoders/Qwen3-4B-Q8_0.gguf", "unet/z-image-turbo-Q8_0.gguf", "vae/ae.safetensors"],
+        outputClass: "SaveImage", outputField: "images",
+      },
+      "image-qwen-edit-2511-gguf-q4": {
+        bindings: ["cfg", "prompt", "referenceImage", "seed", "sourceImage", "steps"],
+        models: [
+          "loras/lightx2v/Qwen-Image-Edit-2511-Lightning/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+          "text_encoders/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+          "unet/qwen-image-edit-2511-Q4_K_M.gguf",
+          "vae/qwen_image_vae.safetensors",
+        ],
         outputClass: "SaveImage", outputField: "images",
       },
       "video-wan2.1-fusionx": {
@@ -223,10 +317,14 @@ describe("immutable Pixelle workflow preparation", () => {
     const nowMs = 2_000_000_000_000;
     const { publicKey, privateKey } = generateKeyPairSync("ed25519");
     const payload = {
-      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v1", windowStartedAtMs: nowMs - 2_000,
+      schemaVersion: 1, producer: "ai-m/task4-comfyui-live-verify-v2", windowStartedAtMs: nowMs - 2_000,
       issuedAtMs: nowMs - 100, expiresAtMs: nowMs + 60_000,
       generationDigest: prepared.generationDigest, packageName: selected.packageName, packageDigest: selected.packageDigest,
       backendFingerprint: "1".repeat(64),
+      controlledInputs: [{
+        bindingKey: "voiceReference", mediaKind: "audio", mimeType: "audio/wav",
+        byteLength: 12, sha256: "9".repeat(64),
+      }],
       listener: { baseUrl: "http://127.0.0.1:8000", pid: 102, processCreatedAtMs: 1_002, bootId: "boot-session-1", processIdentity: "boot-1:process-after", connectionId: "connection-after" },
       liveRuns: [{
         runId: "run-0001", startedAtMs: nowMs - 1_800, completedAtMs: nowMs - 1_700,
@@ -252,6 +350,19 @@ describe("immutable Pixelle workflow preparation", () => {
     };
     const trustRootPublicKey = publicKey.export({ type: "spki", format: "pem" });
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs })).resolves.toMatchObject({ packageName: "tts-index2" });
+    const legacyPayload: Record<string, unknown> = { ...payload, producer: "ai-m/task4-comfyui-live-verify-v1" };
+    delete legacyPayload.controlledInputs;
+    await expect(verifyGenerationPackageForImport({
+      ...base, verifiedEvidence: signTask4Payload(legacyPayload, privateKey), trustRootPublicKey, nowMs,
+    })).rejects.toThrow(/controlled bindings require v2/i);
+    const missingControlledPayload = { ...payload, controlledInputs: [] };
+    await expect(verifyGenerationPackageForImport({
+      ...base, verifiedEvidence: signTask4Payload(missingControlledPayload, privateKey), trustRootPublicKey, nowMs,
+    })).rejects.toThrow(/binding contract/i);
+    const duplicateControlledPayload = { ...payload, controlledInputs: [...payload.controlledInputs, ...payload.controlledInputs] };
+    await expect(verifyGenerationPackageForImport({
+      ...base, verifiedEvidence: signTask4Payload(duplicateControlledPayload, privateKey), trustRootPublicKey, nowMs,
+    })).rejects.toThrow(/unique/i);
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, packageDigest: "f".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/verified evidence/i);
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: { ...evidence, backendFingerprint: "3".repeat(64) }, trustRootPublicKey, nowMs })).rejects.toThrow(/signature|binding/i);
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: evidence, trustRootPublicKey, nowMs: nowMs + 120_000 })).rejects.toThrow(/stale/i);
@@ -261,12 +372,27 @@ describe("immutable Pixelle workflow preparation", () => {
     const badRestartPayload = { ...payload, restart: { ...payload.restart, before: payload.restart.after } };
     const badRestartEvidence = { ...badRestartPayload, signature: { algorithm: "Ed25519", keyId: "pixelle-task4-local-ed25519-v1", value: signBytes(null, Buffer.from(canonicalize(badRestartPayload), "utf8"), privateKey).toString("base64") } };
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: badRestartEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/restart.*identit|listener binding/i);
-    const unboundRunPayload = { ...payload, liveRuns: payload.liveRuns.map((run) => ({ ...run, connectionId: undefined, backendFingerprint: "5".repeat(64) })) };
+    const unboundRunPayload = {
+      ...payload,
+      liveRuns: payload.liveRuns.map((run) => {
+        const listenerWithoutConnectionId = Object.fromEntries(
+          Object.entries(run.listener).filter(([key]) => key !== "connectionId"),
+        );
+        return {
+          ...run,
+          listener: listenerWithoutConnectionId,
+          backendFingerprint: "5".repeat(64),
+        };
+      }),
+    };
     const unboundRunEvidence = signTask4Payload(unboundRunPayload, privateKey);
-    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: unboundRunEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/live run.*backend|bind/i);
+    await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: unboundRunEvidence, trustRootPublicKey, nowMs })).rejects.toThrow(/live run.*(?:backend|bind|listener identity)/i);
     const badOrderPayload = { ...payload, restart: { ...payload.restart, stoppedAtMs: nowMs - 1_900 } };
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(badOrderPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/timeline|order/i);
-    const missingHealthPayload = { ...payload, readiness: { ...payload.readiness, objectInfo: undefined } };
+    const readinessWithoutObjectInfo = Object.fromEntries(
+      Object.entries(payload.readiness).filter(([key]) => key !== "objectInfo"),
+    );
+    const missingHealthPayload = { ...payload, readiness: readinessWithoutObjectInfo };
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(missingHealthPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/object_info|readiness/i);
     const oversizedPayload = { ...payload, liveRuns: [{ ...payload.liveRuns[0], runId: "x".repeat(100_000) }] };
     await expect(verifyGenerationPackageForImport({ ...base, verifiedEvidence: signTask4Payload(oversizedPayload, privateKey), trustRootPublicKey, nowMs })).rejects.toThrow(/size|bounded|length/i);
@@ -561,6 +687,31 @@ describe("immutable Pixelle workflow preparation", () => {
     prepared = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
     await fs.writeFile(path.join(tree.stagingDir, "generations", prepared.generationDigest, "tts-index2", "workflow.api.json"), "{}\n", "utf8");
     await expect(preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir })).rejects.toThrow(/current.*integrity|package digest/i);
+  });
+
+  it("accepts a valid current generation created by an older, smaller package catalog", async () => {
+    const tree = await makeTree();
+    const prepared = await preparePixelleSingleBackendPackages({ pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir });
+    const oldGenerationRoot = path.join(tree.stagingDir, "generations", prepared.generationDigest);
+    const oldGeneration = JSON.parse(await fs.readFile(path.join(oldGenerationRoot, "generation.json"), "utf8"));
+    const retainedNames = Object.keys(oldGeneration.packageDigests).sort().slice(0, 6);
+    const packageDigests = Object.fromEntries(retainedNames.map((name) => [name, oldGeneration.packageDigests[name]]));
+    const generationDigest = createHash("sha256")
+      .update(Buffer.from(canonicalize({ schemaVersion: 1, packageDigests }), "utf8"))
+      .digest("hex");
+    const replacementRoot = path.join(tree.stagingDir, "generations", generationDigest);
+    await fs.mkdir(replacementRoot);
+    for (const name of retainedNames) await fs.cp(path.join(oldGenerationRoot, name), path.join(replacementRoot, name), { recursive: true });
+    await fs.writeFile(path.join(replacementRoot, "generation.json"), `${JSON.stringify({
+      schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified",
+    }, null, 2)}\n`, "utf8");
+    await fs.writeFile(path.join(tree.stagingDir, "current.json"), `${JSON.stringify({
+      schemaVersion: 1, generationDigest, packageDigests, state: "prepared-environment-unverified",
+    }, null, 2)}\n`, "utf8");
+
+    await expect(preparePixelleSingleBackendPackages({
+      pixelleRoot: tree.pixelleRoot, stagingDir: tree.stagingDir,
+    })).resolves.toMatchObject({ packages: expect.arrayContaining([expect.objectContaining({ packageName: "tts-index2" })]) });
   });
 
   it("fsyncs payload, generation directory, current file and staging directory in publication order", async () => {

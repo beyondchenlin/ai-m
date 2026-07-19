@@ -64,7 +64,11 @@ function selector(value: unknown, name: string): WorkflowSelector {
   const nodeId = data.nodeId === undefined ? undefined : string(data.nodeId, `${name}.nodeId`, /^\d+$/);
   const metaTitle = data.metaTitle === undefined ? undefined : string(data.metaTitle, `${name}.metaTitle`);
   if (Boolean(nodeId) === Boolean(metaTitle)) throw new WorkflowManifestError(`${name} requires exactly one of nodeId or metaTitle`);
-  return { classType, nodeId, metaTitle };
+  return {
+    classType,
+    ...(nodeId !== undefined ? { nodeId } : {}),
+    ...(metaTitle !== undefined ? { metaTitle } : {}),
+  };
 }
 
 export function parseWorkflowManifest(value: unknown): WorkflowManifest {
@@ -138,19 +142,53 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifest {
   if (requirements.models.length > 256) throw new WorkflowManifestError("requirements.models is too large");
   const models = requirements.models.map((item, index) => {
     const model = object(item, `requirements.models[${index}]`);
-    keys(model, ["folder", "filename", "sha256"], `requirements.models[${index}]`);
+    keys(model, ["folder", "runtimeFolder", "runtimeVisible", "filename", "sizeBytes", "sha256"], `requirements.models[${index}]`);
     const digest = model.sha256 === undefined ? undefined : string(model.sha256, `requirements.models[${index}].sha256`, /^[0-9a-f]{64}$/i);
+    const sizeBytes = model.sizeBytes === undefined
+      ? undefined
+      : integer(model.sizeBytes, `requirements.models[${index}].sizeBytes`, 1);
     const folder = string(model.folder, `requirements.models[${index}].folder`, /^[A-Za-z0-9._-]+$/);
+    const runtimeFolder = model.runtimeFolder === undefined
+      ? undefined
+      : string(model.runtimeFolder, `requirements.models[${index}].runtimeFolder`, /^[A-Za-z0-9._-]+$/);
+    if (model.runtimeVisible !== undefined && typeof model.runtimeVisible !== "boolean") {
+      throw new WorkflowManifestError(`requirements.models[${index}].runtimeVisible must be boolean`);
+    }
     const filename = string(model.filename, `requirements.models[${index}].filename`, /^[A-Za-z0-9._/\\ -]+$/).replace(/\\/g, "/");
     const filenameParts = filename.split("/");
     if (filename.length > 1024 || filenameParts.some((part) => !part || part === "." || part === ".." || part.length > 255)) {
       throw new WorkflowManifestError(`requirements.models[${index}].filename is unsafe`);
     }
-    return { folder, filename, ...(digest ? { sha256: digest.toLowerCase() } : {}) };
+    return {
+      folder,
+      ...(runtimeFolder !== undefined ? { runtimeFolder } : {}),
+      ...(model.runtimeVisible !== undefined ? { runtimeVisible: model.runtimeVisible } : {}),
+      filename,
+      ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+      ...(digest ? { sha256: digest.toLowerCase() } : {}),
+    };
   });
+  const requiredNodeClasses = new Set((requirements.nodeClasses as string[]).map((item) => item.trim()));
+  for (const [index, model] of models.entries()) {
+    if (model.runtimeVisible !== false) continue;
+    const authorizedAuxiliary =
+      capability === "speech"
+      && model.runtimeFolder === undefined
+      && (
+        (model.folder === "IndexTTS-2" && requiredNodeClasses.has("IndexTTS2BaseNode"))
+        || (model.folder === "omnivoice"
+          && (requiredNodeClasses.has("OmniVoiceLongformTTS") || requiredNodeClasses.has("OmniVoiceVoiceCloneTTS")))
+        || (model.folder === "audio_encoders" && requiredNodeClasses.has("OmniVoiceWhisperLoader"))
+      );
+    if (!authorizedAuxiliary) {
+      throw new WorkflowManifestError(
+        `requirements.models[${index}].runtimeVisible=false is not an authorized speech auxiliary file`,
+      );
+    }
+  }
   if (!Array.isArray(requirements.referenceModes) || !requirements.referenceModes.every((item) => ["off", "auto", "required"].includes(String(item)))) throw new WorkflowManifestError("requirements.referenceModes is invalid");
   const limits = object(data.limits, "limits");
-  keys(limits, ["maxPromptChars", "maxPixels", "maxBatch", "maxOutputs", "maxJobMs", "maxOutputBytes"], "limits");
+  keys(limits, ["maxPromptChars", "maxPixels", "maxBatch", "maxReferenceInputs", "maxOutputs", "maxJobMs", "maxOutputBytes"], "limits");
   return {
     schemaVersion: 1,
     workflowId: string(data.workflowId, "manifest.workflowId", /^[a-z0-9][a-z0-9._-]*$/),
@@ -165,6 +203,9 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifest {
       maxPromptChars: integer(limits.maxPromptChars, "limits.maxPromptChars", 1, 200_000),
       maxPixels: integer(limits.maxPixels, "limits.maxPixels", 1, 268_435_456),
       maxBatch: integer(limits.maxBatch, "limits.maxBatch", 1, 64),
+      ...(limits.maxReferenceInputs === undefined
+        ? {}
+        : { maxReferenceInputs: integer(limits.maxReferenceInputs, "limits.maxReferenceInputs", 1, 64) }),
       maxOutputs: integer(limits.maxOutputs, "limits.maxOutputs", 1, 64),
       maxJobMs: integer(limits.maxJobMs, "limits.maxJobMs", 1000, 24 * 60 * 60 * 1000),
       maxOutputBytes: integer(limits.maxOutputBytes, "limits.maxOutputBytes", 1, 10 * 1024 * 1024 * 1024),

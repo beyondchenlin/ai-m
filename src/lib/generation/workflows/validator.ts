@@ -1,6 +1,6 @@
 /** Platform-owned workflow validation. Workflow authors cannot relax these rules. */
 import { normalizeComfyWorkflow } from "./normalize";
-import { sha256 } from "./canonical";
+import { sha256Canonical } from "./canonical";
 
 export interface WorkflowStructureConstraints {
   maxNodes: number;
@@ -93,7 +93,7 @@ export function validateWorkflowStructure(
       if (!settings.allowedNodeClasses.includes(classType)) errors.push(`Node class not allowed: ${classType}`);
     }
   }
-  return { valid: errors.length === 0, digest: sha256(workflow), nodeCount, nodeClasses, errors, warnings };
+  return { valid: errors.length === 0, digest: sha256Canonical(workflow), nodeCount, nodeClasses, errors, warnings };
 }
 
 export function applyStaticPolicy(
@@ -118,7 +118,7 @@ export function applyStaticPolicy(
       if (unsafe) errors.push(`Unsafe static workflow input: ${unsafe}`);
     }
   }
-  return { valid: errors.length === 0, digest: sha256(workflow), nodeCount: Object.keys(workflow).length, nodeClasses, errors, warnings };
+  return { valid: errors.length === 0, digest: sha256Canonical(workflow), nodeCount: Object.keys(workflow).length, nodeClasses, errors, warnings };
 }
 
 export function assertWorkflowPromotionPolicy(workflowApi: Record<string, unknown>): void {

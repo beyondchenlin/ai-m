@@ -27,17 +27,21 @@ export type {
 } from "./comfyui";
 
 export {
+  probeBackendEnvironment,
   probeBackendFeatures,
   isProbeFresh,
   checkEnvironmentDrift,
 } from "./comfyui-behavior-probe";
 export type {
+  BackendEnvironmentProbe,
   BackendFeatureSnapshot,
   ExternalIdStrategy,
   CancellationCapabilities,
   OutputCapabilities,
   ProbeConfig,
 } from "./comfyui-behavior-probe";
+
+export { adaptComfyWorkflowRuntimeChoices } from "./comfyui-runtime-workflow";
 
 export {
   ComfyUIConnectionManager,

@@ -56,6 +56,7 @@ export {
   probeHistory,
   classifyComfyHistory,
   createComfyUITransport,
+  probeBackendEnvironment,
   probeBackendFeatures,
   isProbeFresh,
   checkEnvironmentDrift,
@@ -70,6 +71,7 @@ export {
   classifySubmissionError,
   ComfyUIExecutionOrchestrator,
   ExecutionCallbackPersistenceError,
+  adaptComfyWorkflowRuntimeChoices,
 } from "./transports";
 export type {
   ComfyUITransport,
@@ -83,6 +85,7 @@ export type {
   ComfyWSMessage,
   ComfyUIOperationOptions,
   ComfyUISubmissionDisposition,
+  BackendEnvironmentProbe,
   BackendFeatureSnapshot,
   ExternalIdStrategy,
   CancellationCapabilities,

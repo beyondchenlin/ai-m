@@ -43,6 +43,7 @@ export interface VerifiedGenerationPackage {
   packageDigest: string;
   files: Record<(typeof PACKAGE_FILES)[number], Buffer>;
   verifiedEvidenceDigest?: string;
+  verifiedEvidenceExpiresAtMs?: number;
 }
 
 function digestBytes(bytes: Uint8Array): string {
@@ -135,16 +136,18 @@ async function verifyEvidence(
   generationDigest: string,
   packageName: string,
   packageDigest: string,
+  expectedControlledInputs: readonly { bindingKey: string; mediaKind: "audio" | "image" }[],
   trustRootPublicKey: string | Buffer | undefined,
   nowMs: number,
-): Promise<string> {
+): Promise<{ digest: string; expiresAtMs: number }> {
   if (!isRecord(value)) throw new Error("Task 4 verified evidence is required");
   assertBoundedValue(value, "Task 4 verified evidence");
   const allowed = [
     "schemaVersion", "producer", "windowStartedAtMs", "issuedAtMs", "expiresAtMs", "generationDigest", "packageName", "packageDigest",
-    "backendFingerprint", "listener", "liveRuns", "restart", "readiness", "signature",
+    "backendFingerprint", "listener", "controlledInputs", "liveRuns", "restart", "readiness", "signature",
   ];
-  if (Object.keys(value).some((key) => !allowed.includes(key)) || value.schemaVersion !== 1 || value.producer !== "ai-m/task4-comfyui-live-verify-v1") {
+  if (Object.keys(value).some((key) => !allowed.includes(key)) || value.schemaVersion !== 1
+    || !["ai-m/task4-comfyui-live-verify-v1", "ai-m/task4-comfyui-live-verify-v2"].includes(String(value.producer))) {
     throw new Error("Task 4 verified evidence contract is invalid");
   }
   if (value.generationDigest !== generationDigest || value.packageName !== packageName || value.packageDigest !== packageDigest) {
@@ -156,8 +159,49 @@ async function verifyEvidence(
     throw new Error("Task 4 verified evidence is stale or has an invalid validity window");
   }
   if (typeof value.backendFingerprint !== "string" || !DIGEST.test(value.backendFingerprint)) throw new Error("Task 4 backend fingerprint is invalid");
-  if (!isRecord(value.listener) || value.listener.baseUrl !== "http://127.0.0.1:8000") throw new Error("Task 4 listener contract is invalid");
+  if (!isRecord(value.listener) || typeof value.listener.baseUrl !== "string"
+    || !/^http:\/\/127\.0\.0\.1:8\d{3}$/.test(value.listener.baseUrl)) {
+    throw new Error("Task 4 listener contract is invalid");
+  }
+  const listenerPort = Number(new URL(value.listener.baseUrl).port);
+  if (listenerPort < 8000 || listenerPort > 8999) throw new Error("Task 4 listener contract is invalid");
   const listener = safeIdentity(value.listener, "listener");
+  if (value.producer === "ai-m/task4-comfyui-live-verify-v2" && !Array.isArray(value.controlledInputs)) {
+    throw new Error("Task 4 v2 controlled inputs are required");
+  }
+  if (expectedControlledInputs.length > 0 && value.producer !== "ai-m/task4-comfyui-live-verify-v2") {
+    throw new Error("Task 4 controlled bindings require v2 evidence");
+  }
+  const controlledInputs = value.controlledInputs ?? [];
+  if (!Array.isArray(controlledInputs) || controlledInputs.length > 16) {
+    throw new Error("Task 4 controlled inputs are invalid");
+  }
+  const actualControlledInputs: Array<{ bindingKey: string; mediaKind: "audio" | "image" }> = [];
+  const controlledBindingKeys = new Set<string>();
+  for (const input of controlledInputs) {
+    if (!isRecord(input)
+      || Object.keys(input).some((key) => !["bindingKey", "mediaKind", "mimeType", "byteLength", "sha256"].includes(key))
+      || typeof input.bindingKey !== "string" || !/^[A-Za-z0-9._-]{1,120}$/.test(input.bindingKey)
+      || !["audio", "image"].includes(String(input.mediaKind))
+      || typeof input.mimeType !== "string" || !/^(audio|image)\/[a-z0-9.+-]{1,50}$/.test(input.mimeType)
+      || !Number.isSafeInteger(input.byteLength) || (input.byteLength as number) < 1
+      || typeof input.sha256 !== "string" || !DIGEST.test(input.sha256)) {
+      throw new Error("Task 4 controlled input entry is invalid");
+    }
+    if (controlledBindingKeys.has(input.bindingKey as string)) {
+      throw new Error("Task 4 controlled input binding keys must be unique");
+    }
+    controlledBindingKeys.add(input.bindingKey as string);
+    actualControlledInputs.push({
+      bindingKey: input.bindingKey as string,
+      mediaKind: input.mediaKind as "audio" | "image",
+    });
+  }
+  const sortControlled = (items: readonly { bindingKey: string; mediaKind: "audio" | "image" }[]) =>
+    [...items].sort((left, right) => left.bindingKey.localeCompare(right.bindingKey));
+  if (canonicalize(sortControlled(actualControlledInputs)) !== canonicalize(sortControlled(expectedControlledInputs))) {
+    throw new Error("Task 4 controlled inputs do not match the package binding contract");
+  }
   let latestRunCompletion = value.windowStartedAtMs as number;
   if (!Array.isArray(value.liveRuns) || value.liveRuns.length < 1 || value.liveRuns.length > 32) throw new Error("Task 4 evidence requires bounded live runs");
   for (const [index, runValue] of value.liveRuns.entries()) {
@@ -216,7 +260,37 @@ async function verifyEvidence(
     throw new Error("Task 4 evidence trust root or signature is invalid");
   }
   if (!valid) throw new Error("Task 4 evidence signature verification failed");
-  return digestBytes(Buffer.from(canonicalize(value), "utf8"));
+  return {
+    digest: digestBytes(Buffer.from(canonicalize(value), "utf8")),
+    expiresAtMs: value.expiresAtMs as number,
+  };
+}
+
+function controlledInputContract(bytes: Buffer): Array<{ bindingKey: string; mediaKind: "audio" | "image" }> {
+  let value: unknown;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error("compiled-bindings.json is invalid JSON"); }
+  if (!isRecord(value) || !Array.isArray(value.bindings)) {
+    throw new Error("compiled-bindings.json has an invalid binding contract");
+  }
+  const result: Array<{ bindingKey: string; mediaKind: "audio" | "image" }> = [];
+  const keys = new Set<string>();
+  for (const binding of value.bindings) {
+    if (!isRecord(binding) || typeof binding.key !== "string" || typeof binding.source !== "string") {
+      throw new Error("compiled-bindings.json has an invalid binding entry");
+    }
+    if (binding.source === "request") continue;
+    const mediaKind = binding.source === "voice-reference"
+      ? "audio"
+      : binding.source === "reference-image"
+        ? "image"
+        : null;
+    if (!mediaKind) throw new Error("compiled-bindings.json has an unsupported controlled binding source");
+    if (keys.has(binding.key)) throw new Error("compiled-bindings.json has duplicate controlled binding keys");
+    keys.add(binding.key);
+    result.push({ bindingKey: binding.key, mediaKind });
+  }
+  return result;
 }
 
 /** Offline integrity verification for prepare/current/GC only. This does not authorize import. */
@@ -266,13 +340,18 @@ export async function verifyPreparedGenerationPackage(options: VerifyGenerationP
 /** Import authorization always requires Task 4 evidence bound to the verified bytes. */
 export async function verifyGenerationPackageForImport(options: VerifyGenerationPackageForImportOptions): Promise<VerifiedGenerationPackage> {
   const prepared = await verifyPreparedGenerationPackage(options);
-  const verifiedEvidenceDigest = await verifyEvidence(
+  const verifiedEvidence = await verifyEvidence(
     options.verifiedEvidence,
     prepared.generationDigest,
     prepared.packageName,
     prepared.packageDigest,
+    controlledInputContract(prepared.files["compiled-bindings.json"]),
     options.trustRootPublicKey,
     options.nowMs ?? Date.now(),
   );
-  return { ...prepared, verifiedEvidenceDigest };
+  return {
+    ...prepared,
+    verifiedEvidenceDigest: verifiedEvidence.digest,
+    verifiedEvidenceExpiresAtMs: verifiedEvidence.expiresAtMs,
+  };
 }

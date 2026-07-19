@@ -17,6 +17,10 @@ import {
 } from "@/lib/db/schema";
 import { eq, and, desc, inArray } from "drizzle-orm";
 import { isEnabled, FF } from "@/lib/feature-flags";
+import {
+  allowedWorkflowValidationKinds,
+  selectApplicableWorkflowValidation,
+} from "@/lib/generation/workflows";
 
 type ProfileCapability = typeof generationProfileRevisions.$inferSelect.capability;
 type DefaultProfileCapability = typeof defaultGenerationProfilePointers.$inferSelect.capability;
@@ -114,27 +118,35 @@ export async function getEnabledProfiles(
     : [];
   const validations: BackendValidation[] = workflowDigests.length
     ? await db.select().from(workflowBackendValidations)
-        .where(inArray(workflowBackendValidations.workflowPackageDigest, workflowDigests))
+        .where(and(
+          inArray(workflowBackendValidations.workflowPackageDigest, workflowDigests),
+          inArray(workflowBackendValidations.validationKind, allowedWorkflowValidationKinds()),
+        ))
     : [];
   const backendById = new Map(backends.map((backend) => [backend.id, backend]));
   const workflowByDigest = new Map(workflows.map((workflow) => [workflow.digest, workflow]));
-  const validationByPair = new Map(validations.map((validation) => [
-    `${validation.executionBackendId}:${validation.workflowPackageDigest}`, validation,
-  ]));
+  const validationsByPair = new Map<string, BackendValidation[]>();
+  for (const validation of validations) {
+    const key = `${validation.executionBackendId}:${validation.workflowPackageDigest}`;
+    validationsByPair.set(key, [...(validationsByPair.get(key) ?? []), validation]);
+  }
 
   return rows.filter((row) => {
     if (row.adapterKind !== "comfyui") return true;
     if (!row.executionBackendId || !row.workflowPackageDigest) return false;
     const backend = backendById.get(row.executionBackendId);
     const workflow = workflowByDigest.get(row.workflowPackageDigest);
-    const validation = validationByPair.get(`${row.executionBackendId}:${row.workflowPackageDigest}`);
+    const validation = selectApplicableWorkflowValidation(
+      validationsByPair.get(`${row.executionBackendId}:${row.workflowPackageDigest}`) ?? [],
+      {
+        workflowState: workflow?.state ?? "",
+        backendFingerprint: backend?.fingerprint ?? null,
+        workflowLockDigest: workflow?.lockDigest ?? null,
+      },
+    );
     return Boolean(
       backend?.enabled
-      && backend.fingerprint
-      && workflow?.state === "active"
       && validation
-      && validation.environmentFingerprint === backend.fingerprint
-      && validation.environmentLockDigest === workflow.lockDigest,
     );
   }).map(({ executionBackendId: _backend, workflowPackageDigest: _workflow, ...row }) => ({
     ...row, enabled: row.enabled === 1,

@@ -1,16 +1,19 @@
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { join, parse, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export type ManagedRuntimeConfig =
   | { enabled: false }
   | {
       enabled: true;
-      baseUrl: "http://127.0.0.1:8000";
+      baseUrl: string;
+      port?: number;
       pixelleRoot: string;
       dataRoot: string;
       pythonExe: string;
+      comfyUIRoot: string;
+      extraModelsConfig: string;
       commandTimeoutMs: number;
       readyTimeoutMs: number;
     };
@@ -23,6 +26,7 @@ export interface ManagedCommandRequest {
   maxOutputBytes: number;
   windowsHide: true;
   signal?: AbortSignal;
+  allowDetachedStdioAfterExit?: boolean;
 }
 
 export interface ManagedCommandResult {
@@ -30,14 +34,15 @@ export interface ManagedCommandResult {
   stdout: string;
   stderr: string;
   truncated: boolean;
+  stdioDetachedAfterExit?: boolean;
 }
 
 export type ManagedCommandRunner = (request: ManagedCommandRequest) => Promise<ManagedCommandResult>;
 
 interface ManagedChildProcess {
   readonly pid?: number;
-  readonly stdout: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
-  readonly stderr: { on(event: "data", listener: (chunk: Buffer) => void): unknown };
+  readonly stdout: { on(event: "data", listener: (chunk: Buffer) => void): unknown; destroy?(): unknown };
+  readonly stderr: { on(event: "data", listener: (chunk: Buffer) => void): unknown; destroy?(): unknown };
   once(event: "error", listener: (error: Error) => void): unknown;
   once(event: "exit", listener: (code: number | null) => void): unknown;
   once(event: "close", listener: (code: number | null) => void): unknown;
@@ -113,12 +118,13 @@ export class ManagedComfyUIEndpointRegistry {
 
 export interface ManagedRuntimeDependencies {
   commandRunner?: ManagedCommandRunner;
-  probeFactory: (baseUrl: "http://127.0.0.1:8000") => ManagedProbeTransport;
+  probeFactory: (baseUrl: string) => ManagedProbeTransport;
   readinessPollMs?: number;
   endpointRegistry?: ManagedComfyUIEndpointRegistry;
 }
 
-const CANONICAL_BASE_URL = "http://127.0.0.1:8000" as const;
+const MIN_MANAGED_PORT = 8000;
+const MAX_MANAGED_PORT = 8999;
 const MAX_COMMAND_TIMEOUT_MS = 600_000;
 const MAX_READY_TIMEOUT_MS = 900_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
@@ -132,15 +138,38 @@ function required(env: Record<string, string | undefined>, name: string): string
   return value;
 }
 
+function assertNoLinkedPathComponents(target: string, name: string): void {
+  const root = parse(target).root;
+  let cursor = root;
+  for (const component of relative(root, target).split(sep).filter(Boolean)) {
+    cursor = join(cursor, component);
+    if (lstatSync(cursor).isSymbolicLink()) throw new Error(`${name} must not contain linked or reparse-point path components`);
+  }
+}
+
 function existingPath(env: Record<string, string | undefined>, name: string, kind: "file" | "directory"): string {
-  const path = resolve(required(env, name));
+  const candidate = resolve(required(env, name));
   try {
-    const stat = statSync(path);
+    assertNoLinkedPathComponents(candidate, name);
+    const stat = lstatSync(candidate);
     if (kind === "file" ? !stat.isFile() : !stat.isDirectory()) throw new Error("wrong path type");
   } catch {
-    throw new Error(`${name} must reference an existing ${kind}`);
+    throw new Error(`${name} must reference an existing, unlinked ${kind}`);
   }
-  return path;
+  return realpathSync.native(candidate);
+}
+
+function pathIdentity(value: string): string {
+  const normalized = resolve(value);
+  return process.platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const leftKey = pathIdentity(left);
+  const rightKey = pathIdentity(right);
+  return leftKey === rightKey
+    || leftKey.startsWith(`${rightKey}${sep}`)
+    || rightKey.startsWith(`${leftKey}${sep}`);
 }
 
 function boundedInteger(env: Record<string, string | undefined>, name: string, maximum: number): number {
@@ -152,14 +181,18 @@ function boundedInteger(env: Record<string, string | undefined>, name: string, m
   return value;
 }
 
-function canonicalizeBaseUrl(raw: string): typeof CANONICAL_BASE_URL {
+function canonicalizeBaseUrl(raw: string): { baseUrl: string; port: number } {
   let url: URL;
-  try { url = new URL(raw); } catch { throw new Error("AI_M_MANAGED_COMFYUI_BASE_URL must be canonical loopback port 8000"); }
+  try { url = new URL(raw); } catch { throw new Error("AI_M_MANAGED_COMFYUI_BASE_URL must be a managed loopback endpoint"); }
   const hostname = url.hostname.toLowerCase();
   const loopback = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]" || hostname === "::1";
-  if (url.protocol !== "http:" || !loopback || url.port !== "8000" || url.pathname !== "/" || url.search || url.hash || url.username || url.password)
-    throw new Error("AI_M_MANAGED_COMFYUI_BASE_URL must be canonical loopback port 8000");
-  return CANONICAL_BASE_URL;
+  const port = Number(url.port);
+  if (url.protocol !== "http:" || !loopback || !Number.isSafeInteger(port)
+    || port < MIN_MANAGED_PORT || port > MAX_MANAGED_PORT
+    || url.pathname !== "/" || url.search || url.hash || url.username || url.password) {
+    throw new Error(`AI_M_MANAGED_COMFYUI_BASE_URL must be a loopback endpoint on ports ${MIN_MANAGED_PORT}-${MAX_MANAGED_PORT}`);
+  }
+  return { baseUrl: `http://127.0.0.1:${port}`, port };
 }
 
 export function parseManagedComfyUIRuntimeConfig(env: Record<string, string | undefined>): ManagedRuntimeConfig {
@@ -169,17 +202,35 @@ export function parseManagedComfyUIRuntimeConfig(env: Record<string, string | un
 
   const pixelleRoot = existingPath(env, "AI_M_MANAGED_COMFYUI_PIXELLE_ROOT", "directory");
   for (const script of ["start_backend.ps1", "stop_backend.ps1"] as const) {
-    const scriptPath = join(pixelleRoot, "scripts", "comfyui", script);
-    try { if (!statSync(scriptPath).isFile()) throw new Error("not a file"); }
-    catch { throw new Error(`Pixelle managed script is missing: ${script}`); }
+    try { existingPath({ SCRIPT_PATH: join(pixelleRoot, "scripts", "comfyui", script) }, "SCRIPT_PATH", "file"); }
+    catch { throw new Error(`Pixelle managed script is missing or linked: ${script}`); }
   }
 
+  const dataRoot = existingPath(env, "AI_M_MANAGED_COMFYUI_DATA_ROOT", "directory");
+  const sharedInputRoot = existingPath(env, "AI_M_COMFYUI_SHARED_INPUT_ROOT", "directory");
+  const expectedInputRoot = existingPath({ EXPECTED_INPUT_ROOT: join(dataRoot, "input") }, "EXPECTED_INPUT_ROOT", "directory");
+  if (pathIdentity(sharedInputRoot) !== pathIdentity(expectedInputRoot)) {
+    throw new Error("AI_M_COMFYUI_SHARED_INPUT_ROOT must be the dedicated managed DataRoot input directory");
+  }
+  const isolatedRoots = [
+    existingPath(env, "UPLOAD_DIR", "directory"),
+    existingPath(env, "AI_M_WORKFLOW_SUPPLY_CHAIN_ROOT", "directory"),
+    existingPath(env, "PIXELLE_WORKFLOW_STAGING_DIR", "directory"),
+  ];
+  for (const other of isolatedRoots) {
+    if (pathsOverlap(dataRoot, other)) {
+      throw new Error("Managed ComfyUI DataRoot must be physically separate from uploads and workflow staging");
+    }
+  }
+  const endpoint = canonicalizeBaseUrl(required(env, "AI_M_MANAGED_COMFYUI_BASE_URL"));
   return {
     enabled: true,
-    baseUrl: canonicalizeBaseUrl(required(env, "AI_M_MANAGED_COMFYUI_BASE_URL")),
+    ...endpoint,
     pixelleRoot,
-    dataRoot: existingPath(env, "AI_M_MANAGED_COMFYUI_DATA_ROOT", "directory"),
+    dataRoot,
     pythonExe: existingPath(env, "AI_M_MANAGED_COMFYUI_PYTHON_EXE", "file"),
+    comfyUIRoot: existingPath(env, "AI_M_MANAGED_COMFYUI_ROOT", "directory"),
+    extraModelsConfig: existingPath(env, "AI_M_MANAGED_COMFYUI_EXTRA_MODELS_CONFIG", "file"),
     commandTimeoutMs: boundedInteger(env, "AI_M_MANAGED_COMFYUI_COMMAND_TIMEOUT_MS", MAX_COMMAND_TIMEOUT_MS),
     readyTimeoutMs: boundedInteger(env, "AI_M_MANAGED_COMFYUI_READY_TIMEOUT_MS", MAX_READY_TIMEOUT_MS),
   };
@@ -312,6 +363,19 @@ export function createPowerShellCommandRunner(options: PowerShellCommandRunnerOp
       request.signal?.removeEventListener("abort", onAbort);
       drainTimer = setTimeout(() => {
         if (settled) return;
+        if (request.allowDetachedStdioAfterExit && exitCode !== null) {
+          settled = true;
+          child.stdout.destroy?.();
+          child.stderr.destroy?.();
+          resolveRun({
+            exitCode,
+            stdout: Buffer.concat(stdout).toString("utf8"),
+            stderr: Buffer.concat(stderr).toString("utf8"),
+            truncated: outState.truncated || errState.truncated,
+            stdioDetachedAfterExit: true,
+          });
+          return;
+        }
         settled = true;
         rejectRun(new ManagedCommandStdioDrainError(`Managed ComfyUI stdio drain timed out after ${stdioDrainTimeoutMs}ms`));
       }, stdioDrainTimeoutMs);
@@ -493,21 +557,39 @@ export class ManagedComfyUIRuntime {
   }
 
   private async runFixedScript(scriptName: "stop_backend.ps1" | "start_backend.ps1", action: "stop" | "start", signal?: AbortSignal): Promise<void> {
-    const script = join(this.config.pixelleRoot, "scripts", "comfyui", scriptName);
+    const verifiedRoot = existingPath({ PATH: this.config.pixelleRoot }, "PATH", "directory");
+    const verifiedDataRoot = existingPath({ PATH: this.config.dataRoot }, "PATH", "directory");
+    const verifiedPython = existingPath({ PATH: this.config.pythonExe }, "PATH", "file");
+    const verifiedComfyUIRoot = existingPath({ PATH: this.config.comfyUIRoot }, "PATH", "directory");
+    const verifiedExtraModelsConfig = existingPath(
+      { PATH: this.config.extraModelsConfig },
+      "PATH",
+      "file",
+    );
+    if (pathIdentity(verifiedRoot) !== pathIdentity(this.config.pixelleRoot)
+      || pathIdentity(verifiedDataRoot) !== pathIdentity(this.config.dataRoot)
+      || pathIdentity(verifiedPython) !== pathIdentity(this.config.pythonExe)
+      || pathIdentity(verifiedComfyUIRoot) !== pathIdentity(this.config.comfyUIRoot)
+      || pathIdentity(verifiedExtraModelsConfig) !== pathIdentity(this.config.extraModelsConfig)) {
+      throw new Error("Managed ComfyUI runtime path identity changed after startup");
+    }
+    const script = existingPath({ PATH: join(verifiedRoot, "scripts", "comfyui", scriptName) }, "PATH", "file");
     const args = [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
-      "-Json", "-DataRoot", this.config.dataRoot, "-PythonExe", this.config.pythonExe,
-      "-HostAddress", "127.0.0.1", "-Port", "8000",
+      "-Json", "-DataRoot", verifiedDataRoot, "-PythonExe", verifiedPython,
+      "-ComfyUIRoot", verifiedComfyUIRoot, "-ExtraModelsConfig", verifiedExtraModelsConfig,
+      "-HostAddress", "127.0.0.1", "-Port", String(this.config.port ?? Number(new URL(this.config.baseUrl).port)),
     ];
     if (action === "start") args.push("-ReadyTimeoutSeconds", String(Math.max(1, Math.ceil(this.config.readyTimeoutMs / 1000))));
     const result = await this.commandRunner({
       executable: "powershell.exe",
       args,
-      cwd: this.config.pixelleRoot,
+      cwd: verifiedRoot,
       timeoutMs: this.config.commandTimeoutMs,
       maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES,
       windowsHide: true,
       signal,
+      allowDetachedStdioAfterExit: action === "start",
     });
     if (result.exitCode !== 0) throw new Error(`Managed ComfyUI ${action} command exited with code ${result.exitCode}`);
   }

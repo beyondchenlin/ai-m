@@ -1,4 +1,4 @@
-import { canonicalize, sha256 } from "./canonical";
+import { sha256Canonical } from "./canonical";
 import type { ComfyWorkflow, CompiledBindings, WorkflowManifest, WorkflowSelector } from "./types";
 
 export const WORKFLOW_COMPILER_VERSION = "1.0.0";
@@ -30,7 +30,7 @@ export function compileWorkflowBindings(
   workflow: ComfyWorkflow,
   manifest: WorkflowManifest,
 ): CompiledBindings {
-  const workflowSha256 = sha256(workflow);
+  const workflowSha256 = sha256Canonical(workflow);
   const requiredClasses = new Set(manifest.requirements.nodeClasses);
   const actualClasses = new Set(Object.values(workflow).map((node) => node.class_type));
   for (const required of requiredClasses) {
@@ -59,7 +59,7 @@ export function compileWorkflowBindings(
     workflowId: manifest.workflowId,
     version: manifest.version,
     workflowSha256,
-    authorContractSha256: sha256(canonicalize(manifest)),
+    authorContractSha256: sha256Canonical(manifest),
     bindings,
     outputs,
   };

@@ -105,61 +105,55 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const SESSION_CREDENTIALS_KEY = "ai-m-model-session-credentials-v1";
+const CREDENTIAL_MIGRATION_MARKER = "ai-m-browser-secret-migration-v1";
 
-interface SessionCredential {
-  apiKey: string;
-  secretKey?: string;
-}
-
-export function mergeSessionCredentials(
-  providers: Provider[],
-  credentials: Record<string, SessionCredential>,
-): Provider[] {
-  return providers.map((provider) => {
-    const credential = credentials[provider.id];
-    return credential
-      ? { ...provider, apiKey: credential.apiKey, secretKey: credential.secretKey }
-      : provider;
-  });
-}
-
-function readSessionCredentials(): Record<string, SessionCredential> {
-  if (typeof window === "undefined") return {};
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_CREDENTIALS_KEY);
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
-    if (!isRecord(parsed)) return {};
-    const result: Record<string, SessionCredential> = {};
-    for (const [providerId, value] of Object.entries(parsed)) {
-      if (!isRecord(value) || typeof value.apiKey !== "string") continue;
-      result[providerId] = {
-        apiKey: value.apiKey.slice(0, 8_192),
-        secretKey: typeof value.secretKey === "string" ? value.secretKey.slice(0, 8_192) : undefined,
-      };
-    }
-    return result;
-  } catch {
-    return {};
+function stripBrowserCredentials(value: unknown): { value: unknown; removed: number } {
+  if (Array.isArray(value)) {
+    const items = value.map(stripBrowserCredentials);
+    return {
+      value: items.map((item) => item.value),
+      removed: items.reduce((sum, item) => sum + item.removed, 0),
+    };
   }
+  if (!isRecord(value)) return { value, removed: 0 };
+  let removed = 0;
+  const clean: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "apiKey" || key === "secretKey") {
+      if (typeof item === "string" && item) removed++;
+      if (key === "apiKey") clean[key] = "";
+      continue;
+    }
+    const nested = stripBrowserCredentials(item);
+    clean[key] = nested.value;
+    removed += nested.removed;
+  }
+  return { value: clean, removed };
 }
 
-function persistSessionCredentials(providers: Provider[]): void {
-  if (typeof window === "undefined") return;
-  const credentials = Object.fromEntries(
-    providers
-      .filter((provider) => provider.apiKey || provider.secretKey)
-      .map((provider) => [provider.id, { apiKey: provider.apiKey, secretKey: provider.secretKey }]),
-  );
+export function purgeLegacyBrowserCredentials(
+  local: Pick<Storage, "getItem" | "setItem">,
+  session: Pick<Storage, "removeItem">,
+  completedAtMs = Date.now(),
+): number {
+  let removed = 0;
   try {
-    if (Object.keys(credentials).length === 0) {
-      window.sessionStorage.removeItem(SESSION_CREDENTIALS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_CREDENTIALS_KEY, JSON.stringify(credentials));
+    const raw = local.getItem("model-store");
+    if (raw) {
+      const stripped = stripBrowserCredentials(JSON.parse(raw) as unknown);
+      removed = stripped.removed;
+      local.setItem("model-store", JSON.stringify(stripped.value));
     }
-  } catch {
-    // The in-memory credential remains usable when storage is unavailable.
-  }
+  } catch { /* Zustand migration still strips credentials during hydration. */ }
+  try { session.removeItem(SESSION_CREDENTIALS_KEY); } catch { /* best effort */ }
+  try {
+    local.setItem(CREDENTIAL_MIGRATION_MARKER, JSON.stringify({
+      schemaVersion: 1,
+      completedAtMs,
+      removedCredentialFieldCount: removed,
+    }));
+  } catch { /* best effort */ }
+  return removed;
 }
 
 function normalizeModel(value: unknown): Model | null {
@@ -250,7 +244,6 @@ export const useModelStore = create<ModelStore>()(
       addProvider: (provider) => {
         const id = genId();
         set((state) => ({ providers: [...state.providers, { ...provider, id, models: [] }] }));
-        persistSessionCredentials(get().providers);
         return id;
       },
 
@@ -274,7 +267,6 @@ export const useModelStore = create<ModelStore>()(
             defaultSpeechModel: state.defaultSpeechModel?.providerId === id ? null : state.defaultSpeechModel,
           };
         });
-        persistSessionCredentials(get().providers);
       },
 
       removeProvider: (id) => {
@@ -285,7 +277,6 @@ export const useModelStore = create<ModelStore>()(
           defaultVideoModel: state.defaultVideoModel?.providerId === id ? null : state.defaultVideoModel,
           defaultSpeechModel: state.defaultSpeechModel?.providerId === id ? null : state.defaultSpeechModel,
         }));
-        persistSessionCredentials(get().providers);
       },
 
       setModels: (providerId, models) => {
@@ -381,11 +372,10 @@ export const useModelStore = create<ModelStore>()(
       }),
       merge: (persistedState: unknown, currentState) => {
         const migrated = migrateModelStoreState(persistedState);
-        const providers = mergeSessionCredentials(
-          migrated.providers,
-          readSessionCredentials(),
-        );
-        return { ...currentState, ...migrated, providers };
+        if (typeof window !== "undefined") {
+          purgeLegacyBrowserCredentials(window.localStorage, window.sessionStorage);
+        }
+        return { ...currentState, ...migrated };
       },
     },
   ),

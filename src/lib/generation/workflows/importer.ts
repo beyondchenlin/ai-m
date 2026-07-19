@@ -3,7 +3,7 @@ import { workflowPackageRevisions, workflowPackageStates } from "@/lib/db/schema
 import { normalizeComfyWorkflow } from "./normalize";
 import { parseWorkflowManifest } from "./manifest";
 import { compileWorkflowBindings, WORKFLOW_COMPILER_VERSION } from "./compiler";
-import { canonicalize, sha256 } from "./canonical";
+import { sha256Canonical } from "./canonical";
 import { parseWorkflowPackageLock, verifyLockedFiles } from "./package-lock";
 import { applyStaticPolicy, validateWorkflowStructure } from "./validator";
 import type { WorkflowPackageInput } from "./types";
@@ -21,7 +21,7 @@ export async function importWorkflowPackage(
   const compiled = compileWorkflowBindings(workflow, manifest);
   const packageLock = parseWorkflowPackageLock(input.packageLock, manifest);
   verifyLockedFiles(packageLock, input.verifiedFileDigests);
-  const digest = sha256({ workflow, manifest, compiled, packageLock });
+  const digest = sha256Canonical({ workflow, manifest, compiled, packageLock });
   const now = Date.now();
   db.transaction((tx) => {
     tx.insert(workflowPackageRevisions).values({
@@ -47,7 +47,7 @@ export async function importWorkflowPackage(
         importedBy: actorId,
         importedAtMs: now,
         workflowNodeCount: Object.keys(workflow).length,
-        contractSha256: sha256(canonicalize(manifest)),
+        contractSha256: sha256Canonical(manifest),
         ...(input.generationProvenance ? { generationProvenance: input.generationProvenance } : {}),
       },
       updatedAtMs: now,

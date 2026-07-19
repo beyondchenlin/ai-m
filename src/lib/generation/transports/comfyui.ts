@@ -709,7 +709,7 @@ export class ComfyUIHttpTransport implements ComfyUITransport {
     if (input.subfolder) form.set("subfolder", input.subfolder);
     const response = await this.request(this.url("/upload/image"), {
       method: "POST", headers: this.headers, body: form, redirect: "manual",
-    }, "definitely-not-submitted", this.uploadTimeoutMs, options);
+    }, "submission-uncertain", this.uploadTimeoutMs, options);
     if (!response.ok) {
       await discardResponseBody(response);
       throw new Error(`ComfyUI image upload failed (${response.status})`);
@@ -814,7 +814,7 @@ export async function submitPrompt(
     await readTextLimited(response, 64 * 1024);
     throw new ComfyUIOperationError(
       `ComfyUI prompt submission failed (${response.status})`,
-      "definitely-not-submitted",
+      "submission-uncertain",
     );
   }
 

@@ -50,13 +50,24 @@ export interface WorkflowManifest {
   outputs: AuthorOutput[];
   requirements: {
     nodeClasses: string[];
-    models: Array<{ folder: string; filename: string; sha256?: string }>;
+    models: Array<{
+      /** Physical path below the configured model root, used for byte verification. */
+      folder: string;
+      /** Optional ComfyUI registry name when it differs from the physical folder. */
+      runtimeFolder?: string;
+      /** False for auxiliary files that must be byte-verified but are not exposed by the runtime model registry. */
+      runtimeVisible?: boolean;
+      filename: string;
+      sizeBytes?: number;
+      sha256?: string;
+    }>;
     referenceModes: Array<"off" | "auto" | "required">;
   };
   limits: {
     maxPromptChars: number;
     maxPixels: number;
     maxBatch: number;
+    maxReferenceInputs?: number;
     maxOutputs: number;
     maxJobMs: number;
     maxOutputBytes: number;
@@ -96,5 +107,6 @@ export interface WorkflowPackageInput {
     packageName: string;
     packageDigest: string;
     verifiedEvidenceDigest?: string;
+    verifiedEvidenceExpiresAtMs?: number;
   };
 }

@@ -128,9 +128,14 @@ def main() -> int:
         if token not in store:
             raise AssertionError(f"model store is missing {token}")
 
-    for token in ["partialize:", 'apiKey: ""', "secretKey: undefined", "sessionStorage", "mergeSessionCredentials"]:
+    for token in [
+        "partialize:", 'apiKey: ""', "secretKey: undefined",
+        "purgeLegacyBrowserCredentials", "window.localStorage", "window.sessionStorage",
+    ]:
         if token not in store:
             raise AssertionError(f"model store does not securely scope browser credentials: {token}")
+    if "sessionStorage.setItem" in store:
+        raise AssertionError("model store must not persist credentials in browser session storage")
 
     check_settings_page_invariants(ROOT)
 
@@ -211,11 +216,11 @@ def main() -> int:
 
 
     profile_service = require("src/lib/generation/profiles/service.ts")
-    for token in ["workflowPackageStates", 'workflow?.state === "active"']:
+    for token in ["workflowPackageStates", "selectApplicableWorkflowValidation"]:
         if token not in profile_service:
             raise AssertionError(f"selectable profiles must require an active workflow package: {token}")
-    if 'runtime.workflowState !== "active"' not in jobs_service:
-        raise AssertionError("job creation must reject inactive workflow packages")
+    if "selectApplicableWorkflowValidation" not in jobs_service:
+        raise AssertionError("job creation must enforce the validation-kind workflow-state policy")
 
     materializer = require("src/lib/generation/input-materializer.ts")
     for token in ["cleanupTerminalSharedInputs", "AI_M_COMFYUI_SHARED_INPUT_ROOT", "generationJobSourceAssets"]:
@@ -240,7 +245,7 @@ def main() -> int:
         raise AssertionError("voice profile creation must reference an uploaded immutable source asset")
 
     dialogue_panel = require("src/components/editor/dialogue-speech-panel.tsx")
-    if "mounted.current = true" not in dialogue_panel or "showLocalProfiles" not in dialogue_panel or 'providerId !== "local"' not in dialogue_panel:
+    if "mounted.current = true" not in dialogue_panel or "showLocalProfiles" not in dialogue_panel or "selectedProfileRevisionId" not in dialogue_panel:
         raise AssertionError("speech panel must be StrictMode-safe and select only runnable local profiles")
     if 'if (dialogues.length === 0) return null' not in dialogue_panel or 'available === true && (' not in dialogue_panel:
         raise AssertionError("speech feature gating must not hide the existing dialogue transcript")

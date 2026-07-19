@@ -14,7 +14,7 @@ import {
   type SqlitePixelleGcAuditAnchor,
   verifyPixelleGcAuditChain,
 } from "./pixelle-gc-audit";
-import { canonicalize, sha256 } from "../src/lib/generation/workflows/canonical";
+import { canonicalize, sha256Canonical } from "../src/lib/generation/workflows/canonical";
 import { compileWorkflowBindings } from "../src/lib/generation/workflows/compiler";
 import { parseWorkflowManifest } from "../src/lib/generation/workflows/manifest";
 import { normalizeComfyWorkflow } from "../src/lib/generation/workflows/normalize";
@@ -22,10 +22,13 @@ import { parseWorkflowPackageLock, verifyLockedFiles } from "../src/lib/generati
 import { applyStaticPolicy, validateWorkflowStructure } from "../src/lib/generation/workflows/validator";
 import type { AuthorBinding, AuthorOutput, ComfyWorkflow, WorkflowManifest } from "../src/lib/generation/workflows/types";
 import { comparePixelleProcessIdentity, getPixelleProcessIdentity, getPixelleProcessLiveness } from "./pixelle-process-identity";
+import { applyVerifiedModelDigests, verifyRequiredModelFiles } from "../src/lib/generation/model-file-inventory";
 
 export interface PrepareOptions {
   pixelleRoot: string;
   stagingDir: string;
+  /** Canonical ComfyUI models root. When set, required model SHA-256 values are baked into the generation. */
+  modelsRoot?: string;
   nowMs?: number;
   lockStaleMs?: number;
   isProcessAlive?: (pid: number) => Promise<boolean | "unknown">;
@@ -91,6 +94,7 @@ interface CandidateDefinition {
   workflowId: string;
   displayName: string;
   capability: WorkflowManifest["capability"];
+  transform?(workflow: ComfyWorkflow): ComfyWorkflow;
   requiredNodeClasses: string[];
   bindings(workflow: ComfyWorkflow): AuthorBinding[];
   output: AuthorOutput;
@@ -146,6 +150,19 @@ const voiceReferenceBinding = (): AuthorBinding => ({
   userOverride: false,
 });
 
+const referenceImageBinding = (
+  key: string,
+  metaTitle: string,
+): AuthorBinding => ({
+  key,
+  selector: selector("LoadImage", metaTitle),
+  inputName: "image",
+  valueType: "image",
+  source: "reference-image",
+  required: true,
+  userOverride: false,
+});
+
 const speechLimits: WorkflowManifest["limits"] = {
   maxPromptChars: 100_000,
   maxPixels: 1,
@@ -164,12 +181,40 @@ const visualLimits: WorkflowManifest["limits"] = {
   maxOutputBytes: 2_147_483_648,
 };
 
-function loaderModel(workflow: ComfyWorkflow, classType: string, inputName: string, folder: string) {
+function loaderModel(
+  workflow: ComfyWorkflow,
+  classType: string,
+  inputName: string,
+  folder: string,
+  runtimeFolder?: string,
+) {
   const matches = Object.values(workflow).filter((node) => node.class_type === classType);
   if (matches.length !== 1) throw new Error(`${classType} model mapping requires exactly one node; found ${matches.length}`);
   const filename = matches[0].inputs[inputName];
   if (typeof filename !== "string" || !filename.trim()) throw new Error(`${classType}.${inputName} must name a model file`);
-  return { folder, filename };
+  return { folder, ...(runtimeFolder ? { runtimeFolder } : {}), filename };
+}
+
+function replaceSingleLoaderModel(
+  workflow: ComfyWorkflow,
+  classType: string,
+  inputName: string,
+  filename: string,
+): void {
+  const matches = Object.values(workflow).filter((node) => node.class_type === classType);
+  if (matches.length !== 1) throw new Error(`${classType} model replacement requires exactly one node; found ${matches.length}`);
+  matches[0].inputs[inputName] = filename;
+}
+
+function withZImageGgufModels(
+  workflow: ComfyWorkflow,
+  unetName: string,
+  clipName: string,
+): ComfyWorkflow {
+  const result = structuredClone(workflow);
+  replaceSingleLoaderModel(result, "UnetLoaderGGUF", "unet_name", unetName);
+  replaceSingleLoaderModel(result, "CLIPLoaderGGUF", "clip_name", clipName);
+  return result;
 }
 
 function numericInputDefault(workflow: ComfyWorkflow, classType: string, metaTitle: string, inputName: string): number {
@@ -193,6 +238,63 @@ function omniBindings(workflow: ComfyWorkflow, nodeClass: string, nodeTitle: str
   ];
 }
 
+const indexTts2Models: WorkflowManifest["requirements"]["models"] = [
+  "bpe.model",
+  "campplus_cn_common.bin",
+  "config.yaml",
+  "feat1.pt",
+  "feat2.pt",
+  "gpt.pth",
+  "s2mel.pth",
+  "wav2vec2bert_stats.pt",
+  "qwen0.6bemo4-merge/Modelfile",
+  "qwen0.6bemo4-merge/added_tokens.json",
+  "qwen0.6bemo4-merge/chat_template.jinja",
+  "qwen0.6bemo4-merge/config.json",
+  "qwen0.6bemo4-merge/generation_config.json",
+  "qwen0.6bemo4-merge/merges.txt",
+  "qwen0.6bemo4-merge/model.safetensors",
+  "qwen0.6bemo4-merge/special_tokens_map.json",
+  "qwen0.6bemo4-merge/tokenizer.json",
+  "qwen0.6bemo4-merge/tokenizer_config.json",
+  "qwen0.6bemo4-merge/vocab.json",
+  "semantic_codec/model.safetensors",
+  "w2v-bert-2.0/config.json",
+  "w2v-bert-2.0/model.safetensors",
+  "w2v-bert-2.0/preprocessor_config.json",
+  "bigvgan/bigvgan_v2_22khz_80band_256x/config.json",
+  "bigvgan/bigvgan_v2_22khz_80band_256x/bigvgan_generator.pt",
+].map((filename) => ({ folder: "IndexTTS-2", filename, runtimeVisible: false }));
+
+const omniVoiceModels: WorkflowManifest["requirements"]["models"] = [
+  "OmniVoice-bf16/config.json",
+  "OmniVoice-bf16/model.safetensors",
+  "OmniVoice-bf16/tokenizer.json",
+  "OmniVoice-bf16/tokenizer_config.json",
+  "OmniVoice-bf16/chat_template.jinja",
+  "OmniVoice-bf16/audio_tokenizer/config.json",
+  "OmniVoice-bf16/audio_tokenizer/model.safetensors",
+  "OmniVoice-bf16/audio_tokenizer/preprocessor_config.json",
+].map((filename) => ({ folder: "omnivoice", filename, runtimeVisible: false }));
+
+const omniVoiceWhisperModels: WorkflowManifest["requirements"]["models"] = [
+  "whisper-large-v3/.msc",
+  "whisper-large-v3/.mv",
+  "whisper-large-v3/added_tokens.json",
+  "whisper-large-v3/config.json",
+  "whisper-large-v3/configuration.json",
+  "whisper-large-v3/generation_config.json",
+  "whisper-large-v3/merges.txt",
+  "whisper-large-v3/model.safetensors",
+  "whisper-large-v3/model.safetensors.index.fp32.json",
+  "whisper-large-v3/normalizer.json",
+  "whisper-large-v3/preprocessor_config.json",
+  "whisper-large-v3/special_tokens_map.json",
+  "whisper-large-v3/tokenizer.json",
+  "whisper-large-v3/tokenizer_config.json",
+  "whisper-large-v3/vocab.json",
+].map((filename) => ({ folder: "audio_encoders", filename, runtimeVisible: false }));
+
 const candidates: CandidateDefinition[] = [
   {
     sourceFile: "tts_index2.json",
@@ -203,7 +305,7 @@ const candidates: CandidateDefinition[] = [
     requiredNodeClasses: ["PrimitiveStringMultiline", "VHS_LoadAudioUpload", "IndexTTS2BaseNode", "IndexTTS2CacheControlNode", "SaveAudio"],
     bindings: () => [textBinding("text", "PrimitiveStringMultiline", "$text.value!", "value"), voiceReferenceBinding()],
     output: { key: "audio", selector: selector("SaveAudio", "Save Audio (FLAC)"), field: "audio", mediaKind: "audio", maxItems: 1 },
-    models: () => [],
+    models: () => indexTts2Models,
     referenceModes: ["required"],
     limits: speechLimits,
   },
@@ -216,7 +318,7 @@ const candidates: CandidateDefinition[] = [
     requiredNodeClasses: ["PrimitiveStringMultiline", "VHS_LoadAudioUpload", "IndexTTS2BaseNode", "IndexTTS2CacheControlNode", "SaveAudio"],
     bindings: () => [textBinding("text", "PrimitiveStringMultiline", "$text.value!", "value"), voiceReferenceBinding()],
     output: { key: "audio", selector: selector("SaveAudio", "Save Audio (FLAC)"), field: "audio", mediaKind: "audio", maxItems: 1 },
-    models: () => [],
+    models: () => indexTts2Models,
     referenceModes: ["required"],
     limits: speechLimits,
   },
@@ -229,7 +331,7 @@ const candidates: CandidateDefinition[] = [
     requiredNodeClasses: ["PrimitiveStringMultiline", "VHS_LoadAudioUpload", "OmniVoiceLongformTTS", "OmniVoiceWhisperLoader", "SaveAudio"],
     bindings: (workflow) => omniBindings(workflow, "OmniVoiceLongformTTS", "OmniVoice Longform TTS", false),
     output: { key: "audio", selector: selector("SaveAudio", "Save Audio (FLAC)"), field: "audio", mediaKind: "audio", maxItems: 1 },
-    models: () => [],
+    models: () => [...omniVoiceModels, ...omniVoiceWhisperModels],
     referenceModes: ["required"],
     limits: speechLimits,
   },
@@ -242,7 +344,7 @@ const candidates: CandidateDefinition[] = [
     requiredNodeClasses: ["PrimitiveStringMultiline", "VHS_LoadAudioUpload", "OmniVoiceVoiceCloneTTS", "PixelleDurationInput", "SaveAudio"],
     bindings: (workflow) => omniBindings(workflow, "OmniVoiceVoiceCloneTTS", "OmniVoice Voice Clone TTS", true),
     output: { key: "audio", selector: selector("SaveAudio", "Save Audio (FLAC)"), field: "audio", mediaKind: "audio", maxItems: 1 },
-    models: () => [],
+    models: () => omniVoiceModels,
     referenceModes: ["required"],
     limits: speechLimits,
   },
@@ -267,6 +369,112 @@ const candidates: CandidateDefinition[] = [
     ],
     referenceModes: ["off"],
     limits: visualLimits,
+  },
+  {
+    sourceFile: "image_z_image.json",
+    packageName: "image-z-image-base-bf16",
+    workflowId: "pixelle.image.z-image-base-bf16",
+    displayName: "Pixelle Z-Image Base BF16",
+    capability: "image",
+    requiredNodeClasses: ["PrimitiveStringMultiline", "easy int", "KSampler", "UNETLoader", "CLIPLoader", "VAELoader", "SaveImage"],
+    bindings: (workflow) => [
+      textBinding("prompt", "PrimitiveStringMultiline", "$prompt.value!", "value"),
+      numericBinding("width", "easy int", "$width.value", "value", "integer", numericInputDefault(workflow, "easy int", "$width.value", "value"), 256, 2_048),
+      numericBinding("height", "easy int", "$height.value", "value", "integer", numericInputDefault(workflow, "easy int", "$height.value", "value"), 256, 2_048),
+      numericBinding("seed", "KSampler", "KSampler", "seed", "integer", numericInputDefault(workflow, "KSampler", "KSampler", "seed"), 0, Number.MAX_SAFE_INTEGER),
+    ],
+    output: { key: "image", selector: selector("SaveImage", "Save Image"), field: "images", mediaKind: "image", maxItems: 1 },
+    models: (workflow) => [
+      loaderModel(workflow, "UNETLoader", "unet_name", "diffusion_models"),
+      loaderModel(workflow, "CLIPLoader", "clip_name", "text_encoders"),
+      loaderModel(workflow, "VAELoader", "vae_name", "vae"),
+    ],
+    referenceModes: ["off"],
+    limits: visualLimits,
+  },
+  {
+    sourceFile: "image_z_image_turbo_gguf.json",
+    packageName: "image-z-image-turbo-gguf-q4",
+    workflowId: "pixelle.image.z-image-turbo-gguf-q4",
+    displayName: "Pixelle Z-Image Turbo GGUF Q4",
+    capability: "image",
+    transform: (workflow) => withZImageGgufModels(
+      workflow,
+      "z-image-turbo-Q4_K_M.gguf",
+      "Qwen3-4B-Q4_K_M.gguf",
+    ),
+    requiredNodeClasses: ["PrimitiveStringMultiline", "easy int", "KSampler", "UnetLoaderGGUF", "CLIPLoaderGGUF", "VAELoader", "SaveImage"],
+    bindings: (workflow) => [
+      textBinding("prompt", "PrimitiveStringMultiline", "$prompt.value!", "value"),
+      numericBinding("width", "easy int", "$width.value", "value", "integer", numericInputDefault(workflow, "easy int", "$width.value", "value"), 256, 2_048),
+      numericBinding("height", "easy int", "$height.value", "value", "integer", numericInputDefault(workflow, "easy int", "$height.value", "value"), 256, 2_048),
+      numericBinding("seed", "KSampler", "KSampler", "seed", "integer", numericInputDefault(workflow, "KSampler", "KSampler", "seed"), 0, Number.MAX_SAFE_INTEGER),
+    ],
+    output: { key: "image", selector: selector("SaveImage", "Save Image"), field: "images", mediaKind: "image", maxItems: 1 },
+    models: (workflow) => [
+      loaderModel(workflow, "UnetLoaderGGUF", "unet_name", "unet", "unet_gguf"),
+      loaderModel(workflow, "CLIPLoaderGGUF", "clip_name", "text_encoders", "clip_gguf"),
+      loaderModel(workflow, "VAELoader", "vae_name", "vae"),
+    ],
+    referenceModes: ["off"],
+    limits: visualLimits,
+  },
+  {
+    sourceFile: "image_z_image_turbo_gguf.json",
+    packageName: "image-z-image-turbo-gguf-q8",
+    workflowId: "pixelle.image.z-image-turbo-gguf-q8",
+    displayName: "Pixelle Z-Image Turbo GGUF Q8",
+    capability: "image",
+    transform: (workflow) => withZImageGgufModels(
+      workflow,
+      "z-image-turbo-Q8_0.gguf",
+      "Qwen3-4B-Q8_0.gguf",
+    ),
+    requiredNodeClasses: ["PrimitiveStringMultiline", "easy int", "KSampler", "UnetLoaderGGUF", "CLIPLoaderGGUF", "VAELoader", "SaveImage"],
+    bindings: (workflow) => [
+      textBinding("prompt", "PrimitiveStringMultiline", "$prompt.value!", "value"),
+      numericBinding("width", "easy int", "$width.value", "value", "integer", numericInputDefault(workflow, "easy int", "$width.value", "value"), 256, 2_048),
+      numericBinding("height", "easy int", "$height.value", "value", "integer", numericInputDefault(workflow, "easy int", "$height.value", "value"), 256, 2_048),
+      numericBinding("seed", "KSampler", "KSampler", "seed", "integer", numericInputDefault(workflow, "KSampler", "KSampler", "seed"), 0, Number.MAX_SAFE_INTEGER),
+    ],
+    output: { key: "image", selector: selector("SaveImage", "Save Image"), field: "images", mediaKind: "image", maxItems: 1 },
+    models: (workflow) => [
+      loaderModel(workflow, "UnetLoaderGGUF", "unet_name", "unet", "unet_gguf"),
+      loaderModel(workflow, "CLIPLoaderGGUF", "clip_name", "text_encoders", "clip_gguf"),
+      loaderModel(workflow, "VAELoader", "vae_name", "vae"),
+    ],
+    referenceModes: ["off"],
+    limits: visualLimits,
+  },
+  {
+    sourceFile: "image_qwen_edit_2511_gguf_q4_k_m.json",
+    packageName: "image-qwen-edit-2511-gguf-q4",
+    workflowId: "pixelle.image.qwen-edit-2511-gguf-q4",
+    displayName: "Pixelle Qwen Image Edit 2511 GGUF Q4",
+    capability: "image",
+    requiredNodeClasses: [
+      "CFGNorm", "CLIPLoaderGGUF", "ConditioningZeroOut", "FluxKontextImageScale",
+      "FluxKontextMultiReferenceLatentMethod", "KSampler", "LoadImage", "LoraLoader",
+      "ModelSamplingAuraFlow", "SaveImage", "TextEncodeQwenImageEditPlus",
+      "UnetLoaderGGUF", "VAEDecodeTiled", "VAEEncodeTiled", "VAELoader",
+    ],
+    bindings: (workflow) => [
+      textBinding("prompt", "TextEncodeQwenImageEditPlus", "Edit Prompt, $prompt.prompt!", "prompt"),
+      referenceImageBinding("sourceImage", "Source Image, $~image.image!"),
+      referenceImageBinding("referenceImage", "Reference Image, $~image2.image!"),
+      numericBinding("seed", "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "seed", "integer", numericInputDefault(workflow, "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "seed"), 0, Number.MAX_SAFE_INTEGER),
+      numericBinding("steps", "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "steps", "integer", numericInputDefault(workflow, "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "steps"), 1, 100),
+      numericBinding("cfg", "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "cfg", "number", numericInputDefault(workflow, "KSampler", "Sampling, $seed.seed, $steps.steps, $cfg.cfg", "cfg"), 0, 100, 0.1),
+    ],
+    output: { key: "image", selector: selector("SaveImage", "Save Image"), field: "images", mediaKind: "image", maxItems: 1 },
+    models: (workflow) => [
+      loaderModel(workflow, "UnetLoaderGGUF", "unet_name", "unet", "unet_gguf"),
+      loaderModel(workflow, "CLIPLoaderGGUF", "clip_name", "text_encoders", "clip_gguf"),
+      loaderModel(workflow, "VAELoader", "vae_name", "vae"),
+      loaderModel(workflow, "LoraLoader", "lora_name", "loras"),
+    ],
+    referenceModes: ["required"],
+    limits: { ...visualLimits, maxReferenceInputs: 2 },
   },
   {
     sourceFile: "video_wan2.1_fusionx.json",
@@ -300,6 +508,14 @@ function isInside(parent: string, child: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 async function lstatOrNull(target: string) {
@@ -398,17 +614,18 @@ async function snapshotSources(
 ): Promise<Map<string, Buffer>> {
   const identities: SourceIdentity[] = [];
   let totalSize = 0;
-  for (const definition of candidates) {
-    const sourcePath = path.resolve(workflowDir, definition.sourceFile);
-    if (path.dirname(sourcePath) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
+  const sourceFiles = [...new Set(candidates.map((definition) => definition.sourceFile))];
+  for (const sourceFile of sourceFiles) {
+    const sourcePath = path.resolve(workflowDir, sourceFile);
+    if (!samePath(path.dirname(sourcePath), workflowDir)) throw new Error(`Source workflow escapes workflows/selfhost: ${sourceFile}`);
     const stat = await fs.lstat(sourcePath);
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Source workflow must be a regular file without links: ${definition.sourceFile}`);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Source workflow must be a regular file without links: ${sourceFile}`);
     const realPath = await fs.realpath(sourcePath);
-    if (path.dirname(realPath) !== workflowDir) throw new Error(`Source workflow escapes workflows/selfhost: ${definition.sourceFile}`);
-    if (stat.size > MAX_WORKFLOW_BYTES) throw new Error(`${definition.sourceFile} exceeds the 5 MiB size limit`);
+    if (!samePath(path.dirname(realPath), workflowDir)) throw new Error(`Source workflow escapes workflows/selfhost: ${sourceFile}`);
+    if (stat.size > MAX_WORKFLOW_BYTES) throw new Error(`${sourceFile} exceeds the 5 MiB size limit`);
     totalSize += stat.size;
     if (totalSize > MAX_TOTAL_WORKFLOW_BYTES) throw new Error("Workflow source snapshot exceeds the total size limit");
-    identities.push({ sourceFile: definition.sourceFile, sourcePath, realPath, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
+    identities.push({ sourceFile, sourcePath, realPath, dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs });
   }
 
   const result = new Map<string, Buffer>();
@@ -455,11 +672,13 @@ function readApiWorkflow(bytes: Buffer, definition: CandidateDefinition): ComfyW
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || "nodes" in raw) {
     throw new Error(`${definition.sourceFile} must be a real ComfyUI API graph keyed by numeric node IDs`);
   }
-  const structure = validateWorkflowStructure(raw as Record<string, unknown>);
-  const policy = applyStaticPolicy(raw as Record<string, unknown>);
+  const workflow = definition.transform
+    ? definition.transform(normalizeComfyWorkflow(raw))
+    : normalizeComfyWorkflow(raw);
+  const structure = validateWorkflowStructure(workflow);
+  const policy = applyStaticPolicy(workflow);
   const errors = [...structure.errors, ...policy.errors];
   if (errors.length) throw new Error(`${definition.sourceFile} is not a safe API graph: ${errors.join("; ")}`);
-  const workflow = normalizeComfyWorkflow(raw);
   const actualClasses = new Set(Object.values(workflow).map((item) => item.class_type));
   const missing = definition.requiredNodeClasses.filter((classType) => !actualClasses.has(classType));
   if (missing.length) throw new Error(`${definition.sourceFile} is missing required node class(es): ${missing.join(", ")}`);
@@ -808,7 +1027,7 @@ async function validateCurrentPointer(stagingDir: string): Promise<void> {
     const allowed = ["schemaVersion", "generationDigest", "packageDigests", "state"];
     if (Object.keys(current).some((key) => !allowed.includes(key))) throw new Error("current.json has unknown fields");
     const packageNames = Object.keys(current.packageDigests).sort();
-    if (packageNames.join("\0") !== candidates.map((item) => item.packageName).sort().join("\0")) throw new Error("current.json package set is invalid");
+    if (packageNames.length === 0) throw new Error("current.json package set is empty");
     const packageDigests: Record<string, string> = {};
     for (const packageName of packageNames) {
       const digest = current.packageDigests[packageName];
@@ -868,7 +1087,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("Staging parent must be an existing regular directory");
   const workflowDir = path.resolve(pixelleRoot, "workflows", "selfhost");
   await assertNoSymlinkComponents(workflowDir, "Pixelle workflows/selfhost");
-  if (await fs.realpath(workflowDir) !== workflowDir) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
+  if (!samePath(await fs.realpath(workflowDir), workflowDir)) throw new Error("Pixelle workflows/selfhost must not escape PIXELLE_ROOT");
   await initializeStaging(stagingDir, options);
   await assertGenerationsDirectory(stagingDir);
   const token = randomBytes(16).toString("hex");
@@ -904,9 +1123,26 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
     const packages: PreparedPackage[] = [];
     const expected = new Map<string, PackageFiles>();
     const packageDigests: Record<string, string> = {};
-    for (const definition of candidates) {
+    let preparedDefinitions = candidates.map((definition) => {
       const workflow = readApiWorkflow(sourceBytes.get(definition.sourceFile)!, definition);
-      const manifest = makeManifest(definition, workflow);
+      return { definition, workflow, manifest: makeManifest(definition, workflow) };
+    });
+    if (options.modelsRoot) {
+      const allRequirements = preparedDefinitions.flatMap(({ manifest }) => manifest.requirements.models);
+      const inventory = await verifyRequiredModelFiles(options.modelsRoot, allRequirements);
+      preparedDefinitions = preparedDefinitions.map(({ definition, workflow, manifest }) => ({
+        definition,
+        workflow,
+        manifest: parseWorkflowManifest({
+          ...manifest,
+          requirements: {
+            ...manifest.requirements,
+            models: applyVerifiedModelDigests(manifest.requirements.models, inventory),
+          },
+        }),
+      }));
+    }
+    for (const { definition, workflow, manifest } of preparedDefinitions) {
       const compiled = compileWorkflowBindings(workflow, manifest);
       const tempPackageDir = path.join(payloadDir, definition.packageName);
       await fs.mkdir(tempPackageDir);
@@ -923,7 +1159,7 @@ export async function preparePixelleSingleBackendPackages(options: PrepareOption
         workflowId: manifest.workflowId,
         version: manifest.version,
         files: fileDigests,
-        environmentLockDigest: sha256({
+        environmentLockDigest: sha256Canonical({
           requirements: manifest.requirements,
           outputContract: manifest.outputs,
         }),
@@ -1113,6 +1349,14 @@ async function main(): Promise<void> {
   const result = await preparePixelleSingleBackendPackages({
     pixelleRoot: process.env.PIXELLE_ROOT ?? "",
     stagingDir: process.env.PIXELLE_WORKFLOW_STAGING_DIR ?? "",
+    ...(process.env.AI_M_MANAGED_COMFYUI_MODELS_ROOT || process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT
+      ? {
+          modelsRoot: path.resolve(
+            process.env.AI_M_MANAGED_COMFYUI_MODELS_ROOT
+              || path.resolve(process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT!, "models"),
+          ),
+        }
+      : {}),
   });
   console.log(JSON.stringify({
     state: result.state,

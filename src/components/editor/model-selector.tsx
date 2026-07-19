@@ -1,9 +1,23 @@
 "use client";
 
-import { useState, useRef, useEffect, useId, useMemo } from "react";
-import { useModelStore, type Capability, type ModelRef } from "@/stores/model-store";
-import { Type, ImageIcon, VideoIcon, AudioLines, ChevronDown, Check, Cpu } from "lucide-react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  AudioLines,
+  Check,
+  ChevronDown,
+  Cpu,
+  ImageIcon,
+  Type,
+  VideoIcon,
+} from "lucide-react";
 import { apiFetch } from "@/lib/api-fetch";
+import { useModelStore, type Capability, type ModelRef } from "@/stores/model-store";
+import {
+  buildModelPickerOptions,
+  modelRefStableId,
+  type LocalProfileOption,
+  type ModelPickerOption,
+} from "./model-picker-options";
 
 const ICONS: Record<Capability, React.ReactNode> = {
   text: <Type className="h-3 w-3" />,
@@ -11,14 +25,6 @@ const ICONS: Record<Capability, React.ReactNode> = {
   video: <VideoIcon className="h-3 w-3" />,
   speech: <AudioLines className="h-3 w-3" />,
 };
-
-/** 本地生成配置选项 */
-interface LocalProfileOption {
-  id: string;
-  displayName: string;
-  adapterKind: string;
-  isLocal: true;
-}
 
 const COLORS: Record<Capability, string> = {
   text: "bg-blue-500/10 text-blue-600",
@@ -45,82 +51,99 @@ interface InlineModelPickerProps {
   capability: Capability;
   value?: ModelRef | null;
   onChange?: (ref: ModelRef) => void;
-  /** 是否显示本地生成配置选项 */
   showLocalProfiles?: boolean;
 }
 
-export function InlineModelPicker({ capability, value: controlledValue, onChange, showLocalProfiles = false }: InlineModelPickerProps) {
-  const providers = useModelStore((s) => s.providers);
-  const globalValue = useModelStore((s) => s[GETTERS[capability]]);
-  const globalSetter = useModelStore((s) => s[SETTERS[capability]]);
-  const isControlled = onChange !== undefined;
-  const value = isControlled ? controlledValue : globalValue;
-  const setter = isControlled ? onChange : globalSetter;
+function parseProfilesResponse(data: unknown): LocalProfileOption[] {
+  if (!data || typeof data !== "object") throw new Error("Profile listing response is invalid");
+  const profiles = (data as { profiles?: unknown }).profiles;
+  if (!Array.isArray(profiles)) throw new Error("Profile listing response is invalid");
+  return profiles.flatMap((profile): LocalProfileOption[] => {
+    if (!profile || typeof profile !== "object") return [];
+    const candidate = profile as Record<string, unknown>;
+    if (
+      typeof candidate.id !== "string"
+      || !candidate.id.trim()
+      || typeof candidate.displayName !== "string"
+      || !candidate.displayName.trim()
+      || typeof candidate.adapterKind !== "string"
+      || candidate.adapterKind !== "comfyui"
+    ) return [];
+    return [{
+      id: candidate.id.trim(),
+      displayName: candidate.displayName.trim(),
+      adapterKind: candidate.adapterKind,
+    }];
+  });
+}
+
+export function InlineModelPicker({
+  capability,
+  value: controlledValue,
+  onChange,
+  showLocalProfiles = false,
+}: InlineModelPickerProps) {
+  const providers = useModelStore((state) => state.providers);
+  const globalValue = useModelStore((state) => state[GETTERS[capability]]);
+  const globalSetter = useModelStore((state) => state[SETTERS[capability]]);
+  const value = onChange ? controlledValue : globalValue;
+  const setter = onChange ?? globalSetter;
   const [open, setOpen] = useState(false);
   const listboxId = useId();
   const [dropUp, setDropUp] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [localProfiles, setLocalProfiles] = useState<LocalProfileOption[]>([]);
-  const hasManagedComfyProvider = providers.some((provider) => (
-    provider.capability === capability && provider.protocol === "comfyui"
-  ));
+  const [profileResult, setProfileResult] = useState<{
+    requestKey: string;
+    profiles: LocalProfileOption[];
+    status: "ready" | "error";
+  } | null>(null);
+  const profileRequestKey = capability;
 
-  // 查询本地生成配置
   useEffect(() => {
-    if (!showLocalProfiles || hasManagedComfyProvider) {
-      return;
-    }
+    if (!showLocalProfiles) return;
 
-    apiFetch(`/api/generation/profiles?capability=${capability}`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.profiles) {
-          setLocalProfiles(
-            data.profiles.map((p: { id: string; displayName: string; adapterKind: string }) => ({
-              id: p.id,
-              displayName: p.displayName,
-              adapterKind: p.adapterKind,
-              isLocal: true as const,
-            }))
-          );
+    const controller = new AbortController();
+    void apiFetch(`/api/generation/profiles?capability=${capability}`, {
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Profile listing failed with status ${response.status}`);
+        const profiles = parseProfilesResponse(await response.json());
+        if (!controller.signal.aborted) {
+          setProfileResult({ requestKey: capability, profiles, status: "ready" });
         }
       })
-      .catch((err) => {
-        console.warn("Failed to load local profiles:", err);
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        console.warn("Failed to load local profiles:", error);
+        setProfileResult({ requestKey: capability, profiles: [], status: "error" });
       });
-  }, [showLocalProfiles, capability, hasManagedComfyProvider]);
+    return () => controller.abort();
+  }, [showLocalProfiles, capability]);
 
-  const visibleLocalProfiles = showLocalProfiles && !hasManagedComfyProvider ? localProfiles : [];
+  const currentProfileResult = showLocalProfiles && profileResult?.requestKey === profileRequestKey
+    ? profileResult
+    : null;
+  const localProfiles = useMemo(
+    () => currentProfileResult?.profiles ?? [],
+    [currentProfileResult],
+  );
+  const profilesLoading = showLocalProfiles && currentProfileResult === null;
+  const profilesError = currentProfileResult?.status === "error";
 
-  const options = useMemo(() => {
-    const result: { providerId: string; providerName: string; modelId: string; modelName: string }[] = [];
-    for (const p of providers) {
-      if (p.capability !== capability) continue;
-      for (const m of p.models) {
-        if (!m.checked) continue;
-        result.push({
-          providerId: p.id,
-          providerName: p.name,
-          modelId: m.id,
-          modelName: m.name,
-        });
-      }
-    }
-    return result;
-  }, [providers, capability]);
+  const options = useMemo(
+    () => buildModelPickerOptions(
+      providers,
+      capability,
+      showLocalProfiles ? localProfiles : [],
+    ),
+    [providers, capability, showLocalProfiles, localProfiles],
+  );
 
-  // Auto-select first option if nothing is selected (only in uncontrolled mode)
-  useEffect(() => {
-    if (!isControlled && !value && options.length > 0) {
-      globalSetter({ providerId: options[0].providerId, modelId: options[0].modelId } as ModelRef);
-    }
-  }, [isControlled, value, options, globalSetter]);
-
-  // Close on outside click
   useEffect(() => {
     if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+    function handleClick(event: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setOpen(false);
       }
     }
@@ -128,41 +151,25 @@ export function InlineModelPicker({ capability, value: controlledValue, onChange
     return () => document.removeEventListener("mousedown", handleClick);
   }, [open]);
 
-  if (options.length === 0 && visibleLocalProfiles.length === 0) return null;
+  if (options.length === 0 && !profilesLoading && !profilesError) return null;
 
-  const currentKey = value
-    ? `${value.providerId}:${value.modelId}`
-    : options.length > 0
-      ? `${options[0].providerId}:${options[0].modelId}`
-      : visibleLocalProfiles.length > 0
-        ? `local:${visibleLocalProfiles[0].id}`
-        : "";
+  const currentStableId = value ? modelRefStableId(value) : "";
+  const currentOption = options.find((option) => option.stableId === currentStableId);
+  const multiProvider = new Set(options.map((option) => option.providerId)).size > 1;
 
-  const currentOption = options.find(
-    (o) => `${o.providerId}:${o.modelId}` === currentKey
-  );
-
-  // 检查是否是本地配置
-  const currentLocalProfile = value && "providerId" in value && value.providerId === "local"
-    ? visibleLocalProfiles.find((p) => p.id === value.modelId)
-    : null;
-
-  const multiProvider = new Set(options.map((o) => o.providerId)).size > 1;
-
-  function getLabel(opt: (typeof options)[number]) {
+  function getLabel(option: ModelPickerOption) {
     return multiProvider
-      ? `${opt.providerName} / ${opt.modelName}`
-      : opt.modelName;
+      ? `${option.providerName} / ${option.modelName}`
+      : option.modelName;
   }
 
-  function handleSelect(opt: (typeof options)[number]) {
-    setter({ providerId: opt.providerId, modelId: opt.modelId } as ModelRef);
+  function handleSelect(option: ModelPickerOption) {
+    setter({ providerId: option.providerId, modelId: option.modelId });
     setOpen(false);
   }
 
   return (
     <div className="relative" ref={containerRef}>
-      {/* Trigger */}
       <button
         type="button"
         aria-label={`Select ${capability} model`}
@@ -171,7 +178,10 @@ export function InlineModelPicker({ capability, value: controlledValue, onChange
         aria-controls={listboxId}
         onKeyDown={(event) => {
           if (event.key === "Escape") setOpen(false);
-          if (event.key === "ArrowDown") { event.preventDefault(); setOpen(true); }
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setOpen(true);
+          }
         }}
         onClick={() => {
           if (!open && containerRef.current) {
@@ -182,100 +192,64 @@ export function InlineModelPicker({ capability, value: controlledValue, onChange
         }}
         className="flex items-center gap-1.5 rounded-lg border border-[--border-subtle] bg-white px-2 py-1 transition-colors hover:border-[--border-hover]"
       >
-        <div
-          className={`flex h-5 w-5 items-center justify-center rounded ${COLORS[capability]}`}
-        >
-          {currentLocalProfile ? <Cpu className="h-3 w-3" /> : ICONS[capability]}
+        <div className={`flex h-5 w-5 items-center justify-center rounded ${COLORS[capability]}`}>
+          {currentOption?.source === "profile" ? <Cpu className="h-3 w-3" /> : ICONS[capability]}
         </div>
         <span className="max-w-[140px] truncate text-[11px] font-medium text-[--text-primary]">
-          {currentLocalProfile
-            ? currentLocalProfile.displayName
-            : currentOption
-              ? getLabel(currentOption)
-              : "—"}
+          {currentOption ? getLabel(currentOption) : "请选择"}
         </span>
         <ChevronDown
           className={`h-3 w-3 text-[--text-muted] transition-transform ${open ? "rotate-180" : ""}`}
         />
       </button>
 
-      {/* Dropdown */}
       {open && (
-        <div id={listboxId} role="listbox" className={`absolute left-0 z-50 min-w-[200px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white py-1 shadow-lg ${dropUp ? "bottom-full mb-1" : "top-full mt-1"}`}>
-          {/* 云端供应商选项 */}
-          {options.map((opt) => {
-            const key = `${opt.providerId}:${opt.modelId}`;
-            const selected = key === currentKey;
+        <div
+          id={listboxId}
+          role="listbox"
+          className={`absolute left-0 z-50 min-w-[200px] overflow-hidden rounded-xl border border-[--border-subtle] bg-white py-1 shadow-lg ${dropUp ? "bottom-full mb-1" : "top-full mt-1"}`}
+        >
+          {options.map((option, index) => {
+            const selected = option.stableId === currentStableId;
+            const showProfileSeparator = option.source === "profile"
+              && index > 0
+              && options[index - 1]?.source !== "profile";
             return (
-              <button
-                key={key}
-                type="button"
-                role="option"
-                aria-selected={selected}
-                onClick={() => handleSelect(opt)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors ${
-                  selected
-                    ? "bg-primary/5 text-primary"
-                    : "text-[--text-primary] hover:bg-[--surface]"
-                }`}
-              >
-                <span
-                  className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full ${
+              <div key={option.stableId}>
+                {showProfileSeparator && <div className="my-1 border-t border-[--border-subtle]" />}
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  onClick={() => handleSelect(option)}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors ${
                     selected
-                      ? "bg-primary text-white"
-                      : "border border-[--border-subtle]"
+                      ? "bg-primary/5 text-primary"
+                      : "text-[--text-primary] hover:bg-[--surface]"
                   }`}
                 >
-                  {selected && <Check className="h-2.5 w-2.5" />}
-                </span>
-                <span className="truncate font-medium">{getLabel(opt)}</span>
-              </button>
-            );
-          })}
-
-          {/* 本地生成配置选项 */}
-          {showLocalProfiles && visibleLocalProfiles.length > 0 && (
-            <>
-              {options.length > 0 && (
-                <div className="my-1 border-t border-[--border-subtle]" />
-              )}
-              <div className="px-3 py-1 text-[10px] font-semibold uppercase text-[--text-muted]">
-                本地生成
-              </div>
-              {visibleLocalProfiles.map((profile) => {
-                const key = `local:${profile.id}`;
-                const selected = value && "providerId" in value && value.providerId === "local" && value.modelId === profile.id;
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    role="option"
-                    aria-selected={Boolean(selected)}
-                    onClick={() => {
-                      setter({ providerId: "local", modelId: profile.id } as ModelRef);
-                      setOpen(false);
-                    }}
-                    className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors ${
+                  <span
+                    className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full ${
                       selected
-                        ? "bg-primary/5 text-primary"
-                        : "text-[--text-primary] hover:bg-[--surface]"
+                        ? "bg-primary text-white"
+                        : "border border-[--border-subtle]"
                     }`}
                   >
-                    <span
-                      className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full ${
-                        selected
-                          ? "bg-primary text-white"
-                          : "border border-[--border-subtle]"
-                      }`}
-                    >
-                      {selected && <Check className="h-2.5 w-2.5" />}
-                    </span>
-                    <Cpu className="h-3 w-3 text-emerald-600" />
-                    <span className="truncate font-medium">{profile.displayName}</span>
-                  </button>
-                );
-              })}
-            </>
+                    {selected && <Check className="h-2.5 w-2.5" />}
+                  </span>
+                  {option.source === "profile" && <Cpu className="h-3 w-3 text-emerald-600" />}
+                  <span className="truncate font-medium">{getLabel(option)}</span>
+                </button>
+              </div>
+            );
+          })}
+          {profilesLoading && (
+            <div className="px-3 py-2 text-xs text-[--text-muted]">正在读取本地配置…</div>
+          )}
+          {profilesError && (
+            <div role="alert" className="px-3 py-2 text-xs text-red-600">
+              本地配置读取失败，当前选择不会自动切换
+            </div>
           )}
         </div>
       )}

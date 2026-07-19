@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mergeSessionCredentials, migrateModelStoreState, useModelStore } from "../model-store";
+import {
+  migrateModelStoreState,
+  purgeLegacyBrowserCredentials,
+  useModelStore,
+} from "../model-store";
 
 describe("model store v4 migration", () => {
   it("preserves valid legacy defaults and adds an empty speech default", () => {
@@ -51,19 +55,43 @@ describe("model store v4 migration", () => {
   });
 });
 
-describe("model store session credentials", () => {
-  it("restores session-scoped credentials without putting them in persisted providers", () => {
-    const providers = migrateModelStoreState({
-      providers: [{
-        id: "cloud", name: "Cloud", protocol: "openai", capability: "text",
-        baseUrl: "https://api.openai.com", apiKey: "persisted-secret",
-        models: [{ id: "gpt", checked: true }],
-      }],
-    }).providers;
-    const restored = mergeSessionCredentials(providers, {
-      cloud: { apiKey: "session-key", secretKey: "session-secret" },
+describe("model store browser credential cleanup", () => {
+  it("removes legacy local/session credentials and writes a non-secret audit marker", () => {
+    const localValues = new Map<string, string>([[
+      "model-store",
+      JSON.stringify({
+        state: {
+          providers: [{
+            id: "cloud",
+            apiKey: "persisted-secret",
+            secretKey: "persisted-secondary",
+            nested: { apiKey: "nested-secret" },
+          }],
+        },
+        version: 3,
+      }),
+    ]]);
+    const sessionValues = new Map<string, string>([[
+      "ai-m-model-session-credentials-v1",
+      JSON.stringify({ cloud: { apiKey: "session-secret" } }),
+    ]]);
+    const removed = purgeLegacyBrowserCredentials({
+      getItem: (key) => localValues.get(key) ?? null,
+      setItem: (key, value) => { localValues.set(key, value); },
+    }, {
+      removeItem: (key) => { sessionValues.delete(key); },
+    }, 123);
+
+    expect(removed).toBe(3);
+    expect(localValues.get("model-store")).not.toContain("persisted-secret");
+    expect(localValues.get("model-store")).not.toContain("persisted-secondary");
+    expect(localValues.get("model-store")).not.toContain("nested-secret");
+    expect(sessionValues.has("ai-m-model-session-credentials-v1")).toBe(false);
+    expect(JSON.parse(localValues.get("ai-m-browser-secret-migration-v1")!)).toEqual({
+      schemaVersion: 1,
+      completedAtMs: 123,
+      removedCredentialFieldCount: 3,
     });
-    expect(restored[0]).toMatchObject({ apiKey: "session-key", secretKey: "session-secret" });
   });
 });
 

@@ -1,4 +1,5 @@
 /** Review and activate one exact workflow digest after a live backend validation. */
+import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
@@ -12,17 +13,23 @@ import {
 } from "@/lib/db/schema";
 import {
   createComfyUITransport,
-  probeBackendFeatures,
+  probeBackendEnvironment,
   probeModelFolder,
-  probeObjectInfo,
 } from "@/lib/generation/transports";
 import {
   assertWorkflowPromotionPolicy,
   normalizeComfyWorkflow,
   parseWorkflowManifest,
-  sha256,
+  recordWorkflowApproval,
+  sha256Canonical,
+  workflowValidationId,
 } from "@/lib/generation/workflows";
 import { resolveBackendAuthHeaders } from "@/lib/security";
+import {
+  authenticatedOperatorActorId,
+  resolveAuthenticatedLocalOperator,
+} from "@/lib/security/authenticated-local-operator";
+import { verifyRequiredModelFiles, type VerifiedModelFile } from "@/lib/generation/model-file-inventory";
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -39,12 +46,12 @@ async function main(): Promise<void> {
   const confirmation = process.env.CONFIRM_WORKFLOW_DIGEST?.trim();
   const environmentConfirmation = process.env.CONFIRM_ENVIRONMENT_LOCK_DIGEST?.trim();
   const backendId = process.env.EXECUTION_BACKEND_ID?.trim();
-  const reviewer = process.env.WORKFLOW_REVIEWER_ID?.trim();
+  const authenticatedReviewer = await resolveAuthenticatedLocalOperator();
+  const reviewer = authenticatedOperatorActorId(authenticatedReviewer);
   if (!digest || confirmation !== digest) {
     throw new Error("WORKFLOW_DIGEST and identical CONFIRM_WORKFLOW_DIGEST are required");
   }
   if (!backendId) throw new Error("EXECUTION_BACKEND_ID is required");
-  if (!reviewer || reviewer === "system") throw new Error("A named WORKFLOW_REVIEWER_ID is required");
 
   const [row] = await db.select({ revision: workflowPackageRevisions, state: workflowPackageStates })
     .from(workflowPackageRevisions)
@@ -63,6 +70,9 @@ async function main(): Promise<void> {
 
   const previousReport = record(row.state.validationReportJson);
   const importer = typeof previousReport.importedBy === "string" ? previousReport.importedBy : null;
+  if (!importer || !/^windows-sid:S-1-(?:\d+-)+\d+$/.test(importer)) {
+    throw new Error("Workflow importer lacks authenticated Windows token provenance; re-import under the authenticated importer command");
+  }
   if (importer && importer === reviewer && !allowSelfReview()) {
     throw new Error("Workflow reviewer must differ from workflow importer");
   }
@@ -79,20 +89,18 @@ async function main(): Promise<void> {
     Array.isArray((backend.networkPolicyJson as { resolvedAddresses?: unknown }).resolvedAddresses)
       ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
       : [],
-    { policyRevision: sha256(backend.networkPolicyJson) },
+    { policyRevision: sha256Canonical(backend.networkPolicyJson) },
   );
   try {
     const workflow = normalizeComfyWorkflow(row.revision.workflowApiJson);
     assertWorkflowPromotionPolicy(workflow);
     const manifest = parseWorkflowManifest(row.revision.manifestJson);
-    if (row.revision.workflowSha256 !== sha256(workflow)) {
+    if (row.revision.workflowSha256 !== sha256Canonical(workflow)) {
       throw new Error("Workflow content digest mismatch");
     }
 
-    const [features, objectInfo] = await Promise.all([
-      probeBackendFeatures(transport),
-      probeObjectInfo(transport),
-    ]);
+    const environment = await probeBackendEnvironment(transport);
+    const { features, objectInfo } = environment;
     const missingNodeClasses = manifest.requirements.nodeClasses.filter(
       (classType) => !objectInfo[classType],
     );
@@ -102,15 +110,39 @@ async function main(): Promise<void> {
 
     const modelFolders = new Map<string, string[]>();
     for (const model of manifest.requirements.models) {
-      if (!modelFolders.has(model.folder)) {
-        modelFolders.set(model.folder, await probeModelFolder(transport, model.folder));
+      if (model.runtimeVisible === false) continue;
+      const runtimeFolder = model.runtimeFolder ?? model.folder;
+      if (!modelFolders.has(runtimeFolder)) {
+        modelFolders.set(runtimeFolder, await probeModelFolder(transport, runtimeFolder));
       }
     }
     const missingModels = manifest.requirements.models.filter(
-      (model) => !modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/")),
+      (model) => model.runtimeVisible !== false,
+    ).filter(
+      (model) => !modelFolders.get(model.runtimeFolder ?? model.folder)?.includes(model.filename.replace(/\\/g, "/")),
     );
     if (missingModels.length) {
       throw new Error(`Backend is missing required models: ${missingModels.map((item) => `${item.folder}/${item.filename}`).join(", ")}`);
+    }
+    let modelInventoryDigest: string | null = null;
+    let verifiedModels: VerifiedModelFile[] = [];
+    if (manifest.requirements.models.length > 0) {
+      if (manifest.requirements.models.some((model) => !model.sha256 || !model.sizeBytes)) {
+        throw new Error("Every required production model must have immutable size and SHA-256 identities in the workflow manifest");
+      }
+      const modelsRoot = process.env.AI_M_MANAGED_COMFYUI_MODELS_ROOT?.trim()
+        || (process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT?.trim()
+          ? path.resolve(process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT, "models")
+          : "");
+      if (!modelsRoot) {
+        throw new Error("AI_M_MANAGED_COMFYUI_MODELS_ROOT is required to verify production model bytes");
+      }
+      const modelInventory = await verifyRequiredModelFiles(
+        path.resolve(modelsRoot),
+        manifest.requirements.models,
+      );
+      modelInventoryDigest = modelInventory.inventoryDigest;
+      verifiedModels = modelInventory.models;
     }
 
     const profileId = process.env.PROFILE_REVISION_ID?.trim();
@@ -129,7 +161,10 @@ async function main(): Promise<void> {
     }
 
     const now = Date.now();
-    const validationId = sha256({ workflowPackageDigest: digest, executionBackendId: backendId });
+    const validationId = workflowValidationId(
+      "release",
+      sha256Canonical({ workflowPackageDigest: digest, executionBackendId: backendId }),
+    );
     const validationReport = {
       importedBy: importer,
       importedAtMs: typeof previousReport.importedAtMs === "number" ? previousReport.importedAtMs : null,
@@ -141,22 +176,24 @@ async function main(): Promise<void> {
       requiredNodeClasses: manifest.requirements.nodeClasses,
       missingNodeClasses: [],
       requiredModels: manifest.requirements.models,
+      modelInventoryDigest,
+      verifiedModels,
       missingModels: [],
     };
 
-    await db.transaction(async (tx) => {
-      await tx.update(executionBackends).set({
+    db.transaction((tx) => {
+      tx.update(executionBackends).set({
         environmentFingerprint: features.environmentFingerprint,
         featureSnapshotJson: features as unknown as Record<string, unknown>,
         validatedAtMs: now,
-        enabled: process.env.ENABLE_BACKEND === "true" ? 1 : backend.enabled,
         updatedAtMs: now,
-      }).where(eq(executionBackends.id, backendId));
+      }).where(eq(executionBackends.id, backendId)).run();
 
-      await tx.insert(workflowBackendValidations).values({
+      tx.insert(workflowBackendValidations).values({
         id: validationId,
         workflowPackageDigest: digest,
         executionBackendId: backendId,
+        validationKind: "release",
         environmentFingerprint: features.environmentFingerprint,
         environmentLockDigest: row.revision.environmentLockDigest,
         reviewerId: reviewer,
@@ -173,22 +210,44 @@ async function main(): Promise<void> {
           validatedAtMs: now,
           updatedAtMs: now,
         },
-      });
+      }).run();
 
-      await tx.update(workflowPackageStates).set({
-        state: "active",
-        reviewedBy: reviewer,
-        reviewedAtMs: now,
+    });
+
+    const approval = recordWorkflowApproval({
+      workflowPackageDigest: digest,
+      executionBackendId: backendId,
+      reviewer: authenticatedReviewer,
+      environmentFingerprint: features.environmentFingerprint,
+      environmentLockDigest: row.revision.environmentLockDigest,
+      validationReport,
+      approvedAtMs: now,
+    });
+    if (approval.state !== "active") {
+      console.log(JSON.stringify({
+        digest,
+        state: approval.state,
+        backendId,
+        reviewer,
+        approvalCount: approval.approvalCount,
+        requiredApprovalCount: 2,
+        environmentFingerprint: features.environmentFingerprint,
+        profileRevisionId: null,
+      }, null, 2));
+      return;
+    }
+
+    db.transaction((tx) => {
+      tx.update(executionBackends).set({
+        enabled: process.env.ENABLE_BACKEND === "true" ? 1 : backend.enabled,
         updatedAtMs: now,
-        validationReportJson: validationReport,
-      }).where(eq(workflowPackageStates.workflowPackageDigest, digest));
-
+      }).where(eq(executionBackends.id, backendId)).run();
       if (!profile) return;
-      await tx.update(generationProfileStates).set({
+      tx.update(generationProfileStates).set({
         enabled: 1,
         visibility: "workspace",
         updatedAtMs: now,
-      }).where(eq(generationProfileStates.generationProfileRevisionId, profile.id));
+      }).where(eq(generationProfileStates.generationProfileRevisionId, profile.id)).run();
 
       const scopeCapability = process.env.SET_DEFAULT_CAPABILITY?.trim();
       if (!scopeCapability) return;
@@ -203,13 +262,13 @@ async function main(): Promise<void> {
         scopeId: "default",
         capability: scopeCapability as "text" | "image" | "video" | "speech",
       };
-      const [existing] = await tx.select().from(defaultGenerationProfilePointers).where(and(
+      const existing = tx.select().from(defaultGenerationProfilePointers).where(and(
         eq(defaultGenerationProfilePointers.scopeType, pointer.scopeType),
         eq(defaultGenerationProfilePointers.scopeId, pointer.scopeId),
         eq(defaultGenerationProfilePointers.capability, pointer.capability),
-      ));
+      )).get();
       if (existing) {
-        await tx.update(defaultGenerationProfilePointers).set({
+        tx.update(defaultGenerationProfilePointers).set({
           generationProfileRevisionId: profile.id,
           updatedBy: reviewer,
           updatedAtMs: now,
@@ -217,14 +276,14 @@ async function main(): Promise<void> {
           eq(defaultGenerationProfilePointers.scopeType, pointer.scopeType),
           eq(defaultGenerationProfilePointers.scopeId, pointer.scopeId),
           eq(defaultGenerationProfilePointers.capability, pointer.capability),
-        ));
+        )).run();
       } else {
-        await tx.insert(defaultGenerationProfilePointers).values({
+        tx.insert(defaultGenerationProfilePointers).values({
           ...pointer,
           generationProfileRevisionId: profile.id,
           updatedBy: reviewer,
           updatedAtMs: now,
-        });
+        }).run();
       }
     });
 
@@ -233,6 +292,8 @@ async function main(): Promise<void> {
       state: "active",
       backendId,
       reviewer,
+      approvalCount: approval.approvalCount,
+      reviewers: approval.reviewers,
       environmentFingerprint: features.environmentFingerprint,
       profileRevisionId: profile?.id ?? null,
     }, null, 2));

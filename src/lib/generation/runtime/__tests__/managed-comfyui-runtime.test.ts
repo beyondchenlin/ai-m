@@ -41,18 +41,33 @@ afterEach(async () => {
   await Promise.all(temporaryPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function makePixelleFixture(): Promise<{ root: string; dataRoot: string; pythonExe: string }> {
+interface PixelleFixture {
+  root: string;
+  dataRoot: string;
+  pythonExe: string;
+  comfyUIRoot: string;
+  extraModelsConfig: string;
+}
+
+async function makePixelleFixture(): Promise<PixelleFixture> {
   const root = await mkdtemp(join(tmpdir(), "ai-m-pixelle-"));
   temporaryPaths.push(root);
   const scripts = join(root, "scripts", "comfyui");
   const dataRoot = join(root, "data");
   const pythonExe = join(root, "python.exe");
+  const comfyUIRoot = join(root, "runtime");
+  const extraModelsConfig = join(root, "extra-model-paths.yaml");
   await mkdir(scripts, { recursive: true });
-  await mkdir(dataRoot);
+  await mkdir(join(dataRoot, "input"), { recursive: true });
+  await mkdir(comfyUIRoot);
+  await mkdir(join(root, "uploads"));
+  await mkdir(join(root, "supply-chain"));
+  await mkdir(join(root, "pixelle-staging"));
   await writeFile(pythonExe, "fixture");
+  await writeFile(extraModelsConfig, "{}");
   await writeFile(join(scripts, "start_backend.ps1"), "exit 0");
   await writeFile(join(scripts, "stop_backend.ps1"), "exit 0");
-  return { root, dataRoot, pythonExe };
+  return { root, dataRoot, pythonExe, comfyUIRoot, extraModelsConfig };
 }
 
 async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
@@ -63,13 +78,19 @@ async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
   throw new Error(`Timed out waiting for fixture file: ${path}`);
 }
 
-function enabledEnv(fixture: { root: string; dataRoot: string; pythonExe: string }): Record<string, string> {
+function enabledEnv(fixture: PixelleFixture): Record<string, string> {
   return {
     AI_M_MANAGED_COMFYUI_ENABLED: "true",
     AI_M_MANAGED_COMFYUI_BASE_URL: "http://127.0.0.1:8000",
     AI_M_MANAGED_COMFYUI_PIXELLE_ROOT: fixture.root,
     AI_M_MANAGED_COMFYUI_DATA_ROOT: fixture.dataRoot,
+    AI_M_COMFYUI_SHARED_INPUT_ROOT: join(fixture.dataRoot, "input"),
+    UPLOAD_DIR: join(fixture.root, "uploads"),
+    AI_M_WORKFLOW_SUPPLY_CHAIN_ROOT: join(fixture.root, "supply-chain"),
+    PIXELLE_WORKFLOW_STAGING_DIR: join(fixture.root, "pixelle-staging"),
     AI_M_MANAGED_COMFYUI_PYTHON_EXE: fixture.pythonExe,
+    AI_M_MANAGED_COMFYUI_ROOT: fixture.comfyUIRoot,
+    AI_M_MANAGED_COMFYUI_EXTRA_MODELS_CONFIG: fixture.extraModelsConfig,
     AI_M_MANAGED_COMFYUI_COMMAND_TIMEOUT_MS: "30000",
     AI_M_MANAGED_COMFYUI_READY_TIMEOUT_MS: "90000",
   };
@@ -82,19 +103,29 @@ describe("parseManagedComfyUIRuntimeConfig", () => {
     expect(() => parseManagedComfyUIRuntimeConfig({ AI_M_MANAGED_COMFYUI_ENABLED: "1" })).toThrow(/ENABLED/);
   });
 
-  test("normalizes loopback aliases on port 8000 to the canonical endpoint", async () => {
+  test("normalizes loopback aliases and accepts isolated managed ports", async () => {
     const fixture = await makePixelleFixture();
     for (const alias of ["http://localhost:8000", "http://[::1]:8000", "http://127.0.0.1:8000/"]) {
       const config = parseManagedComfyUIRuntimeConfig({ ...enabledEnv(fixture), AI_M_MANAGED_COMFYUI_BASE_URL: alias });
-      expect(config).toMatchObject({ enabled: true, baseUrl: "http://127.0.0.1:8000" });
+      expect(config).toMatchObject({ enabled: true, baseUrl: "http://127.0.0.1:8000", port: 8000 });
     }
-    for (const invalid of ["http://127.0.0.1:8001", "https://127.0.0.1:8000", "http://0.0.0.0:8000", "http://127.0.0.1:8000/api"])
+    expect(parseManagedComfyUIRuntimeConfig({
+      ...enabledEnv(fixture),
+      AI_M_MANAGED_COMFYUI_BASE_URL: "http://localhost:8001",
+    })).toMatchObject({ enabled: true, baseUrl: "http://127.0.0.1:8001", port: 8001 });
+    for (const invalid of ["http://127.0.0.1:7999", "http://127.0.0.1:9000", "https://127.0.0.1:8000", "http://0.0.0.0:8000", "http://127.0.0.1:8000/api"])
       expect(() => parseManagedComfyUIRuntimeConfig({ ...enabledEnv(fixture), AI_M_MANAGED_COMFYUI_BASE_URL: invalid })).toThrow(/BASE_URL/);
   });
 
   test("requires existing Pixelle scripts, data root, and Python executable", async () => {
     const fixture = await makePixelleFixture();
-    for (const key of ["AI_M_MANAGED_COMFYUI_PIXELLE_ROOT", "AI_M_MANAGED_COMFYUI_DATA_ROOT", "AI_M_MANAGED_COMFYUI_PYTHON_EXE"] as const) {
+    for (const key of [
+      "AI_M_MANAGED_COMFYUI_PIXELLE_ROOT",
+      "AI_M_MANAGED_COMFYUI_DATA_ROOT",
+      "AI_M_MANAGED_COMFYUI_PYTHON_EXE",
+      "AI_M_MANAGED_COMFYUI_ROOT",
+      "AI_M_MANAGED_COMFYUI_EXTRA_MODELS_CONFIG",
+    ] as const) {
       const env = enabledEnv(fixture);
       delete env[key];
       expect(() => parseManagedComfyUIRuntimeConfig(env)).toThrow(new RegExp(key));
@@ -128,8 +159,19 @@ describe("parseManagedComfyUIRuntimeConfig", () => {
   });
 });
 
-function runtimeConfig(fixture: { root: string; dataRoot: string; pythonExe: string }, overrides: Partial<Extract<ManagedRuntimeConfig, { enabled: true }>> = {}): Extract<ManagedRuntimeConfig, { enabled: true }> {
-  return { enabled: true, baseUrl: "http://127.0.0.1:8000", pixelleRoot: fixture.root, dataRoot: fixture.dataRoot, pythonExe: fixture.pythonExe, commandTimeoutMs: 1_000, readyTimeoutMs: 1_000, ...overrides };
+function runtimeConfig(fixture: PixelleFixture, overrides: Partial<Extract<ManagedRuntimeConfig, { enabled: true }>> = {}): Extract<ManagedRuntimeConfig, { enabled: true }> {
+  return {
+    enabled: true,
+    baseUrl: "http://127.0.0.1:8000",
+    pixelleRoot: fixture.root,
+    dataRoot: fixture.dataRoot,
+    pythonExe: fixture.pythonExe,
+    comfyUIRoot: fixture.comfyUIRoot,
+    extraModelsConfig: fixture.extraModelsConfig,
+    commandTimeoutMs: 1_000,
+    readyTimeoutMs: 1_000,
+    ...overrides,
+  };
 }
 
 class FakeChildProcess extends EventEmitter {
@@ -152,6 +194,8 @@ describe("ManagedComfyUIRuntime", () => {
       expect(request.maxOutputBytes).toBe(64 * 1024);
       expect(request.args).toContain("127.0.0.1");
       expect(request.args).toContain("8000");
+      expect(request.args).toContain(fixture.comfyUIRoot);
+      expect(request.args).toContain(fixture.extraModelsConfig);
       return { exitCode: 0, stdout: "", stderr: "", truncated: false };
     };
     const runtime = new ManagedComfyUIRuntime(runtimeConfig(fixture), {
@@ -512,6 +556,25 @@ describe("createPowerShellCommandRunner", () => {
     child.emit("exit", 0);
     await expect(result).rejects.toThrow(/stdio.*drain.*timed out/i);
     expect(terminator).not.toHaveBeenCalled();
+  });
+
+  test("permits only an explicitly detached daemon command to close inherited stdio after a successful exit", async () => {
+    const child = new FakeChildProcess();
+    const runner = createPowerShellCommandRunner({
+      spawnProcess: () => child,
+      terminateProcessTree: async () => {},
+      stdioDrainTimeoutMs: 20,
+    });
+    const result = runner({
+      executable: "powershell.exe", args: [], cwd: tmpdir(), timeoutMs: 1_000,
+      maxOutputBytes: 128, windowsHide: true, allowDetachedStdioAfterExit: true,
+    });
+    child.emit("exit", 0);
+    await expect(result).resolves.toMatchObject({
+      exitCode: 0,
+      truncated: false,
+      stdioDetachedAfterExit: true,
+    });
   });
 
   test("preserves spawn ENOENT without cleanup or endpoint-poison semantics when no PID exists", async () => {

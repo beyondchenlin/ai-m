@@ -64,6 +64,11 @@ export interface ProbeConfig {
   probeClientIdConsistency: boolean;
 }
 
+export interface BackendEnvironmentProbe {
+  features: BackendFeatureSnapshot;
+  objectInfo: ComfyObjectInfo;
+}
+
 const DEFAULT_PROBE_CONFIG: ProbeConfig = {
   ttlMs: 30 * 60 * 1000,
   submitProbeTimeoutMs: 10_000,
@@ -142,10 +147,11 @@ async function probeOutputCapabilities(
  * - 输出读取方式
  * - 最大请求响应限制
  */
-export async function probeBackendFeatures(
+export async function probeBackendEnvironment(
   transport: ComfyUITransport,
   config: Partial<ProbeConfig> = {},
-): Promise<BackendFeatureSnapshot> {
+  observeObjectInfo?: (objectInfo: ComfyObjectInfo) => void,
+): Promise<BackendEnvironmentProbe> {
   const cfg = { ...DEFAULT_PROBE_CONFIG, ...config };
   const now = Date.now();
 
@@ -158,6 +164,7 @@ export async function probeBackendFeatures(
   ]);
 
   const environmentFingerprint = computeEnvironmentFingerprint(systemInfo, objectInfo);
+  observeObjectInfo?.(objectInfo);
   const externalIdStrategy = await probeExternalIdStrategy();
 
   const nodeCategories = new Set<string>();
@@ -172,6 +179,8 @@ export async function probeBackendFeatures(
   );
 
   return {
+    objectInfo,
+    features: {
     environmentFingerprint,
     comfyVersion: (systemInfo.system?.comfy_version as string | undefined),
     externalIdStrategy,
@@ -181,7 +190,16 @@ export async function probeBackendFeatures(
     devicesSummary,
     probedAtMs: now,
     validUntilMs: now + cfg.ttlMs,
+    },
   };
+}
+
+export async function probeBackendFeatures(
+  transport: ComfyUITransport,
+  config: Partial<ProbeConfig> = {},
+  observeObjectInfo?: (objectInfo: ComfyObjectInfo) => void,
+): Promise<BackendFeatureSnapshot> {
+  return (await probeBackendEnvironment(transport, config, observeObjectInfo)).features;
 }
 
 /** 检查探测结果是否仍在有效期内 */

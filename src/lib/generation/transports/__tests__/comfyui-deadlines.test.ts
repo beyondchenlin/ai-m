@@ -268,7 +268,7 @@ describe("ComfyUI absolute operation deadlines", () => {
     ));
 
     expect(error.message).not.toContain("backend-secret");
-    expect(error).toMatchObject({ submissionDisposition: "definitely-not-submitted" });
+    expect(error).toMatchObject({ submissionDisposition: "submission-uncertain" });
   });
 
   it("does not let a reentrant diagnostics subscriber steal prompt write evidence", async () => {

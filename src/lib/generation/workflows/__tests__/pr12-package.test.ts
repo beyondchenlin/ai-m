@@ -81,4 +81,28 @@ describe("PR-12 workflow package contract", () => {
     expect(() => bindWorkflow(workflow, compiled, { duration: 0.75 }, "out")).toThrow(/step/i);
     expect(() => parseWorkflowManifest({ ...manifestRaw, bindings: [{ ...numericManifest.bindings[0], step: 0 }] })).toThrow(/step/i);
   });
+
+  it("rejects author-declared runtime inventory bypasses outside the speech auxiliary allowlist", () => {
+    expect(() => parseWorkflowManifest({
+      ...manifestRaw,
+      requirements: {
+        ...manifestRaw.requirements,
+        models: [{
+          folder: "diffusion_models",
+          filename: "model.safetensors",
+          runtimeVisible: false,
+        }],
+      },
+    })).toThrow(/authorized speech auxiliary/i);
+
+    expect(() => parseWorkflowManifest({
+      ...manifestRaw,
+      capability: "speech",
+      requirements: {
+        nodeClasses: ["IndexTTS2BaseNode", "SaveAudio"],
+        models: [{ folder: "IndexTTS-2", filename: "gpt.pth", runtimeVisible: false }],
+        referenceModes: ["required"],
+      },
+    })).not.toThrow();
+  });
 });

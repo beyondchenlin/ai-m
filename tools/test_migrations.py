@@ -55,6 +55,11 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "generation_job_source_assets",
         "visual_subjects",
         "resource_reconciliation_proofs",
+        "trusted_proxy_nonces",
+        "job_input_artifacts",
+        "source_asset_quota_reservations",
+        "workflow_package_approvals",
+        "operational_alerts",
     }
     missing = sorted(name for name in required_tables if not table_exists(conn, name))
     if missing:
@@ -75,6 +80,11 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         ("generation_artifacts", "recovery_lease_token"),
         ("generation_artifacts", "recovery_lease_expires_at_ms"),
         ("voice_profiles", "consent_statement_version"),
+        ("voice_profiles", "idempotency_key"),
+        ("voice_profiles", "idempotency_request_digest"),
+        ("workflow_backend_validations", "validation_kind"),
+        ("generation_jobs", "input_retention_until_ms"),
+        ("generation_jobs", "inputs_released_at_ms"),
     }
     missing_columns = sorted(
         f"{table}.{column}"
@@ -108,6 +118,20 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "generation_jobs_idempotency_identity_guard",
         "generation_artifacts_lease_validate_insert",
         "generation_artifacts_lease_validate_update",
+        "job_input_artifacts_guard_insert",
+        "job_input_source_delete_guard",
+        "job_input_generation_artifact_mutation_guard",
+        "voice_profiles_idempotency_guard_insert",
+        "voice_profiles_idempotency_identity_guard",
+        "workflow_package_approvals_guard_insert",
+        "workflow_package_approvals_no_update",
+        "workflow_package_approvals_no_delete",
+        "operational_alerts_guard_insert",
+        "operational_alerts_guard_update",
+        "workflow_backend_validations_kind_guard_insert",
+        "workflow_backend_validations_kind_guard_update",
+        "generation_jobs_input_retention_guard_insert",
+        "generation_jobs_input_retention_guard_update",
     }
     missing_triggers = sorted(required_triggers - triggers)
     if missing_triggers:
@@ -125,13 +149,21 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         "source_media_assets_storage_key_unique",
         "source_media_assets_owner_project_idx",
         "generation_job_source_assets_asset_idx",
-        "workflow_backend_validations_pair_unique",
+        "workflow_backend_validations_kind_unique",
+        "generation_jobs_input_retention_idx",
         "source_media_assets_status_updated_idx",
         "resource_reconciliation_proofs_lease_unique",
         "resource_reconciliation_proofs_external_unique",
         "resource_reconciliation_proofs_disposition_observed_idx",
         "resource_pool_slots_owner_attempt_unique",
         "generation_artifacts_recovery_scan_index",
+        "trusted_proxy_nonces_expiry_idx",
+        "job_input_artifacts_lookup_idx",
+        "source_asset_quota_reservations_project_status_idx",
+        "voice_profiles_idempotency_unique",
+        "workflow_package_approvals_reviewer_unique",
+        "workflow_package_approvals_release_lookup_idx",
+        "operational_alerts_status_severity_idx",
     }
     missing_indexes = sorted(required_indexes - indexes)
     if missing_indexes:
@@ -142,6 +174,32 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
     }
     if pk_columns != {"job_id", "source_asset_id", "role"}:
         raise AssertionError(f"generation_job_source_assets composite primary key is invalid: {pk_columns}")
+
+    nonce_pk_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('trusted_proxy_nonces')") if row[5] > 0
+    }
+    if nonce_pk_columns != {"issuer", "key_id", "nonce"}:
+        raise AssertionError(f"trusted_proxy_nonces composite primary key is invalid: {nonce_pk_columns}")
+    input_snapshot_pk_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('job_input_artifacts')") if row[5] > 0
+    }
+    if input_snapshot_pk_columns != {"job_id", "artifact_kind", "artifact_id", "role"}:
+        raise AssertionError(
+            f"job_input_artifacts composite primary key is invalid: {input_snapshot_pk_columns}"
+        )
+    conn.execute(
+        "INSERT INTO trusted_proxy_nonces (issuer, key_id, nonce, expires_at_ms, created_at_ms) VALUES (?, ?, ?, ?, ?)",
+        ("migration-issuer", "migration-key", "migration-nonce-0001", 2, 1),
+    )
+    try:
+        conn.execute(
+            "INSERT INTO trusted_proxy_nonces (issuer, key_id, nonce, expires_at_ms, created_at_ms) VALUES (?, ?, ?, ?, ?)",
+            ("migration-issuer", "migration-key", "migration-nonce-0001", 3, 2),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("trusted proxy nonce uniqueness is missing")
 
     proof_columns = {
         row[1]: row for row in conn.execute("PRAGMA table_info('resource_reconciliation_proofs')")
@@ -201,6 +259,31 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
         raise AssertionError("voice profile identity mutation was accepted")
 
     try:
+        conn.execute(
+            "INSERT INTO voice_profiles (id, project_id, user_id, name, provider, reference_artifact_id, reference_source_asset_id, reference_text, language, default_speed_milli, default_pitch_milli, consent_confirmed_at_ms, consent_statement_version, idempotency_key, idempotency_request_digest, created_at_ms, updated_at_ms) VALUES ('invalid-idempotent-profile', ?, 'migration-user', 'Voice', 'indextts2', NULL, ?, NULL, 'zh-CN', 1000, 1000, 1, 'voice-clone-consent-v1', 'profile-create', ?, 1, 1)",
+            (project_id, source_id, "sha256:" + "A" * 64),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("voice profile accepted a non-lowercase idempotency digest")
+
+    idempotent_profile_id = "migration-idempotent-profile"
+    conn.execute(
+        "INSERT INTO voice_profiles (id, project_id, user_id, name, provider, reference_artifact_id, reference_source_asset_id, reference_text, language, default_speed_milli, default_pitch_milli, consent_confirmed_at_ms, consent_statement_version, idempotency_key, idempotency_request_digest, created_at_ms, updated_at_ms) VALUES (?, ?, 'migration-user', 'Voice', 'indextts2', NULL, ?, NULL, 'zh-CN', 1000, 1000, 1, 'voice-clone-consent-v1', 'profile-create', ?, 1, 1)",
+        (idempotent_profile_id, project_id, source_id, "sha256:" + "f" * 64),
+    )
+    try:
+        conn.execute(
+            "UPDATE voice_profiles SET idempotency_request_digest=? WHERE id=?",
+            ("sha256:" + "e" * 64, idempotent_profile_id),
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("voice profile idempotency identity mutation was accepted")
+
+    try:
         conn.execute("UPDATE source_media_assets SET status='DELETED' WHERE id=?", (source_id,))
     except sqlite3.IntegrityError:
         pass
@@ -210,7 +293,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
 
     try:
         conn.execute(
-            "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, idempotency_key, idempotency_request_digest, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, 'speech', 'QUEUED', '{}', ?, 'same-operation', NULL, 1, 1, '{}')",
+            "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, idempotency_key, idempotency_request_digest, input_retention_until_ms, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, 'speech', 'QUEUED', '{}', ?, 'same-operation', NULL, 2, 1, 1, '{}')",
             ("invalid-idempotency", project_id, "sha256:" + "b" * 64),
         )
     except sqlite3.IntegrityError:
@@ -221,7 +304,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
     idempotent_job = "valid-idempotency"
     digest = "sha256:" + "c" * 64
     conn.execute(
-        "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, idempotency_key, idempotency_request_digest, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, 'speech', 'QUEUED', '{}', ?, 'stable-operation', ?, 1, 1, '{}')",
+        "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, idempotency_key, idempotency_request_digest, input_retention_until_ms, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, 'speech', 'QUEUED', '{}', ?, 'stable-operation', ?, 2, 1, 1, '{}')",
         (idempotent_job, project_id, "sha256:" + "d" * 64, digest),
     )
     try:
@@ -236,7 +319,7 @@ def assert_hardened(conn: sqlite3.Connection) -> None:
 
     # Terminal success must not be mutable; failed/cancelled jobs remain retryable.
     conn.execute(
-        "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, ?, ?, '{}', ?, 1, 1, '{}')",
+        "INSERT INTO generation_jobs (id, project_id, capability, status, execution_snapshot_json, input_digest, input_retention_until_ms, created_at_ms, updated_at_ms, metadata_json) VALUES (?, ?, ?, ?, '{}', ?, 2, 1, 1, '{}')",
         ("migration-job", project_id, "image", "SUCCEEDED", "sha256:test"),
     )
     try:
@@ -319,6 +402,54 @@ def main() -> int:
             finally:
                 conn.close()
         print(f"PASS published-{boundary:04d}-upgrade: {len(suffix)} additive migrations")
+
+    # A legacy local validation with a damaged or incomplete report must never
+    # inherit the release default merely because its JSON cannot prove origin.
+    prefix_0068 = [p for p in MIGRATIONS if int(p.name[:4]) <= 68]
+    migration_0069 = [p for p in MIGRATIONS if int(p.name[:4]) == 69]
+    with tempfile.TemporaryDirectory(prefix="ai-m-0069-provenance-") as tmp:
+        conn = sqlite3.connect(Path(tmp) / "provenance.sqlite")
+        try:
+            apply(conn, prefix_0068)
+            conn.executescript("""
+                INSERT INTO resource_pools
+                  (id, display_name, capacity, policy_json, created_at_ms, updated_at_ms)
+                VALUES ('pool', 'Pool', 1, '{}', 1, 1);
+                INSERT INTO execution_backends
+                  (id, display_name, adapter_kind, base_url, topology, sharing_mode,
+                   auth_type, auth_config_json, tls_config_json, network_policy_json,
+                   resource_pool_id, capabilities_json, created_at_ms, updated_at_ms)
+                VALUES ('backend', 'Backend', 'comfyui', 'http://127.0.0.1:8000',
+                  'same-host', 'dedicated', 'none', '{}', '{}', '{}', 'pool', '{}', 1, 1);
+                INSERT INTO workflow_package_revisions
+                  (digest, workflow_id, version, capability, workflow_api_json, manifest_json,
+                   compiled_bindings_json, package_lock_json, package_path, workflow_sha256,
+                   environment_lock_digest, compiler_version, compiled_at_ms, created_at_ms)
+                VALUES ('digest', 'workflow', '1', 'image', '{}', '{}', '{}', '{}',
+                  'package', 'workflow-sha', 'lock', '1.0.0', 1, 1);
+                INSERT INTO workflow_backend_validations
+                  (id, workflow_package_digest, execution_backend_id, environment_fingerprint,
+                   environment_lock_digest, reviewer_id, report_json, validated_at_ms, updated_at_ms)
+                VALUES ('legacy-local', 'digest', 'backend', 'fingerprint', 'lock',
+                  'local-self-use', '{}', 1, 1);
+            """)
+            apply(conn, migration_0069)
+            row = conn.execute(
+                "SELECT id, validation_kind FROM workflow_backend_validations WHERE reviewer_id='local-self-use'"
+            ).fetchone()
+            if row != ("local-self-use:legacy-local", "local-self-use"):
+                raise AssertionError(f"0069 misclassified legacy local provenance: {row}")
+            try:
+                conn.execute(
+                    "UPDATE workflow_backend_validations SET validation_kind='release' WHERE reviewer_id='local-self-use'"
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("0069 allowed local reviewer provenance to become release validation")
+        finally:
+            conn.close()
+    print("PASS 0069-local-provenance-backfill")
     return 0
 
 
