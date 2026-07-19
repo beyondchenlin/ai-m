@@ -9,7 +9,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: projectId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   const [project] = await db
     .select()
@@ -34,7 +34,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id: projectId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   const [project] = await db
     .select()

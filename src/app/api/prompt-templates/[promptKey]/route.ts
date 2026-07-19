@@ -11,7 +11,7 @@ export async function PUT(
   { params }: { params: Promise<{ promptKey: string }> }
 ) {
   const { promptKey } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const body = (await request.json()) as {
     mode: "slots" | "full";
     slots?: Record<string, string>;
@@ -143,7 +143,7 @@ export async function DELETE(
   { params }: { params: Promise<{ promptKey: string }> }
 ) {
   const { promptKey } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   await db
     .delete(promptTemplates)

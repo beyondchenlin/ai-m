@@ -6,7 +6,7 @@ import { id as genId } from "@/lib/id";
 import { getUserIdFromRequest } from "@/lib/get-user-id";
 
 export async function GET(request: Request) {
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const allProjects = await db
     .select()
     .from(projects)
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const body = (await request.json()) as { title: string; script?: string };
   const id = genId();
 

@@ -11,10 +11,11 @@ import {
   resourcePoolSlots,
   workflowBackendValidations,
   workflowPackageRevisions,
+  workflowPackageStates,
 } from "@/lib/db/schema";
 import { setupTestDb } from "@/lib/test-helpers/db";
 import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
-import { sha256 } from "@/lib/generation/workflows/canonical";
+import { sha256Canonical } from "@/lib/generation/workflows/canonical";
 import {
   FakeComfyUITransport,
   defaultBackendFeatures,
@@ -31,12 +32,13 @@ const mocks = vi.hoisted(() => ({
   releaseResourceSlot: vi.fn(),
   renewResourceSlot: vi.fn(),
   streamCommitArtifact: vi.fn(),
-  loadActiveWorkflowPackage: vi.fn(),
+  loadValidatedWorkflowPackage: vi.fn(),
   bindWorkflow: vi.fn(),
 }));
 
 vi.mock("@/lib/feature-flags", () => ({
   isEnabled: () => true,
+  isEnabledForProject: () => true,
   FF: { V2_COMFYUI_TRANSPORT: "V2_COMFYUI_TRANSPORT" },
 }));
 
@@ -53,7 +55,7 @@ vi.mock("@/lib/generation", async (importOriginal) => ({
 
 vi.mock("@/lib/generation/workflows", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/lib/generation/workflows")>(),
-  loadActiveWorkflowPackage: mocks.loadActiveWorkflowPackage,
+  loadValidatedWorkflowPackage: mocks.loadValidatedWorkflowPackage,
   bindWorkflow: mocks.bindWorkflow,
 }));
 
@@ -161,6 +163,13 @@ describe("worker completion after cancellation intent", () => {
       compilerVersion: "1.0.0",
       compiledAtMs: now,
       createdAtMs: now,
+    });
+    await db.insert(workflowPackageStates).values({
+      workflowPackageDigest: workflowDigest,
+      state: "active",
+      reviewedBy: "reviewer",
+      reviewedAtMs: now,
+      updatedAtMs: now,
     });
     await db.insert(workflowBackendValidations).values({
       id: crypto.randomUUID(),
@@ -310,7 +319,7 @@ describe("worker completion after cancellation intent", () => {
       mocks.materializeWorkflowInputs.mockResolvedValue({ parameters: {}, cleanup: inputCleanup });
     }
     mocks.bindWorkflow.mockReturnValue({ "1": { class_type: "KSampler", inputs: {} } });
-    mocks.loadActiveWorkflowPackage.mockResolvedValue({
+    mocks.loadValidatedWorkflowPackage.mockResolvedValue({
       revision: { environmentLockDigest: "lock:test" },
       workflow: { "1": { class_type: "KSampler", inputs: {} } },
       manifest: {
@@ -400,7 +409,7 @@ describe("worker completion after cancellation intent", () => {
       status: "SUCCEEDED",
     });
     expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toMatchObject({
-      policyRevision: sha256({}),
+      policyRevision: sha256Canonical({}),
       lifecycleSignal: expect.any(AbortSignal),
     });
   });
@@ -561,7 +570,7 @@ describe("worker completion after cancellation intent", () => {
     await arranged.execute();
 
     expect(mocks.createComfyUITransport.mock.calls[0]?.[4]).toMatchObject({
-      policyRevision: sha256(networkPolicyJson),
+      policyRevision: sha256Canonical(networkPolicyJson),
       resolutionTimeoutMs: 2_000,
       probeTimeoutMs: 3_000,
       submitTimeoutMs: 4_000,

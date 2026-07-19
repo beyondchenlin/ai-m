@@ -37,7 +37,7 @@ export async function GET(
   if (!(await assertProjectOwnership(request, projectId))) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   try {
     assertTrustedRequestOrigin(request);
   } catch (error) {
@@ -61,7 +61,7 @@ export async function POST(
   if (!(await assertProjectOwnership(request, projectId))) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   try {
     assertTrustedRequestOrigin(request);
@@ -76,9 +76,16 @@ export async function POST(
       "defaultSpeed",
       "defaultPitch",
       "consentConfirmed",
+      "idempotencyKey",
     ]);
     const consentConfirmed = readBoolean(body, "consentConfirmed");
     if (consentConfirmed !== true) throw new RequestValidationError("Voice usage consent must be confirmed");
+    const bodyKey = readOptionalString(body, "idempotencyKey", { maxLength: 160 });
+    const headerKey = request.headers.get("idempotency-key")?.trim() || undefined;
+    if (headerKey && headerKey.length > 160) throw new RequestValidationError("idempotency-key is too long");
+    if (bodyKey && headerKey && bodyKey !== headerKey) throw new RequestValidationError("Conflicting idempotency keys");
+    const idempotencyKey = bodyKey || headerKey;
+    if (!idempotencyKey) throw new RequestValidationError("idempotencyKey is required");
 
     const profile = await processVoiceProfile({
       projectId,
@@ -92,6 +99,7 @@ export async function POST(
       defaultPitch: optionalFiniteNumber(body, "defaultPitch", 1),
       consentConfirmed: true,
       consentStatementVersion: VOICE_CONSENT_VERSION,
+      idempotencyKey,
     });
     return NextResponse.json({ profile }, { status: 201 });
   } catch (error) {

@@ -11,7 +11,7 @@ export async function POST(
   { params }: { params: Promise<{ promptKey: string; vid: string }> }
 ) {
   const { vid } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   // Find the version record
   const [version] = await db

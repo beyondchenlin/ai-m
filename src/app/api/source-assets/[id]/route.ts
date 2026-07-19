@@ -46,7 +46,7 @@ async function resolveOwnedAsset(request: Request, id: string) {
     }
     throw error;
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   if (!userId) return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) } as const;
   const asset = await getOwnedSourceAsset(id, userId);
   if (!asset) return { response: NextResponse.json({ error: "Not found" }, { status: 404 }) } as const;
@@ -139,7 +139,7 @@ export async function DELETE(
     }
     throw error;
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
   try {

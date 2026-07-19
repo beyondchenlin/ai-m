@@ -37,7 +37,7 @@ export async function POST(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const body = await request.json();
   const { action, characterId, ...input } = body;
 

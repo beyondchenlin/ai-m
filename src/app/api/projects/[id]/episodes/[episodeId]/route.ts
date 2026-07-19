@@ -40,7 +40,7 @@ export async function GET(
   { params }: { params: Promise<{ id: string; episodeId: string }> }
 ) {
   const { id, episodeId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const { project, episode } = await resolveProjectAndEpisode(
     id,
     episodeId,
@@ -178,7 +178,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string; episodeId: string }> }
 ) {
   const { id, episodeId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const { project, episode } = await resolveProjectAndEpisode(
     id,
     episodeId,
@@ -232,7 +232,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string; episodeId: string }> }
 ) {
   const { id, episodeId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const { project, episode } = await resolveProjectAndEpisode(
     id,
     episodeId,

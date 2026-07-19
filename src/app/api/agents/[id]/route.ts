@@ -9,7 +9,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const body = (await request.json()) as Partial<{
     name: string;
     category: string;
@@ -48,7 +48,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   const [existing] = await db
     .select()

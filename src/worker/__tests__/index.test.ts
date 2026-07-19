@@ -21,6 +21,7 @@ vi.mock("@/lib/generation/runtime/managed-comfyui-runtime", () => ({
 
 vi.mock("@/lib/feature-flags", () => ({
   isEnabled: (...args: unknown[]) => isEnabledMock(...args),
+  isEnabledForProject: (...args: unknown[]) => isEnabledMock(...args),
   FF: { V2_DURABLE_EXECUTION: "V2_DURABLE_EXECUTION", V2_COMFYUI_TRANSPORT: "V2_COMFYUI_TRANSPORT" },
 }));
 
@@ -60,6 +61,11 @@ vi.mock("@/lib/generation/worker-executor", () => ({
 vi.mock("@/lib/generation/archiving", () => ({
   parseLegacyArtifactRecoveryBeforeMs: vi.fn(() => undefined),
   recoverStagingArtifacts: vi.fn(() => Promise.resolve({ claimed: 0, committed: 0, quarantined: 0 })),
+  checkDiskUsage: vi.fn(() => Promise.resolve(0.2)),
+  getArtifactRoot: vi.fn(() => "D:/safe/uploads/generation-artifacts"),
+}));
+vi.mock("@/lib/generation/operations-health", () => ({
+  refreshOperationalHealth: vi.fn(() => ({ metrics: {}, alerts: [] })),
 }));
 vi.mock("@/lib/generation/input-materializer", () => ({ cleanupTerminalSharedInputs: vi.fn(() => Promise.resolve(0)) }));
 vi.mock("@/lib/generation/source-assets", () => ({
@@ -170,6 +176,13 @@ describe("job claim heartbeat", () => {
 });
 
 describe("managed single-endpoint worker startup", () => {
+  it("parses a bounded exact backend identity allowlist", async () => {
+    const { parseWorkerExecutionBackendIds } = await import("../index");
+    expect(parseWorkerExecutionBackendIds("[\"index\",\"omni\",\"index\"]")).toEqual(["index", "omni"]);
+    expect(() => parseWorkerExecutionBackendIds("[]")).toThrow(/BACKEND_IDS_JSON/);
+    expect(() => parseWorkerExecutionBackendIds("[\"../escape\"]")).toThrow(/BACKEND_IDS_JSON/);
+  });
+
   it("parses managed runtime configuration exactly once per worker module", async () => {
     vi.resetModules();
     parseManagedConfigMock.mockClear();
@@ -191,6 +204,23 @@ describe("managed single-endpoint worker startup", () => {
       [{ id: "gpu", capacity: 1 }],
       [{ resourcePoolId: "gpu", slotNo: 0 }],
     )).not.toThrow();
+  });
+
+  it("allows isolated endpoints only when this worker's exact backend ids share the one physical GPU pool", async () => {
+    const { validateManagedWorkerBackendConfiguration } = await import("../index");
+    const backends = [
+      { id: "index", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8001", resourcePoolId: "gpu", enabled: true },
+      { id: "omni", adapterKind: "comfyui", baseUrl: "http://127.0.0.1:8002", resourcePoolId: "gpu", enabled: true },
+    ];
+    const pools = [{ id: "gpu", capacity: 1 }];
+    const slots = [{ resourcePoolId: "gpu", slotNo: 0 }];
+
+    expect(() => validateManagedWorkerBackendConfiguration(
+      "http://127.0.0.1:8001", backends, pools, slots, ["index"],
+    )).not.toThrow();
+    expect(() => validateManagedWorkerBackendConfiguration(
+      "http://127.0.0.1:8001", backends, pools, slots, ["omni"],
+    )).toThrow(/managed_comfyui_worker_configuration_invalid/);
   });
 
   it.each([
@@ -278,6 +308,8 @@ describe("managed single-endpoint worker startup", () => {
         pixelleRoot: "C:\\pixelle",
         dataRoot: "C:\\data",
         pythonExe: "C:\\python.exe",
+        comfyUIRoot: "C:\\comfyui",
+        extraModelsConfig: "C:\\extra-model-paths.yaml",
         commandTimeoutMs: 1,
         readyTimeoutMs: 1,
       },

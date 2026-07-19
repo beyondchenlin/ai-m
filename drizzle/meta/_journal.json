@@ -442,6 +442,62 @@
       "when": 1784382000000,
       "tag": "0062_artifact_recovery_leases",
       "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1784468400000,
+      "tag": "0063_trusted_proxy_nonces",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1784554800000,
+      "tag": "0064_job_input_artifacts",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1784641200000,
+      "tag": "0065_source_asset_quota_reservations",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1784727600000,
+      "tag": "0066_voice_profile_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1784814000000,
+      "tag": "0067_workflow_two_person_approvals",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1784900400000,
+      "tag": "0068_operational_alerts",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1784986800000,
+      "tag": "0069_workflow_validation_kinds",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1785073200000,
+      "tag": "0070_job_input_retention",
+      "breakpoints": true
     }
   ]
 }

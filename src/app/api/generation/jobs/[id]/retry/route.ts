@@ -16,7 +16,7 @@ export async function POST(
   if (!isEnabled(FF.V2_DURABLE_EXECUTION)) {
     return NextResponse.json({ error: "v2.0 durable execution is not enabled" }, { status: 403 });
   }
-  const userId = getUserIdFromRequest(req);
+  const userId = await getUserIdFromRequest(req);
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
   try {

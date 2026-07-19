@@ -143,14 +143,20 @@ async function createBackendAndPool(capability = "image", capacity = 2) {
   return { poolId, backendId };
 }
 
-async function createQueuedJob(capability: typeof generationJobs.$inferInsert.capability = "image") {
+async function createQueuedJob(
+  capability: typeof generationJobs.$inferInsert.capability = "image",
+  options: { projectId?: string; createdAtMs?: number; executionBackendId?: string } = {},
+) {
   const jobId = crypto.randomUUID();
-  const now = Date.now();
+  const now = options.createdAtMs ?? Date.now();
   await db.insert(generationJobs).values({
     id: jobId,
+    projectId: options.projectId,
     capability,
     status: "QUEUED",
-    executionSnapshotJson: {},
+    executionSnapshotJson: options.executionBackendId
+      ? { executionBackendId: options.executionBackendId }
+      : {},
     inputDigest: "digest",
     claimFencingToken: 0,
     createdAtMs: now,
@@ -695,6 +701,26 @@ describe("PR-11: 工作任务领取", () => {
     expect(job).toBeNull();
   });
 
+  it("claims only jobs assigned to the worker's exact backend allowlist", async () => {
+    const indexJob = await createQueuedJob("image", {
+      executionBackendId: "comfy-index-8001",
+      createdAtMs: Date.now() - 1_000,
+    });
+    const omniJob = await createQueuedJob("image", {
+      executionBackendId: "comfy-omni-8002",
+    });
+
+    expect((await claimJob("worker-omni", "image", {
+      executionBackendIds: ["comfy-omni-8002"],
+    }))?.id).toBe(omniJob);
+    expect((await claimJob("worker-index", "image", {
+      executionBackendIds: ["comfy-index-8001"],
+    }))?.id).toBe(indexJob);
+    await expect(claimJob("worker-empty", "image", {
+      executionBackendIds: [],
+    })).rejects.toThrow(/executionBackendIds/);
+  });
+
   it("续租应验证 fencingToken", async () => {
     await createQueuedJob();
     const job = (await claimJob("worker-1", "image"))!;
@@ -769,6 +795,62 @@ describe("PR-11: 工作任务领取", () => {
     const winners = results.filter((r) => r !== null);
     expect(winners).toHaveLength(1);
     expect(winners[0]!.id).toBe(jobId);
+  });
+
+  it("enforces the per-project running quota under concurrent claims", async () => {
+    const first = await createQueuedJob("image", { projectId: "project-a" });
+    const second = await createQueuedJob("image", { projectId: "project-a" });
+    const results = await Promise.all([
+      claimJob("worker-a", "image", { maxRunningJobsPerProject: 1 }),
+      claimJob("worker-b", "image", { maxRunningJobsPerProject: 1 }),
+    ]);
+    const winners = results.filter((result) => result !== null);
+    expect(winners).toHaveLength(1);
+    expect([first, second]).toContain(winners[0]!.id);
+    expect(await claimJob("worker-c", "image", { maxRunningJobsPerProject: 1 })).toBeNull();
+  });
+
+  it("prefers a project with less active capacity pressure", async () => {
+    const now = Date.now();
+    const activeHot = await createQueuedJob("image", {
+      projectId: "project-hot",
+      createdAtMs: now - 3_000,
+    });
+    expect((await claimJob("worker-hot", "image", {
+      maxRunningJobsPerProject: 2,
+      projectStarvationMs: 60_000,
+      clock: () => now,
+    }))?.id).toBe(activeHot);
+    await createQueuedJob("image", { projectId: "project-hot", createdAtMs: now - 2_000 });
+    const cold = await createQueuedJob("image", { projectId: "project-cold", createdAtMs: now - 1_000 });
+    expect((await claimJob("worker-cold", "image", {
+      maxRunningJobsPerProject: 2,
+      projectStarvationMs: 60_000,
+      clock: () => now,
+    }))?.id).toBe(cold);
+  });
+
+  it("lets an aged project job cross the starvation boundary", async () => {
+    const now = Date.now();
+    const activeHot = await createQueuedJob("image", {
+      projectId: "project-hot",
+      createdAtMs: now - 20_000,
+    });
+    expect((await claimJob("worker-hot", "image", {
+      maxRunningJobsPerProject: 2,
+      projectStarvationMs: 60_000,
+      clock: () => now,
+    }))?.id).toBe(activeHot);
+    const starved = await createQueuedJob("image", {
+      projectId: "project-hot",
+      createdAtMs: now - 120_000,
+    });
+    await createQueuedJob("image", { projectId: "project-cold", createdAtMs: now - 1_000 });
+    expect((await claimJob("worker-starvation", "image", {
+      maxRunningJobsPerProject: 2,
+      projectStarvationMs: 60_000,
+      clock: () => now,
+    }))?.id).toBe(starved);
   });
 });
 

@@ -10,7 +10,13 @@
 
 import { claimJob, renewJobClaim, releaseJobClaim, scanExpiredClaims, LEASE_CONFIG } from "@/lib/generation/resources/leases";
 import { executeGenerationJob } from "@/lib/generation/worker-executor";
-import { parseLegacyArtifactRecoveryBeforeMs, recoverStagingArtifacts } from "@/lib/generation/archiving";
+import {
+  checkDiskUsage,
+  getArtifactRoot,
+  parseLegacyArtifactRecoveryBeforeMs,
+  recoverStagingArtifacts,
+} from "@/lib/generation/archiving";
+import { refreshOperationalHealth } from "@/lib/generation/operations-health";
 import { cleanupTerminalSharedInputs } from "@/lib/generation/input-materializer";
 import { cleanupSourceAssetStorage, recoverSourceMediaAssets } from "@/lib/generation/source-assets";
 import { db, waitForCurrentMigrationBundle } from "@/lib/db";
@@ -18,7 +24,8 @@ import { reconcileBusinessArtifactProjections } from "@/lib/generation/business-
 import { isEnabled, FF } from "@/lib/feature-flags";
 import { settleClaimedJob } from "./claim-settlement";
 import { connectionManagerRegistry } from "@/lib/generation/transports/comfyui-connection-manager";
-import { executionBackends, resourcePools, resourcePoolSlots } from "@/lib/db/schema";
+import { executionBackends, generationEvents, resourcePools, resourcePoolSlots } from "@/lib/db/schema";
+import { id as genId } from "@/lib/id";
 import {
   ManagedComfyUIRuntime,
   parseManagedComfyUIRuntimeConfig,
@@ -36,6 +43,24 @@ const LEGACY_ARTIFACT_RECOVERY_BEFORE_MS = parseLegacyArtifactRecoveryBeforeMs(
 const SUPPORTED_CAPABILITIES = ["image", "text", "video", "speech"] as const;
 const managedRuntimeConfig = parseManagedComfyUIRuntimeConfig(process.env);
 
+export function parseWorkerExecutionBackendIds(raw: string | undefined): readonly string[] | undefined {
+  if (!raw?.trim()) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("AI_M_WORKER_EXECUTION_BACKEND_IDS_JSON must be valid JSON"); }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 64
+    || parsed.some((id) => typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id))) {
+    throw new Error("AI_M_WORKER_EXECUTION_BACKEND_IDS_JSON must be a non-empty bounded array of backend identities");
+  }
+  return Object.freeze([...new Set(parsed)]);
+}
+
+const workerExecutionBackendIds = parseWorkerExecutionBackendIds(
+  process.env.AI_M_WORKER_EXECUTION_BACKEND_IDS_JSON,
+);
+if (managedRuntimeConfig.enabled && !workerExecutionBackendIds) {
+  throw new Error("AI_M_WORKER_EXECUTION_BACKEND_IDS_JSON is required for a managed ComfyUI worker");
+}
+
 type ManagedBackendRow = {
   id: string;
   adapterKind: string;
@@ -48,19 +73,25 @@ type ManagedPoolRow = { id: string; capacity: number };
 type ManagedSlotRow = { resourcePoolId: string; slotNo: number };
 
 export function validateManagedWorkerBackendConfiguration(
-  baseUrl: "http://127.0.0.1:8000",
+  baseUrl: string,
   backends: readonly ManagedBackendRow[],
   pools: readonly ManagedPoolRow[],
   slots: readonly ManagedSlotRow[],
+  executionBackendIds?: readonly string[],
 ): void {
   const enabledComfyUI = backends.filter((backend) => (backend.enabled === true || backend.enabled === 1)
     && backend.adapterKind === "comfyui");
-  const canonical = enabledComfyUI.filter((backend) => backend.baseUrl === baseUrl);
+  const allowed = executionBackendIds ? new Set(executionBackendIds) : null;
+  const canonical = enabledComfyUI.filter((backend) => backend.baseUrl === baseUrl
+    && (!allowed || allowed.has(backend.id)));
+  const configuredIds = new Set(canonical.map((backend) => backend.id));
   const poolIds = new Set(canonical.map((backend) => backend.resourcePoolId));
   const pool = poolIds.size === 1 ? pools.find((candidate) => candidate.id === canonical[0]?.resourcePoolId) : undefined;
   const physicalSlots = pool ? slots.filter((slot) => slot.resourcePoolId === pool.id) : [];
   if (canonical.length === 0
-    || canonical.length !== enabledComfyUI.length
+    || (!allowed && canonical.length !== enabledComfyUI.length)
+    || (allowed && (configuredIds.size !== allowed.size || [...allowed].some((id) => !configuredIds.has(id))))
+    || enabledComfyUI.some((backend) => backend.resourcePoolId !== pool?.id)
     || poolIds.size !== 1
     || pool?.capacity !== 1
     || physicalSlots.length !== 1) {
@@ -95,7 +126,7 @@ type ProbeTransportCreator = (
 ) => Promise<Pick<ComfyUITransport, "get" | "close">>;
 
 export function createManagedProbeFactory(createTransport: ProbeTransportCreator) {
-  return (baseUrl: "http://127.0.0.1:8000"): ManagedProbeTransport => {
+  return (baseUrl: string): ManagedProbeTransport => {
     const transport = createTransport(baseUrl, "same-host", {}, ["127.0.0.1"], {
       policyRevision: "managed-loopback-v1",
       resolver: async (hostname) => {
@@ -220,6 +251,14 @@ function startRecoveryScanner() {
       const cleanedSharedInputs = await cleanupTerminalSharedInputs();
       const sourceRecovery = await recoverSourceMediaAssets();
       const sourceCleanup = await cleanupSourceAssetStorage();
+      const operationalHealth = refreshOperationalHealth({
+        diskUsageRatio: await checkDiskUsage(getArtifactRoot()),
+      });
+      const activeAlertCount = operationalHealth.alerts
+        .filter((alert) => alert.status !== "RESOLVED").length;
+      if (activeAlertCount > 0) {
+        console.warn(`[${WORKER_ID}] Operational health: ${activeAlertCount} active alerts`);
+      }
       if (projections.projected > 0 || projections.failed > 0) {
         console.log(`[${WORKER_ID}] Business projections: projected=${projections.projected}, pending=${projections.failed}`);
       }
@@ -284,12 +323,40 @@ async function executeClaimedJob(job: ClaimedJob, boundarySignal: AbortSignal) {
         fencingToken,
         currentAbortController!.signal,
         managedRuntime ? {
-          managedEndpoint: { baseUrl: managedRuntimeConfig.enabled ? managedRuntimeConfig.baseUrl : "http://127.0.0.1:8000" },
+          managedEndpoint: {
+            baseUrl: managedRuntimeConfig.enabled ? managedRuntimeConfig.baseUrl : "http://127.0.0.1:8000",
+            modelsRoot: process.env.AI_M_MANAGED_COMFYUI_MODELS_ROOT?.trim(),
+          },
           beforeTerminalResourceRelease: async () => {
             try { connectionManagerRegistry.closeAll(); }
             catch (error) { throw new ManagedRuntimeLifecycleError("managed_connection_close_failed", error); }
-            try { await managedRuntime!.restartAfterJob(currentAbortController!.signal); }
-            catch (error) { throw new ManagedRuntimeLifecycleError("managed_runtime_restart_failed", error); }
+            const restartStartedAtMs = Date.now();
+            try {
+              await managedRuntime!.restartAfterJob(currentAbortController!.signal);
+              await db.insert(generationEvents).values({
+                id: genId(),
+                jobId: job.id,
+                attemptId: job.currentAttemptId,
+                eventType: "managed_runtime_restart_succeeded",
+                severity: "info",
+                safePayloadJson: { durationMs: Date.now() - restartStartedAtMs },
+                createdAtMs: Date.now(),
+              });
+            } catch (error) {
+              await db.insert(generationEvents).values({
+                id: genId(),
+                jobId: job.id,
+                attemptId: job.currentAttemptId,
+                eventType: "managed_runtime_restart_failed",
+                severity: "error",
+                safePayloadJson: {
+                  durationMs: Date.now() - restartStartedAtMs,
+                  errorCode: error instanceof ManagedRuntimeLifecycleError ? error.code : "managed_runtime_restart_failed",
+                },
+                createdAtMs: Date.now(),
+              }).catch(() => undefined);
+              throw new ManagedRuntimeLifecycleError("managed_runtime_restart_failed", error);
+            }
           },
         } : {},
       ),
@@ -402,6 +469,7 @@ async function mainLoop() {
     const snapshot = readManagedWorkerBackendSnapshot();
     validateManagedWorkerBackendConfiguration(
       managedRuntimeConfig.baseUrl, snapshot.backends, snapshot.pools, snapshot.slots,
+      workerExecutionBackendIds,
     );
     console.log(`[${WORKER_ID}] Managed ComfyUI single-endpoint configuration validated`);
   }
@@ -451,6 +519,7 @@ async function mainLoop() {
     const snapshot = readManagedWorkerBackendSnapshot();
     validateManagedWorkerBackendConfiguration(
       managedRuntimeConfig.baseUrl, snapshot.backends, snapshot.pools, snapshot.slots,
+      workerExecutionBackendIds,
     );
     lastConfigurationValidationAt = now;
   };
@@ -465,7 +534,9 @@ async function mainLoop() {
         catch (error) { boundary.block(); throw error; }
         let job = null;
         for (const capability of SUPPORTED_CAPABILITIES) {
-          job = await claimJob(WORKER_ID, capability);
+          job = await claimJob(WORKER_ID, capability, {
+            executionBackendIds: workerExecutionBackendIds,
+          });
           if (job) break;
         }
         return job;

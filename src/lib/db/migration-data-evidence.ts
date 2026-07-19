@@ -58,6 +58,27 @@ export const DATA_POSTCONDITION_REGISTRY: readonly DataPostconditionRegistration
     hash: "e1a411e86bbe892f38db6d2388acc65e3a44a92afe28b83f8518170c8d6e60eb",
     verify: () => "0051 dropped legacy shot columns; their historical values are never independently provable",
   },
+  {
+    folderMillis: 1784986800000,
+    hash: "81369b764cd37c3ebf3d47fea25d54bef7ecd2f78b8de6d8ee23c80ae26673a6",
+    verify: (sqlite) => hasRows(sqlite, `SELECT 1 present
+      FROM workflow_backend_validations
+      WHERE validation_kind NOT IN ('release', 'local-self-use')
+        OR id NOT LIKE validation_kind || ':%'
+        OR ((reviewer_id='local-self-use') <> (validation_kind='local-self-use'))
+      LIMIT 1`)
+      ? "0069 workflow validation provenance backfill is incomplete" : null,
+  },
+  {
+    folderMillis: 1785073200000,
+    hash: "6e2780384e1957c1715820d115583e96543d483580c55b655cafc8628a3bdf1c",
+    verify: (sqlite) => hasRows(sqlite, `SELECT 1 present FROM generation_jobs
+      WHERE input_retention_until_ms IS NULL
+        OR input_retention_until_ms <= created_at_ms
+        OR (inputs_released_at_ms IS NOT NULL AND inputs_released_at_ms < created_at_ms)
+      LIMIT 1`)
+      ? "0070 job input retention backfill is incomplete" : null,
+  },
 ] as const;
 
 /** Return the outer statement kind, ignoring comments, quoted bytes, and trigger bodies. */

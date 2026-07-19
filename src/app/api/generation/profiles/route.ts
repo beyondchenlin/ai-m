@@ -9,7 +9,7 @@ export async function GET(req: NextRequest) {
   if (!isEnabled(FF.V2_GENERATION_PROFILES)) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
-  const userId = getUserIdFromRequest(req);
+  const userId = await getUserIdFromRequest(req);
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const capabilityParam = new URL(req.url).searchParams.get("capability");

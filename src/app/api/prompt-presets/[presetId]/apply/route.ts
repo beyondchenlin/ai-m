@@ -12,7 +12,7 @@ export async function POST(
   { params }: { params: Promise<{ presetId: string }> }
 ) {
   const { presetId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const body = (await request.json()) as {
     scope?: "global" | "project";
     projectId?: string;

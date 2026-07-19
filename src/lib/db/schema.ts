@@ -506,13 +506,52 @@ export const workflowBackendValidations = sqliteTable("workflow_backend_validati
   executionBackendId: text("execution_backend_id")
     .notNull()
     .references(() => executionBackends.id, { onDelete: "cascade" }),
+  validationKind: text("validation_kind", {
+    enum: ["release", "local-self-use"],
+  }).notNull().default("release"),
   environmentFingerprint: text("environment_fingerprint").notNull(),
   environmentLockDigest: text("environment_lock_digest"),
   reviewerId: text("reviewer_id").notNull(),
   reportJson: text("report_json", { mode: "json" }).notNull(),
   validatedAtMs: integer("validated_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
-});
+}, (table) => [
+  uniqueIndex("workflow_backend_validations_kind_unique").on(
+    table.workflowPackageDigest,
+    table.executionBackendId,
+    table.validationKind,
+  ),
+]);
+
+export const workflowPackageApprovals = sqliteTable("workflow_package_approvals", {
+  id: text("id").primaryKey(),
+  workflowPackageDigest: text("workflow_package_digest")
+    .notNull()
+    .references(() => workflowPackageRevisions.digest),
+  executionBackendId: text("execution_backend_id")
+    .notNull()
+    .references(() => executionBackends.id),
+  reviewerId: text("reviewer_id").notNull(),
+  environmentFingerprint: text("environment_fingerprint").notNull(),
+  environmentLockDigest: text("environment_lock_digest").notNull(),
+  validationReportJson: text("validation_report_json", { mode: "json" }).notNull(),
+  approvedAtMs: integer("approved_at_ms").notNull(),
+}, (table) => [
+  uniqueIndex("workflow_package_approvals_reviewer_unique")
+    .on(
+      table.workflowPackageDigest,
+      table.executionBackendId,
+      table.environmentFingerprint,
+      table.environmentLockDigest,
+      table.reviewerId,
+    ),
+  index("workflow_package_approvals_release_lookup_idx").on(
+    table.workflowPackageDigest,
+    table.executionBackendId,
+    table.environmentFingerprint,
+    table.environmentLockDigest,
+  ),
+]);
 
 export const generationProfileRevisions = sqliteTable("generation_profile_revisions", {
   id: text("id").primaryKey(),
@@ -583,11 +622,17 @@ export const generationJobs = sqliteTable("generation_jobs", {
   claimFencingToken: integer("claim_fencing_token").notNull().default(0),
   cancelRequestedAtMs: integer("cancel_requested_at_ms"),
   needsAttentionReason: text("needs_attention_reason"),
+  inputRetentionUntilMs: integer("input_retention_until_ms")
+    .$defaultFn(() => Date.now() + 30 * 24 * 60 * 60 * 1000),
+  inputsReleasedAtMs: integer("inputs_released_at_ms"),
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
   completedAtMs: integer("completed_at_ms"),
 }, (table) => [
   index("generation_jobs_claim_queue_idx").on(table.status, table.capability, table.createdAtMs),
+  index("generation_jobs_input_retention_idx")
+    .on(table.status, table.inputRetentionUntilMs)
+    .where(sql`${table.inputsReleasedAtMs} IS NULL`),
 ]);
 
 export const generationAttempts = sqliteTable("generation_attempts", {
@@ -769,6 +814,8 @@ export const voiceProfiles = sqliteTable("voice_profiles", {
   userId: text("user_id").notNull(),
   name: text("name").notNull(),
   provider: text("provider").notNull(),
+  idempotencyKey: text("idempotency_key"),
+  idempotencyRequestDigest: text("idempotency_request_digest"),
   /** Legacy generated-audio reference, retained for backwards compatibility. */
   referenceArtifactId: text("reference_artifact_id").references(() => generationArtifacts.id),
   /** Preferred user-uploaded immutable source asset. */
@@ -782,6 +829,9 @@ export const voiceProfiles = sqliteTable("voice_profiles", {
   createdAtMs: integer("created_at_ms").notNull(),
   updatedAtMs: integer("updated_at_ms").notNull(),
 }, (table) => [
+  uniqueIndex("voice_profiles_idempotency_unique")
+    .on(table.projectId, table.userId, table.idempotencyKey)
+    .where(sql`${table.idempotencyKey} IS NOT NULL`),
   index("voice_profiles_project_user_index").on(table.projectId, table.userId),
   index("voice_profiles_reference_source_asset_idx").on(table.referenceSourceAssetId),
   check(
@@ -823,6 +873,75 @@ export const auditEvents = sqliteTable("audit_events", {
   detailsSafeJson: text("details_safe_json", { mode: "json" }).notNull(),
   createdAtMs: integer("created_at_ms").notNull(),
 });
+
+export const operationalAlerts = sqliteTable("operational_alerts", {
+  alertKey: text("alert_key").primaryKey(),
+  category: text("category", {
+    enum: ["submission-unknown", "lease-loss", "environment-drift", "disk-high-watermark"],
+  }).notNull(),
+  severity: text("severity", { enum: ["warning", "critical"] }).notNull(),
+  status: text("status", { enum: ["OPEN", "ACKNOWLEDGED", "RESOLVED"] }).notNull(),
+  summarySafe: text("summary_safe").notNull(),
+  detailsSafeJson: text("details_safe_json", { mode: "json" }).notNull(),
+  firstSeenAtMs: integer("first_seen_at_ms").notNull(),
+  lastSeenAtMs: integer("last_seen_at_ms").notNull(),
+  acknowledgedAtMs: integer("acknowledged_at_ms"),
+  acknowledgedBy: text("acknowledged_by"),
+  acknowledgementReason: text("acknowledgement_reason"),
+  evidenceRefsJson: text("evidence_refs_json", { mode: "json" }),
+  resolvedAtMs: integer("resolved_at_ms"),
+}, (table) => [
+  index("operational_alerts_status_severity_idx")
+    .on(table.status, table.severity, table.lastSeenAtMs),
+]);
+
+export const trustedProxyNonces = sqliteTable("trusted_proxy_nonces", {
+  issuer: text("issuer").notNull(),
+  keyId: text("key_id").notNull(),
+  nonce: text("nonce").notNull(),
+  expiresAtMs: integer("expires_at_ms").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.issuer, table.keyId, table.nonce] }),
+  index("trusted_proxy_nonces_expiry_idx").on(table.expiresAtMs),
+  check("trusted_proxy_nonces_issuer_length", sql`length(${table.issuer}) BETWEEN 1 AND 120`),
+  check("trusted_proxy_nonces_key_id_length", sql`length(${table.keyId}) BETWEEN 1 AND 120`),
+  check("trusted_proxy_nonces_nonce_length", sql`length(${table.nonce}) BETWEEN 16 AND 128`),
+  check("trusted_proxy_nonces_expiry_order", sql`${table.expiresAtMs} > ${table.createdAtMs}`),
+]);
+
+export const jobInputArtifacts = sqliteTable("job_input_artifacts", {
+  jobId: text("job_id").notNull().references(() => generationJobs.id, { onDelete: "cascade" }),
+  artifactKind: text("artifact_kind", {
+    enum: ["source-media", "generation-artifact"],
+  }).notNull(),
+  artifactId: text("artifact_id").notNull(),
+  role: text("role").notNull(),
+  storageKey: text("storage_key").notNull(),
+  sha256: text("sha256").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  mimeType: text("mime_type").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.jobId, table.artifactKind, table.artifactId, table.role] }),
+  index("job_input_artifacts_lookup_idx").on(table.artifactKind, table.artifactId, table.jobId),
+]);
+
+export const sourceAssetQuotaReservations = sqliteTable("source_asset_quota_reservations", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull(),
+  uploadToken: text("upload_token").notNull().unique(),
+  reservedBytes: integer("reserved_bytes").notNull(),
+  actualBytes: integer("actual_bytes"),
+  status: text("status", { enum: ["RESERVED", "COMMITTED", "RELEASED"] }).notNull(),
+  expiresAtMs: integer("expires_at_ms").notNull(),
+  createdAtMs: integer("created_at_ms").notNull(),
+  updatedAtMs: integer("updated_at_ms").notNull(),
+}, (table) => [
+  index("source_asset_quota_reservations_project_status_idx")
+    .on(table.projectId, table.status, table.expiresAtMs),
+]);
 
 /** 服务端密钥引用：密钥只存服务端，浏览器只传引用 ID */
 export const keyReferences = sqliteTable("key_references", {

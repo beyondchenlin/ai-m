@@ -5,7 +5,7 @@ import {
   generationProfileRevisions, generationProfileStates, workflowBackendValidations,
   workflowPackageRevisions, workflowPackageStates, executionBackends,
 } from "@/lib/db/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { id as genId } from "@/lib/id";
 import {
   requireAdmin, assertPlainObject, rejectUnknownKeys, readRequiredString, readEnum,
@@ -14,6 +14,10 @@ import {
 import { controlPlaneErrorResponse } from "@/lib/security/api-response";
 import { writeAuditEvent, AuditAction, AuditTargetType } from "@/lib/security/audit";
 import { isEnabled, FF } from "@/lib/feature-flags";
+import {
+  allowedWorkflowValidationKinds,
+  selectApplicableWorkflowValidation,
+} from "@/lib/generation/workflows";
 
 const CAPABILITIES = ["text", "image", "video", "speech", "utility"] as const;
 
@@ -64,20 +68,23 @@ export async function POST(req: NextRequest) {
         workflowPackageStates,
         eq(workflowPackageStates.workflowPackageDigest, workflowPackageRevisions.digest),
       ).where(eq(workflowPackageRevisions.digest, workflowPackageDigest));
-      if (!workflow || workflow.state !== "active") {
-        return NextResponse.json({ error: "workflow package must be active" }, { status: 409 });
+      if (!workflow) {
+        return NextResponse.json({ error: "workflow package does not exist" }, { status: 409 });
       }
       if (workflow.capability !== capability) {
         return NextResponse.json({ error: "workflow capability does not match profile capability" }, { status: 409 });
       }
       if (executionBackendId && backend) {
-        const [validation] = await db.select().from(workflowBackendValidations).where(and(
+        const validations = await db.select().from(workflowBackendValidations).where(and(
           eq(workflowBackendValidations.workflowPackageDigest, workflowPackageDigest),
           eq(workflowBackendValidations.executionBackendId, executionBackendId),
+          inArray(workflowBackendValidations.validationKind, allowedWorkflowValidationKinds()),
         ));
-        if (!validation
-          || validation.environmentFingerprint !== backend.environmentFingerprint
-          || validation.environmentLockDigest !== workflow.environmentLockDigest) {
+        if (!selectApplicableWorkflowValidation(validations, {
+          workflowState: workflow.state,
+          backendFingerprint: backend.environmentFingerprint,
+          workflowLockDigest: workflow.environmentLockDigest,
+        })) {
           return NextResponse.json({ error: "workflow package is not validated for this exact backend environment" }, { status: 409 });
         }
       }

@@ -24,7 +24,7 @@ export async function DELETE(
     }
     throw error;
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   const profile = await getVoiceProfile(profileId, userId);
   if (!profile || profile.projectId !== projectId) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });

@@ -62,6 +62,26 @@ export function isEnabled(flag: FeatureFlag): boolean {
   return DEFAULTS[flag] ?? false;
 }
 
+/**
+ * Restrict an enabled feature to an exact project allowlist.
+ *
+ * If FF_<FLAG>_PROJECTS is absent, the global flag applies to every project.
+ * If present, empty, oversized, or malformed values fail closed.
+ */
+export function isEnabledForProject(flag: FeatureFlag, projectId: string): boolean {
+  if (!isEnabled(flag)) return false;
+  const raw = process.env[`FF_${flag}_PROJECTS`];
+  if (raw === undefined) return true;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(projectId)) return false;
+  if (raw.length > 16_384) return false;
+  const values = raw.split(",").map((value) => value.trim());
+  if (values.length < 1 || values.length > 200
+    || values.some((value) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(value))) {
+    return false;
+  }
+  return new Set(values).has(projectId);
+}
+
 /** 批量检查：返回所有已启用的开关列表 */
 export function enabledFlags(): FeatureFlag[] {
   return Object.values(FF).filter((f) => isEnabled(f));

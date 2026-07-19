@@ -11,7 +11,7 @@ export async function assertProjectOwnership(
   request: Request,
   projectId: string
 ) {
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   if (!userId) return null;
   const [project] = await db
     .select()

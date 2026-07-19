@@ -11,7 +11,7 @@ export async function PUT(
   { params }: { params: Promise<{ id: string; promptKey: string }> }
 ) {
   const { id, promptKey } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   // Verify project ownership
   const [project] = await db
@@ -154,7 +154,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string; promptKey: string }> }
 ) {
   const { id, promptKey } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   // Verify project ownership
   const [project] = await db

@@ -14,7 +14,7 @@ import {
   shots,
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
-import { isEnabled, FF } from "@/lib/feature-flags";
+import { isEnabledForProject, FF } from "@/lib/feature-flags";
 import { createGenerationJob } from "./jobs/service";
 import type { CreateGenerationJobInput } from "./contracts";
 import { normalizeParameters, type InputParameters } from "./parameter-normalization";
@@ -69,7 +69,7 @@ export async function createCharacterImageJob(
     referenceMode?: ReferenceMode; profileRevisionId?: string; operationId?: string;
   } = {},
 ): Promise<{ jobId: string; profileRevisionId: string }> {
-  if (!isEnabled(FF.V2_LOCAL_IMAGE)) throw new Error("v2.0 local image generation is not enabled");
+  if (!isEnabledForProject(FF.V2_LOCAL_IMAGE, projectId)) throw new Error("v2.0 local image generation is not enabled for this project");
   const character = await assertCharacterProject(characterId, projectId);
   const profileRevisionId = options.profileRevisionId || await resolveDefaultProfile("image");
   if (!profileRevisionId) throw new Error("No image generation profile configured");
@@ -106,7 +106,7 @@ export async function createShotFrameJob(
   userId: string,
   options: { frameType: "start" | "end" | "keyframe"; prompt?: string; negativePrompt?: string; width?: number; height?: number; seed?: string; operationId?: string },
 ): Promise<{ jobId: string; profileRevisionId: string }> {
-  if (!isEnabled(FF.V2_LOCAL_IMAGE)) throw new Error("v2.0 local image generation is not enabled");
+  if (!isEnabledForProject(FF.V2_LOCAL_IMAGE, projectId)) throw new Error("v2.0 local image generation is not enabled for this project");
   const shot = await assertShotProject(shotId, projectId);
   const profileRevisionId = await resolveDefaultProfile("image");
   if (!profileRevisionId) throw new Error("No default image generation profile configured");
@@ -181,7 +181,7 @@ export async function createSpeechJob(
   userId: string,
   options: SpeechJobOptions,
 ): Promise<{ jobId: string; profileRevisionId: string; chunkCount: number }> {
-  if (!isEnabled(FF.V2_LOCAL_SPEECH)) throw new SpeechJobError("Local speech generation is not enabled", 409, "speech_disabled");
+  if (!isEnabledForProject(FF.V2_LOCAL_SPEECH, projectId)) throw new SpeechJobError("Local speech generation is not enabled for this project", 409, "speech_disabled");
   validateSpeechOverrides(options);
   const voiceProfile = await getVoiceProfile(options.voiceProfileId, userId);
   if (!voiceProfile || voiceProfile.projectId !== projectId) throw new SpeechJobError("Voice profile is not accessible in this project", 404, "voice_profile_unavailable");

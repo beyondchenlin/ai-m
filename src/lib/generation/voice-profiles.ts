@@ -11,6 +11,12 @@ import {
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { deleteOwnedSourceAsset } from "./source-assets";
+import { sha256Canonical } from "./workflows";
+import {
+  GenerationInputAccessError,
+  loadAccessibleGenerationArtifactInputs,
+  loadAccessibleSourceMediaInputs,
+} from "./input-access";
 
 export const VOICE_CONSENT_VERSION = "voice-clone-consent-v1";
 export type VoiceProvider = "indextts2" | "omnivoice";
@@ -40,6 +46,7 @@ export interface VoiceProfileInput {
   defaultPitch?: number;
   consentConfirmed: boolean;
   consentStatementVersion: string;
+  idempotencyKey: string;
 }
 
 export interface ProcessedVoiceProfile {
@@ -65,34 +72,40 @@ async function assertOwnedProject(projectId: string, userId: string): Promise<vo
 }
 
 async function loadOwnedSourceAudio(projectId: string, userId: string, sourceAssetId: string) {
-  const [asset] = await db.select().from(sourceMediaAssets).where(and(
-    eq(sourceMediaAssets.id, sourceAssetId),
-    eq(sourceMediaAssets.projectId, projectId),
-    eq(sourceMediaAssets.userId, userId),
-    eq(sourceMediaAssets.status, "COMMITTED"),
-  ));
-  if (!asset || asset.kind !== "audio" || !asset.mimeType.startsWith("audio/")) throw new VoiceProfileError("Reference source audio is not accessible", 404, "source_audio_unavailable");
+  let asset;
+  try {
+    [asset] = await loadAccessibleSourceMediaInputs({
+      ids: [sourceAssetId],
+      projectId,
+      actor: { userId, isAdmin: false },
+    });
+  } catch (error) {
+    if (!(error instanceof GenerationInputAccessError)) throw error;
+    throw new VoiceProfileError("Reference source audio is not accessible", 404, "source_audio_unavailable");
+  }
+  if (asset.kind !== "audio" || !asset.mimeType.startsWith("audio/")) throw new VoiceProfileError("Reference source audio is not accessible", 404, "source_audio_unavailable");
   if (asset.sizeBytes <= 0 || asset.sizeBytes > 50 * 1024 * 1024) throw new VoiceProfileError("Reference audio exceeds 50 MB", 400, "source_audio_size_invalid");
   if (asset.durationMs === null || asset.durationMs < 3_000 || asset.durationMs > 60_000) throw new VoiceProfileError("Reference audio must be between 3 and 60 seconds", 400, "source_audio_duration_invalid");
   return asset;
 }
 
 async function loadOwnedGeneratedAudio(projectId: string, userId: string, artifactId: string) {
-  const [row] = await db.select({
-    artifact: generationArtifacts,
-    projectUserId: projects.userId,
-    jobProjectId: generationJobs.projectId,
-  }).from(generationArtifacts)
-    .innerJoin(generationAttempts, eq(generationAttempts.id, generationArtifacts.attemptId))
-    .innerJoin(generationJobs, eq(generationJobs.id, generationAttempts.jobId))
-    .innerJoin(projects, eq(projects.id, generationJobs.projectId))
-    .where(and(eq(generationArtifacts.id, artifactId), eq(projects.id, projectId)));
-  if (!row || row.projectUserId !== userId || row.jobProjectId !== projectId) throw new VoiceProfileError("Reference audio artifact is not accessible", 404, "artifact_audio_unavailable");
-  if (row.artifact.status !== "COMMITTED" || row.artifact.kind !== "audio") throw new VoiceProfileError("Reference artifact must be committed audio", 400, "artifact_audio_invalid");
-  if (!["private-original", "project"].includes(row.artifact.visibility)) throw new VoiceProfileError("Reference audio visibility is invalid", 404, "artifact_audio_unavailable");
-  if (row.artifact.sizeBytes <= 0 || row.artifact.sizeBytes > 50 * 1024 * 1024) throw new VoiceProfileError("Reference audio exceeds 50 MB", 400, "artifact_audio_size_invalid");
-  if (row.artifact.durationMs === null || row.artifact.durationMs < 3_000 || row.artifact.durationMs > 60_000) throw new VoiceProfileError("Reference audio must be between 3 and 60 seconds", 400, "artifact_audio_duration_invalid");
-  return row.artifact;
+  let artifact;
+  try {
+    [artifact] = await loadAccessibleGenerationArtifactInputs({
+      ids: [artifactId],
+      projectId,
+      actor: { userId, isAdmin: false },
+    });
+  } catch (error) {
+    if (!(error instanceof GenerationInputAccessError)) throw error;
+    throw new VoiceProfileError("Reference audio artifact is not accessible", 404, "artifact_audio_unavailable");
+  }
+  if (artifact.kind !== "audio") throw new VoiceProfileError("Reference artifact must be committed audio", 400, "artifact_audio_invalid");
+  if (!["private-original", "project"].includes(artifact.visibility)) throw new VoiceProfileError("Reference audio visibility is invalid", 404, "artifact_audio_unavailable");
+  if (artifact.sizeBytes <= 0 || artifact.sizeBytes > 50 * 1024 * 1024) throw new VoiceProfileError("Reference audio exceeds 50 MB", 400, "artifact_audio_size_invalid");
+  if (artifact.durationMs === null || artifact.durationMs < 3_000 || artifact.durationMs > 60_000) throw new VoiceProfileError("Reference audio must be between 3 and 60 seconds", 400, "artifact_audio_duration_invalid");
+  return artifact;
 }
 
 function validateInput(input: VoiceProfileInput): void {
@@ -105,16 +118,50 @@ function validateInput(input: VoiceProfileInput): void {
   if (input.language && !/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(input.language)) throw new VoiceProfileError("language tag is invalid", 400, "language_invalid");
   if (!Number.isFinite(input.defaultSpeed ?? 1) || (input.defaultSpeed ?? 1) < 0.5 || (input.defaultSpeed ?? 1) > 2) throw new VoiceProfileError("defaultSpeed must be between 0.5 and 2.0", 400, "speed_invalid");
   if (!Number.isFinite(input.defaultPitch ?? 1) || (input.defaultPitch ?? 1) < 0.5 || (input.defaultPitch ?? 1) > 2) throw new VoiceProfileError("defaultPitch must be between 0.5 and 2.0", 400, "pitch_invalid");
+  if (!/^[A-Za-z0-9._:-]{1,160}$/.test(input.idempotencyKey)) {
+    throw new VoiceProfileError("idempotencyKey has an invalid format", 400, "idempotency_key_invalid");
+  }
 }
 
 export async function processVoiceProfile(input: VoiceProfileInput): Promise<ProcessedVoiceProfile> {
   validateInput(input);
+  const normalized = {
+    name: input.name.trim(),
+    provider: input.provider,
+    referenceSourceAssetId: input.referenceSourceAssetId ?? null,
+    referenceArtifactId: input.referenceArtifactId ?? null,
+    referenceText: input.referenceText?.trim() || null,
+    language: input.language?.trim() || "zh-CN",
+    defaultSpeed: Math.round((input.defaultSpeed ?? 1) * 1000),
+    defaultPitch: Math.round((input.defaultPitch ?? 1) * 1000),
+    consentStatementVersion: input.consentStatementVersion,
+  };
+  const requestDigest = sha256Canonical(normalized);
+  const [replay] = await db.select({
+    id: voiceProfiles.id,
+    digest: voiceProfiles.idempotencyRequestDigest,
+  }).from(voiceProfiles).where(and(
+    eq(voiceProfiles.projectId, input.projectId),
+    eq(voiceProfiles.userId, input.userId),
+    eq(voiceProfiles.idempotencyKey, input.idempotencyKey),
+  ));
+  if (replay) {
+    if (replay.digest !== requestDigest) throw new VoiceProfileError(
+      "Idempotency key was already used for a different voice profile request",
+      409,
+      "idempotency_key_conflict",
+    );
+    const existing = await getVoiceProfile(replay.id, input.userId);
+    if (!existing) throw new VoiceProfileError("Existing voice profile is unavailable", 409, "profile_unavailable");
+    return existing;
+  }
   await assertOwnedProject(input.projectId, input.userId);
   if (input.referenceSourceAssetId) await loadOwnedSourceAudio(input.projectId, input.userId, input.referenceSourceAssetId);
   if (input.referenceArtifactId) await loadOwnedGeneratedAudio(input.projectId, input.userId, input.referenceArtifactId);
   const id = genId();
   const now = Date.now();
-  db.transaction((tx) => {
+  try {
+    db.transaction((tx) => {
     const [ownedProject] = tx.select({ userId: projects.userId }).from(projects)
       .where(eq(projects.id, input.projectId)).all();
     if (!ownedProject || ownedProject.userId !== input.userId) throw new VoiceProfileError("Project not found", 404, "project_not_found");
@@ -146,21 +193,46 @@ export async function processVoiceProfile(input: VoiceProfileInput): Promise<Pro
       id,
       projectId: input.projectId,
       userId: input.userId,
-      name: input.name.trim(),
-      provider: input.provider,
+      name: normalized.name,
+      provider: normalized.provider,
+      idempotencyKey: input.idempotencyKey,
+      idempotencyRequestDigest: requestDigest,
       referenceArtifactId: input.referenceArtifactId ?? null,
       referenceSourceAssetId: input.referenceSourceAssetId ?? null,
-      referenceText: input.referenceText?.trim() || null,
-      language: input.language?.trim() || "zh-CN",
-      defaultSpeed: Math.round((input.defaultSpeed ?? 1) * 1000),
-      defaultPitch: Math.round((input.defaultPitch ?? 1) * 1000),
+      referenceText: normalized.referenceText,
+      language: normalized.language,
+      defaultSpeed: normalized.defaultSpeed,
+      defaultPitch: normalized.defaultPitch,
       consentConfirmedAtMs: now,
       consentStatementVersion: VOICE_CONSENT_VERSION,
       createdAtMs: now,
       updatedAtMs: now,
-    }).run();
-  });
-  const created = await getVoiceProfile(id, input.userId);
+    }).onConflictDoNothing().run();
+    });
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : "";
+    if (!code.startsWith("SQLITE_BUSY")) throw error;
+  }
+  let winner: { id: string; digest: string | null } | undefined;
+  for (let attempt = 0; attempt < 10 && !winner; attempt += 1) {
+    [winner] = await db.select({
+      id: voiceProfiles.id,
+      digest: voiceProfiles.idempotencyRequestDigest,
+    }).from(voiceProfiles).where(and(
+      eq(voiceProfiles.projectId, input.projectId),
+      eq(voiceProfiles.userId, input.userId),
+      eq(voiceProfiles.idempotencyKey, input.idempotencyKey),
+    ));
+    if (!winner) await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
+  }
+  if (!winner || winner.digest !== requestDigest) throw new VoiceProfileError(
+    "Idempotency key was concurrently used for a different voice profile request",
+    409,
+    "idempotency_key_conflict",
+  );
+  const created = await getVoiceProfile(winner.id, input.userId);
   if (!created) throw new Error("Voice profile was created but could not be reloaded");
   return created;
 }

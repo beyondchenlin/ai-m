@@ -57,6 +57,8 @@ describe("DML postcondition registry", () => {
       repositoryMigrations[57].folderMillis,
       repositoryMigrations[58].folderMillis,
       repositoryMigrations[51].folderMillis,
+      repositoryMigrations[69].folderMillis,
+      repositoryMigrations[70].folderMillis,
     ]);
   });
 

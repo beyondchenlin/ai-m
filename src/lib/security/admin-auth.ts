@@ -1,5 +1,5 @@
-import { timingSafeEqual } from "node:crypto";
 import type { NextRequest } from "next/server";
+import { decodeStrongServiceToken, strongServiceTokenEqual } from "./service-token";
 
 export interface AdminPrincipal {
   id: string;
@@ -14,22 +14,13 @@ export class AdminAuthenticationError extends Error {
   }
 }
 
-function constantTimeEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
-
 function isInsecureLocalAdminAllowed(): boolean {
   return process.env.NODE_ENV !== "production"
     && process.env.AI_M_ALLOW_INSECURE_LOCAL_ADMIN === "true";
 }
 
 function hasStrongAdminToken(token: string): boolean {
-  if (/^[0-9a-f]{64,}$/i.test(token)) return true;
-  if (!/^[A-Za-z0-9_-]{43,}$/.test(token)) return false;
-  try { return Buffer.from(token, "base64url").byteLength >= 32; } catch { return false; }
+  return decodeStrongServiceToken(token) !== null;
 }
 
 export function validateAdminConfiguration(): void {
@@ -62,7 +53,7 @@ export function requireAdmin(request: NextRequest): AdminPrincipal {
     ? authorization.slice("Bearer ".length).trim()
     : request.headers.get("x-ai-m-admin-token")?.trim() ?? "";
 
-  if (!token || !constantTimeEqual(token, configured)) {
+  if (!token || !strongServiceTokenEqual(token, configured)) {
     throw new AdminAuthenticationError();
   }
 

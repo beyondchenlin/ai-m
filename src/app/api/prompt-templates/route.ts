@@ -6,7 +6,7 @@ import { getUserIdFromRequest } from "@/lib/get-user-id";
 
 // GET: list all global overrides for user
 export async function GET(request: Request) {
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   const templates = await db
     .select()

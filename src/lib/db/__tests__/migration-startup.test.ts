@@ -31,24 +31,26 @@ describe("migration journal startup ordering", () => {
   const OLD_0060_HASH = "92abf3be9aac6c6591cd7c5ca7cc9527cf42baa04bd79b4aeb6790797dadef23";
   const OLD_0060_TIMESTAMP = 1784209200000;
   const PUBLISHED_0061_HASH = "1616ca4c54d5af31ced5ca321a016f3124a0dc2b36a1941c4710e3ade010221f";
+  const WINDOWS_0061_HASH = "23f52f29320b5f3ad693f661959c7aa93de3335ba07020891b921c9f9f162cf2";
+  const canonicalLfHash = (filename: string) => createHash("sha256")
+    .update(fs.readFileSync(filename, "utf8").replace(/\r\n/g, "\n"))
+    .digest("hex");
 
-  it("preserves exact published 0060 bytes and binds the precondition to additive 0061", () => {
-    expect(createHash("sha256").update(fs.readFileSync(
-      path.resolve("drizzle/0060_resource_reconciliation_proof.sql"),
-    )).digest("hex")).toBe(OLD_0060_HASH);
+  it("preserves canonical published 0060/0061 SQL and binds the precondition to either Git line ending", () => {
+    expect(canonicalLfHash(path.resolve("drizzle/0060_resource_reconciliation_proof.sql")))
+      .toBe(OLD_0060_HASH);
     expect(repositoryBundle.migrations[60]).toMatchObject({
       folderMillis: OLD_0060_TIMESTAMP,
-      hash: OLD_0060_HASH,
     });
-    expect(createHash("sha256").update(fs.readFileSync(
-      path.resolve("drizzle/0061_resource_slot_owner_unique.sql"),
-    )).digest("hex")).toBe(PUBLISHED_0061_HASH);
-    expect(repositoryBundle.migrations).toHaveLength(63);
-    expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hash }) => ({ folderMillis, hash })))
+    expect(canonicalLfHash(path.resolve("drizzle/0061_resource_slot_owner_unique.sql")))
+      .toBe(PUBLISHED_0061_HASH);
+    expect(repositoryBundle.migrations).toHaveLength(71);
+    expect(MIGRATION_PRECONDITION_REGISTRY.map(({ folderMillis, hashes }) => ({ folderMillis, hashes })))
       .toEqual([{
         folderMillis: repositoryBundle.migrations[61].folderMillis,
-        hash: repositoryBundle.migrations[61].hash,
+        hashes: [PUBLISHED_0061_HASH, WINDOWS_0061_HASH],
       }]);
+    expect([PUBLISHED_0061_HASH, WINDOWS_0061_HASH]).toContain(repositoryBundle.migrations[61].hash);
     expect(() => validateMigrationPreconditionRegistry(
       repositoryBundle.migrations,
       MIGRATION_PRECONDITION_REGISTRY,
@@ -73,7 +75,7 @@ describe("migration journal startup ordering", () => {
     for (const statement of candidate0060.sql ?? []) {
       if (!statement.includes("resource_pool_slots_owner_attempt_unique")) sqlite.exec(statement);
     }
-    insert.run(OLD_0060_HASH, OLD_0060_TIMESTAMP);
+    insert.run(candidate0060.hash, OLD_0060_TIMESTAMP);
     return sqlite;
   }
 
@@ -526,19 +528,19 @@ describe("migration journal startup ordering", () => {
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it("upgrades a database recorded through published 0060 by applying additive 0061 and 0062", () => {
+  it("upgrades a database recorded through published 0060 by applying additive 0061 through 0070", () => {
     const sqlite = databaseRecordedThroughPublished0060();
     try {
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(10);
       expect(sqlite.prepare<[], { count: number }>(
         'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
-      ).get()).toEqual({ count: 63 });
+      ).get()).toEqual({ count: 71 });
       expect(sqlite.prepare(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
       ).get()).toBeDefined();
       expect(sqlite.prepare<[number], { hash: string }>(
         'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
-      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: repositoryBundle.migrations[60].hash });
     } finally { sqlite.close(); }
   });
 
@@ -574,24 +576,24 @@ describe("migration journal startup ordering", () => {
       ).get()).toEqual({ count: 61 });
       expect(sqlite.prepare<[number], { hash: string }>(
         'SELECT hash FROM "__drizzle_migrations" WHERE created_at=?',
-      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: OLD_0060_HASH });
+      ).get(OLD_0060_TIMESTAMP)).toEqual({ hash: repositoryBundle.migrations[60].hash });
 
       sqlite.prepare("DELETE FROM resource_pool_slots WHERE resource_pool_id=? AND slot_no=?")
         .run("legacy-pool-b", 2);
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(2);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(10);
       expect(sqlite.prepare(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='resource_pool_slots_owner_attempt_unique'",
       ).get()).toBeDefined();
       expect(sqlite.prepare<[], { count: number }>(
         'SELECT COUNT(*) AS count FROM "__drizzle_migrations"',
-      ).get()).toEqual({ count: 63 });
+      ).get()).toEqual({ count: 71 });
     } finally { sqlite.close(); }
   });
 
-  it("upgrades a database recorded through published 0061 by applying only 0062", () => {
+  it("upgrades a database recorded through published 0061 by applying 0062 through 0070", () => {
     const sqlite = databaseRecordedThroughPublished0061();
     try {
-      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(1);
+      expect(applyPendingMigrations(sqlite, repositoryBundle)).toBe(9);
       const columns = sqlite.prepare<[], { name: string }>("PRAGMA table_info('generation_artifacts')")
         .all().map((column) => column.name);
       expect(columns).toEqual(expect.arrayContaining([
@@ -601,10 +603,13 @@ describe("migration journal startup ordering", () => {
       expect(sqlite.prepare(
         "SELECT name FROM sqlite_master WHERE type='trigger' AND name='generation_artifacts_lease_validate_update'",
       ).get()).toBeDefined();
+      expect(sqlite.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='trusted_proxy_nonces'",
+      ).get()).toBeDefined();
     } finally { sqlite.close(); }
   });
 
-  it("keeps concurrent worker connections waiting at 0061 and releases both after 0062", async () => {
+  it("keeps concurrent worker connections waiting at 0061 and releases both after 0070", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-m-worker-journal-"));
     const databasePath = path.join(directory, "worker.sqlite");
     const writer = new Database(databasePath);
@@ -623,10 +628,12 @@ describe("migration journal startup ordering", () => {
       }).then(() => { released++; }));
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(released).toBe(0);
-      const migration0062 = repositoryBundle.migrations[62];
+      const pendingMigrations = repositoryBundle.migrations.slice(62);
       writer.transaction(() => {
-        for (const statement of migration0062.sql ?? []) writer.exec(statement);
-        insert.run(migration0062.hash, migration0062.folderMillis);
+        for (const migration of pendingMigrations) {
+          for (const statement of migration.sql ?? []) writer.exec(statement);
+          insert.run(migration.hash, migration.folderMillis);
+        }
       })();
       await Promise.all(waits);
       expect(released).toBe(2);

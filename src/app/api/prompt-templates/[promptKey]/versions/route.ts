@@ -10,7 +10,7 @@ export async function GET(
   { params }: { params: Promise<{ promptKey: string }> }
 ) {
   const { promptKey } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   // Get user's template records for this promptKey
   const templates = await db

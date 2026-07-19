@@ -10,7 +10,7 @@ export async function DELETE(
   { params }: { params: Promise<{ presetId: string }> }
 ) {
   const { presetId } = await params;
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
 
   // Verify the preset belongs to this user (userId matches)
   const [existing] = await db

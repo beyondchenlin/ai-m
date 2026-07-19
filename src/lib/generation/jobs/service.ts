@@ -15,18 +15,32 @@ import {
   projects,
   sourceMediaAssets,
   generationJobSourceAssets,
+  jobInputArtifacts,
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
-import { isEnabled, FF } from "@/lib/feature-flags";
+import { isEnabledForProject, FF } from "@/lib/feature-flags";
 import type { Actor, ArtifactRef, CreateGenerationJobInput, GenerationJobView, RetryMode } from "@/lib/generation/contracts";
 import type { JobStatus } from "@/lib/generation/naming";
-import { canonicalize, sha256 } from "@/lib/generation/workflows";
+import { parseCompiledBindings, sha256Canonical } from "@/lib/generation/workflows";
+import {
+  allowedWorkflowValidationKinds,
+  selectApplicableWorkflowValidation,
+} from "@/lib/generation/workflows";
 import { buildIdempotencyRequestDigest, legacySnapshotIdempotencyDigest } from "./idempotency";
+import {
+  GenerationRequestValidationError,
+  normalizeCompiledWorkflowRequest,
+} from "./request-validation";
+import {
+  GenerationInputAccessError,
+  loadAccessibleGenerationArtifactInputs,
+  loadAccessibleSourceMediaInputs,
+} from "../input-access";
 
 export class GenerationJobServiceError extends Error {
   constructor(
     message: string,
-    readonly status: 400 | 404 | 409,
+    readonly status: 400 | 404 | 409 | 413,
     readonly code: string,
   ) {
     super(message);
@@ -95,6 +109,10 @@ type SourceAccessRow = {
   projectId: string;
   userId: string;
   status: string;
+  storageKey: string;
+  sha256: string;
+  sizeBytes: number;
+  mimeType: string;
 };
 
 function validateSourceAssetRows(
@@ -116,31 +134,110 @@ async function assertSourceAssetsAccessible(
   sourceAssets: Array<{ id: string; role: string }>,
   projectId: string,
   actor: Actor,
-): Promise<void> {
-  if (!sourceAssets.length) return;
+): Promise<SourceAccessRow[]> {
+  if (!sourceAssets.length) return [];
   const ids = [...new Set(sourceAssets.map((item) => item.id))];
-  const rows = await db.select({
-    id: sourceMediaAssets.id,
-    projectId: sourceMediaAssets.projectId,
-    userId: sourceMediaAssets.userId,
-    status: sourceMediaAssets.status,
-  }).from(sourceMediaAssets).where(inArray(sourceMediaAssets.id, ids));
-  validateSourceAssetRows(rows, ids, projectId, actor);
+  try {
+    return await loadAccessibleSourceMediaInputs({
+      ids,
+      projectId,
+      actor: { userId: actor.userId, isAdmin: isAdmin(actor) },
+    });
+  } catch (error) {
+    if (!(error instanceof GenerationInputAccessError)) throw error;
+    throw new GenerationJobServiceError(
+      "One or more source assets are unavailable", 409, "source_asset_unavailable",
+    );
+  }
+}
+
+const DEFAULT_JOB_INPUT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function jobInputRetentionMs(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): number {
+  const raw = environment.AI_M_JOB_INPUT_RETENTION_MS?.trim();
+  if (!raw) return DEFAULT_JOB_INPUT_RETENTION_MS;
+  const value = Number(raw);
+  const minimum = 24 * 60 * 60 * 1000;
+  const maximum = 365 * 24 * 60 * 60 * 1000;
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error("AI_M_JOB_INPUT_RETENTION_MS must be between one day and one year");
+  }
+  return value;
+}
+
+function generationArtifactReferences(metadata: Record<string, unknown> | undefined): Array<{ id: string; role: string }> {
+  if (!metadata) return [];
+  const references: Array<{ id: string; role: string }> = [];
+  if (Array.isArray(metadata.referenceImages)) {
+    metadata.referenceImages.forEach((item, index) => {
+      if (item && typeof item === "object" && !Array.isArray(item)
+        && typeof (item as Record<string, unknown>).artifactId === "string") {
+        references.push({
+          id: (item as Record<string, unknown>).artifactId as string,
+          role: `reference-image:${index}`,
+        });
+      }
+    });
+  }
+  if (typeof metadata.voiceReferenceArtifactId === "string") {
+    references.push({ id: metadata.voiceReferenceArtifactId, role: "voice-reference" });
+  }
+  return [...new Map(references.map((item) => [`${item.id}:${item.role}`, item])).values()];
+}
+
+async function loadGenerationArtifactSnapshots(
+  references: Array<{ id: string; role: string }>,
+  projectId: string,
+  actor: Actor,
+): Promise<Array<{ id: string; role: string; storageKey: string; sha256: string; sizeBytes: number; mimeType: string }>> {
+  if (!references.length) return [];
+  const ids = [...new Set(references.map((item) => item.id))];
+  let rows;
+  try {
+    rows = await loadAccessibleGenerationArtifactInputs({
+      ids,
+      projectId,
+      actor: { userId: actor.userId, isAdmin: isAdmin(actor) },
+    });
+  } catch (error) {
+    if (!(error instanceof GenerationInputAccessError)) throw error;
+    throw new GenerationJobServiceError(
+      "One or more input artifacts are unavailable",
+      409,
+      "input_artifact_unavailable",
+    );
+  }
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return references.map((reference) => ({ ...byId.get(reference.id)!, role: reference.role }));
 }
 
 export async function createGenerationJob(input: CreateGenerationJobInput, actor: Actor): Promise<GenerationJobView> {
-  if (!isEnabled(FF.V2_DURABLE_EXECUTION)) throw new Error("v2.0 durable execution is not enabled");
+  if (!isEnabledForProject(FF.V2_DURABLE_EXECUTION, input.projectId)) {
+    throw new Error("v2.0 durable execution is not enabled for this project");
+  }
   await assertProjectAccess(input.projectId, actor);
   const sourceAssets = normalizeSourceAssets(input);
-  await assertSourceAssetsAccessible(sourceAssets, input.projectId, actor);
+  const sourceAssetRows = await assertSourceAssetsAccessible(sourceAssets, input.projectId, actor);
+  const artifactSnapshots = await loadGenerationArtifactSnapshots(
+    generationArtifactReferences(input.metadata),
+    input.projectId,
+    actor,
+  );
   const [profile] = await db.select({
     revision: generationProfileRevisions,
     visibility: generationProfileStates.visibility,
+    compiledBindingsJson: workflowPackageRevisions.compiledBindingsJson,
   })
     .from(generationProfileRevisions)
     .innerJoin(
       generationProfileStates,
       eq(generationProfileStates.generationProfileRevisionId, generationProfileRevisions.id),
+    )
+    .leftJoin(
+      workflowPackageRevisions,
+      eq(workflowPackageRevisions.digest, generationProfileRevisions.workflowPackageDigest),
     )
     .where(and(
       eq(generationProfileRevisions.id, input.profileRevisionId),
@@ -153,15 +250,39 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
     throw new GenerationJobServiceError("Profile capability does not match request capability", 400, "profile_capability_mismatch");
   }
   const profileRevision = profile.revision;
+  let normalizedRequest = structuredClone(input.request) as unknown as Record<string, unknown>;
   if (profileRevision.adapterKind === "comfyui") {
-    if (!profileRevision.executionBackendId || !profileRevision.workflowPackageDigest) {
+    if (!profileRevision.executionBackendId || !profileRevision.workflowPackageDigest || !profile.compiledBindingsJson) {
       throw new GenerationJobServiceError("ComfyUI profile is incomplete", 409, "profile_incomplete");
     }
-    const [runtime] = await db.select({
+    try {
+      const config = profileRevision.configJson && typeof profileRevision.configJson === "object"
+        ? profileRevision.configJson as Record<string, unknown>
+        : {};
+      const defaults = config.defaultParameters && typeof config.defaultParameters === "object"
+        ? config.defaultParameters
+        : {};
+      normalizedRequest = normalizeCompiledWorkflowRequest(
+        parseCompiledBindings(profile.compiledBindingsJson),
+        input.request,
+        defaults,
+      );
+    } catch (error) {
+      if (error instanceof GenerationRequestValidationError) {
+        throw new GenerationJobServiceError(error.message, error.status, error.code);
+      }
+      throw new GenerationJobServiceError(
+        "Compiled workflow input contract is invalid",
+        409,
+        "workflow_input_contract_invalid",
+      );
+    }
+    const runtimes = await db.select({
       backendEnabled: executionBackends.enabled,
       backendFingerprint: executionBackends.environmentFingerprint,
       validationFingerprint: workflowBackendValidations.environmentFingerprint,
       validationLockDigest: workflowBackendValidations.environmentLockDigest,
+      validationKind: workflowBackendValidations.validationKind,
       workflowLockDigest: workflowPackageRevisions.environmentLockDigest,
       workflowState: workflowPackageStates.state,
     }).from(executionBackends)
@@ -174,12 +295,24 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
         workflowPackageStates,
         eq(workflowPackageStates.workflowPackageDigest, workflowPackageRevisions.digest),
       )
-      .where(eq(executionBackends.id, profileRevision.executionBackendId));
-    if (!runtime || !runtime.backendEnabled
-      || runtime.workflowState !== "active"
-      || !runtime.backendFingerprint
-      || runtime.backendFingerprint !== runtime.validationFingerprint
-      || runtime.validationLockDigest !== runtime.workflowLockDigest) {
+      .where(and(
+        eq(executionBackends.id, profileRevision.executionBackendId),
+        inArray(workflowBackendValidations.validationKind, allowedWorkflowValidationKinds()),
+      ));
+    const runtime = runtimes[0];
+    const applicableValidation = runtime && selectApplicableWorkflowValidation(
+      runtimes.map((candidate) => ({
+        validationKind: candidate.validationKind,
+        environmentFingerprint: candidate.validationFingerprint,
+        environmentLockDigest: candidate.validationLockDigest,
+      })),
+      {
+        workflowState: runtime.workflowState,
+        backendFingerprint: runtime.backendFingerprint,
+        workflowLockDigest: runtime.workflowLockDigest,
+      },
+    );
+    if (!runtime?.backendEnabled || !applicableValidation) {
       throw new GenerationJobServiceError(
         "Generation profile is not validated for its current backend environment",
         409, "profile_environment_unvalidated",
@@ -187,8 +320,15 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
     }
   }
 
-  const inputDigest = sha256(canonicalize({ request: input.request, metadata: input.metadata ?? null, sourceAssets }));
-  const idempotencyRequestDigest = buildIdempotencyRequestDigest(input, sourceAssets);
+  const normalizedInput: CreateGenerationJobInput = {
+    ...input,
+    request: normalizedRequest as unknown as CreateGenerationJobInput["request"],
+  };
+  const inputDigest = sha256Canonical({ request: normalizedRequest, metadata: input.metadata ?? null, sourceAssets });
+  const idempotencyRequestDigest = buildIdempotencyRequestDigest(normalizedInput, sourceAssets);
+  // v1 digests hashed caller input before compiled defaults were resolved.
+  // Keep a dual-read during rollout so an existing key remains reusable.
+  const legacyCallerRequestDigest = buildIdempotencyRequestDigest(input, sourceAssets);
   const idempotencyKey = normalizeIdempotencyKey(input);
   if (idempotencyKey) {
     const [existing] = await db.select({
@@ -203,7 +343,7 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
     if (existing) {
       const existingDigest = existing.requestDigest
         ?? legacySnapshotIdempotencyDigest(input.capability, existing.executionSnapshotJson);
-      if (existingDigest !== idempotencyRequestDigest) {
+      if (existingDigest !== idempotencyRequestDigest && existingDigest !== legacyCallerRequestDigest) {
         throw new GenerationJobServiceError(
           "Idempotency key was already used for a different generation request",
           409,
@@ -220,14 +360,15 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
   }
 
   const jobId = genId();
+  const traceId = `trace-${jobId}`;
   const now = Date.now();
-  const dedupeScope = sha256(canonicalize({
+  const dedupeScope = sha256Canonical({
     projectId: input.projectId,
     capability: input.capability,
     profileRevisionId: input.profileRevisionId,
     businessContext: input.businessContext ?? null,
     inputDigest,
-  }));
+  });
   if (!idempotencyKey) {
     const [activeDuplicate] = await db.select({ id: generationJobs.id }).from(generationJobs).where(and(
       eq(generationJobs.projectId, input.projectId),
@@ -246,6 +387,10 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
         projectId: sourceMediaAssets.projectId,
         userId: sourceMediaAssets.userId,
         status: sourceMediaAssets.status,
+        storageKey: sourceMediaAssets.storageKey,
+        sha256: sourceMediaAssets.sha256,
+        sizeBytes: sourceMediaAssets.sizeBytes,
+        mimeType: sourceMediaAssets.mimeType,
       }).from(sourceMediaAssets).where(inArray(sourceMediaAssets.id, ids)).all();
       validateSourceAssetRows(rows, ids, input.projectId, actor);
     }
@@ -255,22 +400,30 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
       requestedBy: actor.userId,
       idempotencyKey,
       idempotencyRequestDigest: idempotencyKey ? idempotencyRequestDigest : null,
-      metadataJson: input.metadata ? structuredClone(input.metadata) : {},
+      metadataJson: {
+        ...(input.metadata ? structuredClone(input.metadata) : {}),
+        traceId,
+      },
       capability: input.capability,
       status: "QUEUED",
       executionSnapshotJson: {
+        requestDigestVersion: profileRevision.adapterKind === "comfyui" ? 2 : 1,
         profileRevisionId: input.profileRevisionId,
         adapterKind: profileRevision.adapterKind,
         executionBackendId: profileRevision.executionBackendId,
         workflowPackageDigest: profileRevision.workflowPackageDigest,
         configJson: profileRevision.configJson,
-        request: structuredClone(input.request),
-        metadata: input.metadata ? structuredClone(input.metadata) : undefined,
+        request: structuredClone(normalizedRequest),
+        metadata: {
+          ...(input.metadata ? structuredClone(input.metadata) : {}),
+          traceId,
+        },
         sourceAssets: structuredClone(sourceAssets),
         businessContext: input.businessContext ? structuredClone(input.businessContext) : undefined,
       },
       inputDigest,
       dedupeScope,
+      inputRetentionUntilMs: now + jobInputRetentionMs(),
       createdAtMs: now,
       updatedAtMs: now,
     }).onConflictDoNothing().run();
@@ -294,6 +447,35 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
         createdAtMs: now,
       }))).run();
     }
+    const sourceById = new Map(sourceAssetRows.map((row) => [row.id, row]));
+    const inputSnapshots = [
+      ...sourceAssets.map((item) => {
+        const descriptor = sourceById.get(item.id)!;
+        return {
+          jobId,
+          artifactKind: "source-media" as const,
+          artifactId: item.id,
+          role: item.role,
+          storageKey: descriptor.storageKey,
+          sha256: descriptor.sha256,
+          sizeBytes: descriptor.sizeBytes,
+          mimeType: descriptor.mimeType,
+          createdAtMs: now,
+        };
+      }),
+      ...artifactSnapshots.map((descriptor) => ({
+        jobId,
+        artifactKind: "generation-artifact" as const,
+        artifactId: descriptor.id,
+        role: descriptor.role,
+        storageKey: descriptor.storageKey,
+        sha256: descriptor.sha256,
+        sizeBytes: descriptor.sizeBytes,
+        mimeType: descriptor.mimeType,
+        createdAtMs: now,
+      })),
+    ];
+    if (inputSnapshots.length) tx.insert(jobInputArtifacts).values(inputSnapshots).run();
   });
 
   let effectiveJobId = jobId;
@@ -317,7 +499,7 @@ export async function createGenerationJob(input: CreateGenerationJobInput, actor
       }).from(generationJobs).where(eq(generationJobs.id, winner.id));
       const winnerDigest = winnerDetail?.requestDigest
         ?? legacySnapshotIdempotencyDigest(input.capability, winnerDetail?.executionSnapshotJson);
-      if (winnerDigest !== idempotencyRequestDigest) {
+      if (winnerDigest !== idempotencyRequestDigest && winnerDigest !== legacyCallerRequestDigest) {
         throw new GenerationJobServiceError(
           "Idempotency key was concurrently used for a different generation request",
           409,
@@ -364,6 +546,13 @@ export async function retryGenerationJob(jobId: string, actor: Actor, mode: Retr
       ? "Jobs requiring attention must be reconciled by an administrator before retry"
       : `Job cannot be retried in status ${job.status}`;
     throw new GenerationJobServiceError(reason, 409, "job_not_retryable");
+  }
+  if (job.inputsReleasedAtMs || !job.inputRetentionUntilMs || job.inputRetentionUntilMs <= Date.now()) {
+    throw new GenerationJobServiceError(
+      "Job input retention expired; create a new generation job with current inputs",
+      409,
+      "job_inputs_expired",
+    );
   }
   const sourceRows = await db.select({ status: sourceMediaAssets.status })
     .from(generationJobSourceAssets)

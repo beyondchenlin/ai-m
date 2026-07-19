@@ -44,3 +44,18 @@ export { assertModelDiscoveryUrl, ModelDiscoveryPolicyError } from "./model-disc
 export { requestPinnedJson } from "./pinned-json-request";
 
 export { assertTrustedRequestOrigin } from "./request-origin";
+export { assertMutationRequest, type MutationRequestClass } from "./mutation-request";
+
+export {
+  buildTrustedProxyProof,
+  decodeTrustedProxySecret,
+  hasCompleteTrustedProxyProofHeaders,
+  TRUSTED_PROXY_HEADER_NAMES,
+  verifyTrustedProxyRequest,
+  TrustedProxyAuthError,
+} from "./trusted-proxy-auth";
+
+export {
+  isAuthenticatedLocalClientRequest,
+  LOCAL_CLIENT_TOKEN_HEADER,
+} from "./local-client-auth";

@@ -7,6 +7,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
+    // Real Windows child-process/WAL tests share CPU and disk with the parallel
+    // suite. Keep a bounded budget that covers cold process startup under load.
+    testTimeout: 15_000,
     env: {
       NODE_ENV: "test",
       FF_V2_BACKEND_CONFIG: "1",

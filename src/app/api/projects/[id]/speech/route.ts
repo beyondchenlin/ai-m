@@ -32,7 +32,7 @@ export async function POST(
   if (!(await assertProjectOwnership(request, projectId))) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   try {
     assertTrustedRequestOrigin(request);
     const body: unknown = await readJsonBodyLimited(request, 128 * 1024);

@@ -2,15 +2,23 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { and, eq, lt, sql } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { generationJobSourceAssets, sourceMediaAssets, voiceProfiles } from "@/lib/db/schema";
+import { and, eq, inArray, isNull, lt, lte } from "drizzle-orm";
+import { db, getSqlite } from "@/lib/db";
+import {
+  generationJobSourceAssets,
+  generationJobs,
+  jobInputArtifacts,
+  sourceAssetQuotaReservations,
+  sourceMediaAssets,
+  voiceProfiles,
+} from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { detectMimeType } from "./archiving/content-detection";
 import { probeAudioMetadata } from "./media-probe";
 
 export const MAX_VOICE_REFERENCE_BYTES = 50 * 1024 * 1024;
 const SOURCE_STAGING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const QUOTA_RESERVATION_TTL_MS = 5 * 60 * 1000;
 
 const verifiedFileCache = new Map<string, {
   size: number;
@@ -120,6 +128,7 @@ async function writeStreamBounded(
   signal?: AbortSignal,
   readTimeoutMs = 30_000,
   totalTimeoutMs = 5 * 60_000,
+  onProgress?: () => void,
 ): Promise<{ sizeBytes: number; sha256: string; header: Uint8Array }> {
   if (!Number.isSafeInteger(readTimeoutMs) || readTimeoutMs < 1_000 || readTimeoutMs > 120_000) {
     throw new SourceAssetError("Invalid source upload read timeout", "UPLOAD_TIMEOUT_INVALID", 500);
@@ -148,6 +157,7 @@ async function writeStreamBounded(
       ]).finally(() => { if (timer) clearTimeout(timer); });
       if (done) break;
       sizeBytes += value.byteLength;
+      onProgress?.();
       if (sizeBytes > maxBytes) {
         throw new SourceAssetError(`Reference audio exceeds ${maxBytes} bytes`, "SOURCE_TOO_LARGE", 413);
       }
@@ -177,6 +187,55 @@ async function writeStreamBounded(
   }
   await handle.close();
   return { sizeBytes, sha256: hash.digest("hex"), header };
+}
+
+export function reserveSourceAssetQuota(projectId: string, userId: string, reservedBytes: number): {
+  id: string;
+  token: string;
+} {
+  if (!Number.isSafeInteger(reservedBytes) || reservedBytes <= 0) {
+    throw new SourceAssetError("Invalid source-audio quota reservation", "INVALID_QUOTA_RESERVATION", 500);
+  }
+  const sqlite = getSqlite();
+  const id = genId();
+  const token = genId();
+  sqlite.transaction(() => {
+    const now = Date.now();
+    sqlite.prepare(
+      "UPDATE source_asset_quota_reservations SET status='RELEASED', updated_at_ms=? WHERE status='RESERVED' AND expires_at_ms<=?",
+    ).run(now, now);
+    const committed = sqlite.prepare<
+      [string],
+      { total_bytes: number }
+    >("SELECT coalesce(sum(size_bytes), 0) AS total_bytes FROM source_media_assets WHERE project_id=? AND status IN ('STAGING','COMMITTED')")
+      .get(projectId)?.total_bytes ?? 0;
+    const reserved = sqlite.prepare<
+      [string, number],
+      { total_bytes: number }
+    >("SELECT coalesce(sum(reserved_bytes), 0) AS total_bytes FROM source_asset_quota_reservations WHERE project_id=? AND status='RESERVED' AND expires_at_ms>?")
+      .get(projectId, now)?.total_bytes ?? 0;
+    if (!Number.isSafeInteger(committed) || !Number.isSafeInteger(reserved)
+      || committed + reserved + reservedBytes > projectQuotaBytes()) {
+      throw new SourceAssetError("Project source-audio quota exceeded", "SOURCE_PROJECT_QUOTA_EXCEEDED", 413);
+    }
+    sqlite.prepare(
+      "INSERT INTO source_asset_quota_reservations (id, project_id, user_id, upload_token, reserved_bytes, status, expires_at_ms, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?, ?)",
+    ).run(id, projectId, userId, token, reservedBytes, now + QUOTA_RESERVATION_TTL_MS, now, now);
+  }).immediate();
+  return { id, token };
+}
+
+export function renewSourceAssetQuotaReservation(id: string, token: string): void {
+  const now = Date.now();
+  getSqlite().prepare(
+    "UPDATE source_asset_quota_reservations SET expires_at_ms=?, updated_at_ms=? WHERE id=? AND upload_token=? AND status='RESERVED'",
+  ).run(now + QUOTA_RESERVATION_TTL_MS, now, id, token);
+}
+
+export function releaseSourceAssetQuotaReservation(id: string, token: string): void {
+  getSqlite().prepare(
+    "UPDATE source_asset_quota_reservations SET status='RELEASED', updated_at_ms=? WHERE id=? AND upload_token=? AND status='RESERVED'",
+  ).run(Date.now(), id, token);
 }
 
 async function verifyRegularFile(
@@ -273,16 +332,41 @@ export async function importVoiceReferenceStream(input: VoiceReferenceStreamInpu
   const stagingKey = stagingKeyFor(id);
   const stagingPath = storagePath(stagingKey);
   await fs.mkdir(path.dirname(stagingPath), { recursive: true, mode: 0o700 });
-  const written = await writeStreamBounded(
-    input.stream, stagingPath, MAX_VOICE_REFERENCE_BYTES, input.signal,
+  const quotaReservation = reserveSourceAssetQuota(
+    input.projectId,
+    input.userId,
+    input.declaredSize ?? MAX_VOICE_REFERENCE_BYTES,
   );
+  let lastRenewedAt = Date.now();
+  let written: Awaited<ReturnType<typeof writeStreamBounded>>;
+  try {
+    written = await writeStreamBounded(
+      input.stream,
+      stagingPath,
+      input.declaredSize ?? MAX_VOICE_REFERENCE_BYTES,
+      input.signal,
+      30_000,
+      5 * 60_000,
+      () => {
+        if (Date.now() - lastRenewedAt >= 5_000) {
+          renewSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
+          lastRenewedAt = Date.now();
+        }
+      },
+    );
+  } catch (error) {
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
+    throw error;
+  }
   if (input.declaredSize !== undefined && written.sizeBytes !== input.declaredSize) {
     await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
     throw new SourceAssetError("Content-Length does not match the uploaded body", "CONTENT_LENGTH_MISMATCH");
   }
   const detected = detectMimeType(written.header);
   if (!detected || !MIME_EXTENSION[detected]) {
     await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
     throw new SourceAssetError("Only real WAV and MP3 reference audio is supported", "UNSUPPORTED_AUDIO_TYPE");
   }
 
@@ -291,10 +375,12 @@ export async function importVoiceReferenceStream(input: VoiceReferenceStreamInpu
     audioMetadata = await probeAudioMetadata(stagingPath, { maxDurationMs: 60_000 });
   } catch {
     await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
     throw new SourceAssetError("Reference audio could not be decoded", "AUDIO_PROBE_FAILED");
   }
   if (audioMetadata.durationMs < 3_000 || audioMetadata.durationMs > 60_000) {
     await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
     throw new SourceAssetError("Reference audio must be between 3 and 60 seconds", "AUDIO_DURATION_INVALID");
   }
 
@@ -314,17 +400,6 @@ export async function importVoiceReferenceStream(input: VoiceReferenceStreamInpu
 
   try {
     db.transaction((tx) => {
-      const [usage] = tx.select({
-        totalBytes: sql<number>`coalesce(sum(${sourceMediaAssets.sizeBytes}), 0)`,
-      }).from(sourceMediaAssets).where(and(
-        eq(sourceMediaAssets.projectId, input.projectId),
-        sql`${sourceMediaAssets.status} IN ('STAGING','COMMITTED')`,
-      )).all();
-      const currentBytes = Number(usage?.totalBytes ?? 0);
-      if (!Number.isSafeInteger(currentBytes) || currentBytes < 0
-        || currentBytes + written.sizeBytes > projectQuotaBytes()) {
-        throw new SourceAssetError("Project source-audio quota exceeded", "SOURCE_PROJECT_QUOTA_EXCEEDED", 413);
-      }
       tx.insert(sourceMediaAssets).values({
         id,
         projectId: input.projectId,
@@ -340,9 +415,24 @@ export async function importVoiceReferenceStream(input: VoiceReferenceStreamInpu
         createdAtMs: now,
         updatedAtMs: now,
       }).run();
+      const finalized = tx.update(sourceAssetQuotaReservations).set({
+        status: "COMMITTED",
+        actualBytes: written.sizeBytes,
+        updatedAtMs: now,
+      }).where(and(
+        eq(sourceAssetQuotaReservations.id, quotaReservation.id),
+        eq(sourceAssetQuotaReservations.uploadToken, quotaReservation.token),
+        eq(sourceAssetQuotaReservations.status, "RESERVED"),
+      )).returning({ id: sourceAssetQuotaReservations.id }).all();
+      if (finalized.length !== 1) throw new SourceAssetError(
+        "Upload quota reservation expired",
+        "SOURCE_QUOTA_RESERVATION_LOST",
+        409,
+      );
     });
   } catch (error) {
     await fs.rm(stagingPath, { force: true }).catch(() => undefined);
+    releaseSourceAssetQuotaReservation(quotaReservation.id, quotaReservation.token);
     throw error;
   }
 
@@ -439,6 +529,7 @@ export async function recoverSourceMediaAssets(limit = 100): Promise<{ committed
 }
 
 export async function cleanupSourceAssetStorage(): Promise<{ deletedFiles: number; quarantinedFiles: number; orphanStagingFiles: number; abandonedAssets: number }> {
+  await releaseExpiredJobInputSnapshots();
   let deletedFiles = 0;
   let quarantinedFiles = 0;
   let abandonedAssets = 0;
@@ -504,6 +595,44 @@ export async function cleanupSourceAssetStorage(): Promise<{ deletedFiles: numbe
     }
   }
   return { deletedFiles, quarantinedFiles, orphanStagingFiles, abandonedAssets };
+}
+
+export async function releaseExpiredJobInputSnapshots(
+  nowMs = Date.now(),
+  batchSize = 200,
+): Promise<number> {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0
+    || !Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 1_000) {
+    throw new Error("Job input release arguments are invalid");
+  }
+  const candidates = await db.select({ id: generationJobs.id })
+    .from(generationJobs)
+    .where(and(
+      inArray(generationJobs.status, ["SUCCEEDED", "FAILED", "CANCELLED"]),
+      isNull(generationJobs.inputsReleasedAtMs),
+      lte(generationJobs.inputRetentionUntilMs, nowMs),
+    ))
+    .limit(batchSize);
+  let released = 0;
+  for (const candidate of candidates) {
+    db.transaction((tx) => {
+      const changed = tx.update(generationJobs).set({
+        inputsReleasedAtMs: nowMs,
+        updatedAtMs: nowMs,
+      }).where(and(
+        eq(generationJobs.id, candidate.id),
+        inArray(generationJobs.status, ["SUCCEEDED", "FAILED", "CANCELLED"]),
+        isNull(generationJobs.inputsReleasedAtMs),
+        lte(generationJobs.inputRetentionUntilMs, nowMs),
+      )).run();
+      if (changed.changes !== 1) return;
+      tx.delete(jobInputArtifacts).where(eq(jobInputArtifacts.jobId, candidate.id)).run();
+      tx.delete(generationJobSourceAssets)
+        .where(eq(generationJobSourceAssets.jobId, candidate.id)).run();
+      released += 1;
+    });
+  }
+  return released;
 }
 
 export async function getOwnedSourceAsset(assetId: string, userId: string, projectId?: string) {

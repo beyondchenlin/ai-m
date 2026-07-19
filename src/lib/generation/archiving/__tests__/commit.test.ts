@@ -193,6 +193,44 @@ describe("PR-12 fenced two-phase artifact commit", () => {
     await expect(fs.stat(stagingPath)).rejects.toThrow();
   });
 
+  it("fails boundedly on ENOSPC without publishing or leaving a staging file", async () => {
+    const execution = await createExecution();
+    let stagingPath = "";
+    const writing = streamCommitArtifact({
+      attemptId: execution.attemptId,
+      expectedJobClaimFencingToken: 1,
+      writerOwner: "disk-full-writer",
+      logicalName: "disk-full.png",
+      kind: ArtifactKind.IMAGE,
+      mimeType: "image/png",
+      visibility: ArtifactVisibility.PROJECT,
+      read: () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(pngBytes);
+          controller.close();
+        },
+      }),
+    }, {
+      openStagingFile: async (filePath) => {
+        stagingPath = filePath;
+        const handle = await fs.open(filePath, "wx", 0o600);
+        handle.write = async () => {
+          throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+        };
+        return handle;
+      },
+    });
+
+    await expect(writing).rejects.toMatchObject({ code: "ENOSPC" });
+    const [artifact] = await db.select().from(generationArtifacts);
+    expect(artifact.status).toBe("QUARANTINED");
+    expect(stagingPath).not.toBe("");
+    await expect(fs.stat(stagingPath)).rejects.toThrow();
+    const committed = await fs.readdir(path.dirname(resolveArtifactStoragePath(`${execution.attemptId}/placeholder.png`)))
+      .catch(() => []);
+    expect(committed).toEqual([]);
+  });
+
   it("rejects stale workers before publishing output", async () => {
     const execution = await createExecution();
     await db.update(generationJobs).set({ claimFencingToken: 2 }).where(eq(generationJobs.id, execution.jobId));

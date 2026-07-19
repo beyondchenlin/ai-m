@@ -53,7 +53,7 @@ export async function GET(
   if (!isEnabled(FF.V2_MEDIA_ARCHIVING)) {
     return NextResponse.json({ error: "Media archiving is not enabled" }, { status: 403 });
   }
-  const userId = getUserIdFromRequest(req);
+  const userId = await getUserIdFromRequest(req);
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await params;
   if (!/^[A-Za-z0-9._:-]{1,200}$/.test(id)) {

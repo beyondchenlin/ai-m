@@ -30,9 +30,28 @@ export const LEASE_CONFIG = {
   RESOURCE_LEASE_MS: 120_000,
   /** 心跳间隔 (ms) */
   HEARTBEAT_INTERVAL_MS: 10_000,
+  /** Default cap for simultaneously leased jobs from one project. */
+  MAX_RUNNING_JOBS_PER_PROJECT: 2,
+  /** An older queued job crosses the fairness starvation boundary. */
+  PROJECT_STARVATION_MS: 5 * 60_000,
 } as const;
 
 class ResourceCardinalityRollback extends Error {}
+
+function boundedEnvironmentInteger(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
 
 export class InvalidResourceCardinalityError extends Error {
   readonly name = "InvalidResourceCardinalityError";
@@ -365,9 +384,47 @@ export function recordResourceTerminationProof(
 export async function claimJob(
   workerId: string,
   capability: typeof generationJobs.$inferSelect.capability,
+  options: {
+    maxRunningJobsPerProject?: number;
+    projectStarvationMs?: number;
+    executionBackendIds?: readonly string[];
+    clock?: () => number;
+  } = {},
 ): Promise<typeof generationJobs.$inferSelect | null> {
-  const now = Date.now();
+  const executionBackendIds = options.executionBackendIds
+    ? [...new Set(options.executionBackendIds)]
+    : undefined;
+  if (executionBackendIds && (executionBackendIds.length === 0
+    || executionBackendIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)))) {
+    throw new Error("executionBackendIds must contain one or more valid backend identities");
+  }
+  const maxRunningJobsPerProject = options.maxRunningJobsPerProject
+    ?? boundedEnvironmentInteger(
+      "AI_M_MAX_RUNNING_JOBS_PER_PROJECT",
+      LEASE_CONFIG.MAX_RUNNING_JOBS_PER_PROJECT,
+      1,
+      32,
+    );
+  const projectStarvationMs = options.projectStarvationMs
+    ?? boundedEnvironmentInteger(
+      "AI_M_PROJECT_STARVATION_MS",
+      LEASE_CONFIG.PROJECT_STARVATION_MS,
+      1_000,
+      24 * 60 * 60_000,
+    );
+  if (!Number.isSafeInteger(maxRunningJobsPerProject)
+    || maxRunningJobsPerProject < 1
+    || maxRunningJobsPerProject > 32) {
+    throw new Error("maxRunningJobsPerProject must be an integer between 1 and 32");
+  }
+  if (!Number.isSafeInteger(projectStarvationMs)
+    || projectStarvationMs < 1_000
+    || projectStarvationMs > 24 * 60 * 60_000) {
+    throw new Error("projectStarvationMs must be between one second and 24 hours");
+  }
+  const now = (options.clock ?? Date.now)();
   const claimUntilMs = now + LEASE_CONFIG.CLAIM_LEASE_MS;
+  const starvationCutoffMs = now - projectStarvationMs;
 
   // 原子领取：通过 rowid 子查询只更新第一个可领取的任务（状态为 QUEUED、无未过期租约）。
   const [job] = await db
@@ -387,8 +444,31 @@ export async function claimJob(
           SELECT "rowid" FROM ${generationJobs}
           WHERE ${generationJobs.status} = 'QUEUED'
             AND ${generationJobs.capability} = ${capability}
+            ${executionBackendIds
+              ? sql`AND json_extract(${generationJobs.executionSnapshotJson}, '$.executionBackendId') IN (${sql.join(executionBackendIds.map((id) => sql`${id}`), sql`, `)})`
+              : sql``}
             AND (${generationJobs.claimOwner} IS NULL OR ${generationJobs.claimUntilMs} <= ${now})
-          ORDER BY ${generationJobs.createdAtMs}
+            AND (
+              ${generationJobs.projectId} IS NULL
+              OR (
+                SELECT COUNT(*)
+                FROM generation_jobs AS active_project_job
+                WHERE active_project_job.project_id = ${generationJobs.projectId}
+                  AND active_project_job.status IN ('RUNNING', 'CANCEL_REQUESTED')
+                  AND active_project_job.claim_until_ms > ${now}
+              ) < ${maxRunningJobsPerProject}
+            )
+          ORDER BY
+            CASE WHEN ${generationJobs.createdAtMs} <= ${starvationCutoffMs} THEN 0 ELSE 1 END,
+            (
+              SELECT COUNT(*)
+              FROM generation_jobs AS active_project_job
+              WHERE active_project_job.project_id = ${generationJobs.projectId}
+                AND active_project_job.status IN ('RUNNING', 'CANCEL_REQUESTED')
+                AND active_project_job.claim_until_ms > ${now}
+            ),
+            ${generationJobs.createdAtMs},
+            ${generationJobs.id}
           LIMIT 1
         )`,
       ),

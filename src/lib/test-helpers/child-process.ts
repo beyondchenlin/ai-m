@@ -1,6 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 
-const DEFAULT_CHILD_EXIT_TIMEOUT_MS = 5_000;
+/** Bounded for Windows cold process startup while the full suite runs in parallel. */
+const DEFAULT_CHILD_EXIT_TIMEOUT_MS = 15_000;
 
 function childDescription(child: ChildProcess): string {
   return child.pid ? `child process ${child.pid}` : "child process";

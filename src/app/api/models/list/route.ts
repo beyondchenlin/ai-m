@@ -130,7 +130,7 @@ function staticModels(protocol: string): ModelItem[] | null {
 }
 
 export async function POST(request: NextRequest) {
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   try {
     assertTrustedRequestOrigin(request);

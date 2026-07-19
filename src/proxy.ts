@@ -1,12 +1,25 @@
 import createMiddleware from "next-intl/middleware";
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { routing } from "./i18n/routing";
+import { assertMutationRequest } from "./lib/security/mutation-request";
+import { RequestValidationError } from "./lib/security/request-validation";
 
 const COOKIE_NAME = "ai_comic_uid";
 
 const intlMiddleware = createMiddleware(routing);
 
 export default function proxy(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith("/api/")) {
+    try {
+      assertMutationRequest(request);
+      return NextResponse.next();
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        return NextResponse.json({ error: error.message }, { status: error.status });
+      }
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  }
   const response = intlMiddleware(request);
 
   // Ensure ai_comic_uid cookie exists before any page renders.
@@ -26,5 +39,5 @@ export default function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!api|_next|_vercel|.*\\..*).*)"],
+  matcher: ["/((?!_next|_vercel|.*\\..*).*)"],
 };

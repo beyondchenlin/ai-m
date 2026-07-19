@@ -16,22 +16,38 @@ const migrations: MigrationMetadata[] = [
 ];
 
 describe("validateMigrationJournal", () => {
-  it("keeps published 0060/0061 and appends artifact recovery leases as 0062", () => {
+  it("keeps published migrations and appends job input retention as 0070", () => {
     const journal = JSON.parse(readFileSync(
       resolve(process.cwd(), "drizzle/meta/_journal.json"),
       "utf8",
     )) as { entries: Array<{ idx: number; when: number; tag: string }> };
     const latest = journal.entries.at(-1);
-    const previous = journal.entries.at(-2);
-    const published0060 = journal.entries.at(-3);
+    const validationKinds = journal.entries.at(-2);
+    const operationalAlerts = journal.entries.at(-3);
+    const workflowApprovals = journal.entries.at(-4);
+    const voiceIdempotency = journal.entries.at(-5);
+    const quotaReservations = journal.entries.at(-6);
+    const jobInputArtifacts = journal.entries.at(-7);
+    const trustedProxyNonces = journal.entries.at(-8);
+    const artifactLeases = journal.entries.at(-9);
+    const slotOwnerUnique = journal.entries.at(-10);
+    const published0060 = journal.entries.at(-11);
 
     expect(latest).toMatchObject({
-      idx: 62,
-      tag: "0062_artifact_recovery_leases",
+      idx: 70,
+      tag: "0070_job_input_retention",
     });
-    expect(previous).toMatchObject({ idx: 61, tag: "0061_resource_slot_owner_unique" });
+    expect(validationKinds).toMatchObject({ idx: 69, tag: "0069_workflow_validation_kinds" });
+    expect(operationalAlerts).toMatchObject({ idx: 68, tag: "0068_operational_alerts" });
+    expect(workflowApprovals).toMatchObject({ idx: 67, tag: "0067_workflow_two_person_approvals" });
+    expect(voiceIdempotency).toMatchObject({ idx: 66, tag: "0066_voice_profile_idempotency" });
+    expect(quotaReservations).toMatchObject({ idx: 65, tag: "0065_source_asset_quota_reservations" });
+    expect(jobInputArtifacts).toMatchObject({ idx: 64, tag: "0064_job_input_artifacts" });
+    expect(trustedProxyNonces).toMatchObject({ idx: 63, tag: "0063_trusted_proxy_nonces" });
+    expect(artifactLeases).toMatchObject({ idx: 62, tag: "0062_artifact_recovery_leases" });
+    expect(slotOwnerUnique).toMatchObject({ idx: 61, tag: "0061_resource_slot_owner_unique" });
     expect(published0060).toMatchObject({ idx: 60, tag: "0060_resource_reconciliation_proof" });
-    expect(latest!.when).toBeGreaterThan(previous!.when);
+    expect(latest!.when).toBeGreaterThan(validationKinds!.when);
   });
 
   it("accepts valid rows independently of insertion order", () => {

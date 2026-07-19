@@ -30,7 +30,7 @@ export async function POST(
     }
     throw error;
   }
-  const userId = getUserIdFromRequest(request);
+  const userId = await getUserIdFromRequest(request);
   if (!request.body) return NextResponse.json({ error: "Audio body is required" }, { status: 400 });
 
   const lengthHeader = request.headers.get("content-length");

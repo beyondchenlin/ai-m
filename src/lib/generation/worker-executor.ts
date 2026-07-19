@@ -1,5 +1,6 @@
 /** Durable ComfyUI execution worker with fenced writes and immutable workflows. */
-import { and, desc, eq, sql } from "drizzle-orm";
+import path from "node:path";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   executionBackends,
@@ -9,6 +10,8 @@ import {
   resourcePools,
   resourcePoolSlots,
   workflowBackendValidations,
+  workflowPackageRevisions,
+  workflowPackageStates,
 } from "@/lib/db/schema";
 import { id as genId } from "@/lib/id";
 import { isEnabled, FF } from "@/lib/feature-flags";
@@ -17,6 +20,7 @@ import {
   ComfyUIOperationError,
   ExecutionCallbackPersistenceError,
   acquireResourceSlot,
+  adaptComfyWorkflowRuntimeChoices,
   createComfyUITransport,
   probeBackendFeatures,
   probeModelFolder,
@@ -29,11 +33,17 @@ import {
 } from "@/lib/generation";
 import type { BackendFeatureSnapshot, ComfyUITransport, ExecutionCallbacks, OrchestratorPhase } from "@/lib/generation";
 import { InvalidResourceCardinalityError } from "@/lib/generation/resources/leases";
-import { bindWorkflow, loadActiveWorkflowPackage } from "@/lib/generation/workflows";
-import { sha256 } from "@/lib/generation/workflows/canonical";
+import {
+  allowedWorkflowValidationKinds,
+  bindWorkflow,
+  loadValidatedWorkflowPackage,
+  selectApplicableWorkflowValidation,
+} from "@/lib/generation/workflows";
+import { sha256Canonical } from "@/lib/generation/workflows/canonical";
 import { resolveBackendAuthHeaders } from "@/lib/security";
 import { linkArtifactToBusinessEntity, mergeGenerationJobMetadata } from "@/lib/generation/business-adapter";
 import { selectPrimaryArtifact, type CollectedArtifactCandidate } from "@/lib/generation/artifact-selection";
+import { verifyRequiredModelFilesCached } from "@/lib/generation/model-file-inventory";
 import {
   attachOwnedAttempt,
   beginOwnedAttemptSubmission,
@@ -66,7 +76,7 @@ export interface GenerationJobLifecycleHooks {
     resourcePoolId: string;
     slotNo: number;
   }) => Promise<void>;
-  managedEndpoint?: { baseUrl: "http://127.0.0.1:8000" };
+  managedEndpoint?: { baseUrl: string; modelsRoot?: string };
 }
 
 function parsePersistedBackendFeatures(value: unknown, fingerprint: string | null): BackendFeatureSnapshot | null {
@@ -173,14 +183,36 @@ export async function executeGenerationJob(
     const workflowDigest = typeof snapshot.workflowPackageDigest === "string" ? snapshot.workflowPackageDigest : "";
     const request = snapshot.request && typeof snapshot.request === "object" ? snapshot.request as Record<string, unknown> : {};
     const config = snapshot.configJson && typeof snapshot.configJson === "object" ? snapshot.configJson as Record<string, unknown> : {};
+    const jobMetadata = job.metadataJson && typeof job.metadataJson === "object"
+      ? job.metadataJson as Record<string, unknown>
+      : {};
+    const traceId = typeof jobMetadata.traceId === "string"
+      && /^trace-[A-Za-z0-9._:-]{1,160}$/.test(jobMetadata.traceId)
+      ? jobMetadata.traceId
+      : `trace-${job.id}`;
     if (!backendId || !workflowDigest) return failJob(job.id, "", workerId, jobFencingToken, "Backend and active workflow package are required", "config_error");
 
     const capturedConfiguration = db.transaction((tx) => {
       const backendRow = tx.select().from(executionBackends).where(eq(executionBackends.id, backendId)).get();
-      const validationRow = tx.select().from(workflowBackendValidations).where(and(
+      const validationRows = tx.select().from(workflowBackendValidations).where(and(
         eq(workflowBackendValidations.workflowPackageDigest, workflowDigest),
         eq(workflowBackendValidations.executionBackendId, backendId),
-      )).get();
+        inArray(workflowBackendValidations.validationKind, allowedWorkflowValidationKinds()),
+      )).all();
+      const workflowRevision = tx.select({
+        state: workflowPackageStates.state,
+        lockDigest: workflowPackageRevisions.environmentLockDigest,
+      }).from(workflowPackageRevisions).innerJoin(
+        workflowPackageStates,
+        eq(workflowPackageStates.workflowPackageDigest, workflowPackageRevisions.digest),
+      ).where(eq(workflowPackageRevisions.digest, workflowDigest)).get();
+      const validationRow = workflowRevision && backendRow
+        ? selectApplicableWorkflowValidation(validationRows, {
+            workflowState: workflowRevision.state,
+            backendFingerprint: backendRow.environmentFingerprint,
+            workflowLockDigest: workflowRevision.lockDigest,
+          })
+        : null;
       const poolRow = backendRow
         ? tx.select().from(resourcePools).where(eq(resourcePools.id, backendRow.resourcePoolId)).get()
         : undefined;
@@ -207,11 +239,20 @@ export async function executeGenerationJob(
     if (!persistedFeatures) {
       return failJob(job.id, "", workerId, jobFencingToken, "Execution backend feature snapshot is missing or invalid", "config_error");
     }
-    const workflowPackage = await loadActiveWorkflowPackage(workflowDigest);
-    if (workflowPackage.manifest.capability !== job.capability) return failJob(job.id, "", workerId, jobFencingToken, "Workflow capability does not match job", "config_error");
     const backendValidation = capturedConfiguration.validation;
-    if (!backendValidation
-      || backendValidation.environmentFingerprint !== backend.environmentFingerprint
+    if (!backendValidation) {
+      return failJob(
+        job.id, "", workerId, jobFencingToken,
+        "Workflow package is not validated for the exact backend environment",
+        "workflow_backend_validation_missing", true,
+      );
+    }
+    const workflowPackage = await loadValidatedWorkflowPackage(
+      workflowDigest,
+      backendValidation.validationKind,
+    );
+    if (workflowPackage.manifest.capability !== job.capability) return failJob(job.id, "", workerId, jobFencingToken, "Workflow capability does not match job", "config_error");
+    if (backendValidation.environmentFingerprint !== backend.environmentFingerprint
       || backendValidation.environmentLockDigest !== workflowPackage.revision.environmentLockDigest) {
       return failJob(
         job.id, "", workerId, jobFencingToken,
@@ -221,7 +262,7 @@ export async function executeGenerationJob(
     }
 
     const attemptNo = await getNextAttemptNo(job.id);
-    const correlationId = `corr-${attemptId}`;
+    const correlationId = `${traceId}.attempt-${attemptId}`.slice(0, 320);
     const outputPrefix = `ai-m/${job.id}/${attemptNo}`;
     const attemptCreatedAtMs = Date.now();
     const attached = attachOwnedAttempt({
@@ -300,13 +341,18 @@ export async function executeGenerationJob(
         ? ((backend.networkPolicyJson as { resolvedAddresses: unknown[] }).resolvedAddresses.filter((value): value is string => typeof value === "string"))
         : [],
       {
-        policyRevision: sha256(backend.networkPolicyJson),
+        policyRevision: sha256Canonical(backend.networkPolicyJson),
         ...parseComfyUIOperationTimeouts(backend.networkPolicyJson),
         lifecycleSignal: executionSignal,
       },
     );
     const activeTransport = transport;
-    const features: BackendFeatureSnapshot = await probeBackendFeatures(activeTransport);
+    let runtimeObjectInfo: import("@/lib/generation").ComfyObjectInfo = {};
+    const features: BackendFeatureSnapshot = await probeBackendFeatures(
+      activeTransport,
+      {},
+      (objectInfo) => { runtimeObjectInfo = objectInfo; },
+    );
     if (backend.environmentFingerprint !== features.environmentFingerprint) {
       return complete(await failJob(
         job.id,
@@ -320,13 +366,48 @@ export async function executeGenerationJob(
     }
     const modelFolders = new Map<string, string[]>();
     for (const model of workflowPackage.manifest.requirements.models) {
-      if (!modelFolders.has(model.folder)) {
-        modelFolders.set(model.folder, await probeModelFolder(activeTransport, model.folder));
+      if (model.runtimeVisible === false) continue;
+      const runtimeFolder = model.runtimeFolder ?? model.folder;
+      if (!modelFolders.has(runtimeFolder)) {
+        modelFolders.set(runtimeFolder, await probeModelFolder(activeTransport, runtimeFolder));
       }
-      if (!modelFolders.get(model.folder)?.includes(model.filename.replace(/\\/g, "/"))) {
+      if (!modelFolders.get(runtimeFolder)?.includes(model.filename.replace(/\\/g, "/"))) {
         return complete(await failJob(
           job.id, attemptId, workerId, jobFencingToken,
           `Required workflow model is no longer available: ${model.folder}/${model.filename}`,
+          "environment_model_drift", true,
+        ));
+      }
+    }
+    if (workflowPackage.manifest.requirements.models.length > 0) {
+      if (workflowPackage.manifest.requirements.models.some((model) => !model.sha256 || !model.sizeBytes)) {
+        return complete(await failJob(
+          job.id, attemptId, workerId, jobFencingToken,
+          "Required workflow models do not have immutable size and SHA-256 identities",
+          "environment_model_inventory_missing", true,
+        ));
+      }
+      const modelsRoot = lifecycle.managedEndpoint?.modelsRoot?.trim()
+        || process.env.AI_M_MANAGED_COMFYUI_MODELS_ROOT?.trim()
+        || (process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT?.trim()
+          ? path.resolve(process.env.AI_M_MANAGED_COMFYUI_DATA_ROOT, "models")
+          : "");
+      if (!modelsRoot) {
+        return complete(await failJob(
+          job.id, attemptId, workerId, jobFencingToken,
+          "Managed ComfyUI data root is unavailable for model integrity verification",
+          "environment_model_inventory_missing", true,
+        ));
+      }
+      try {
+        await verifyRequiredModelFilesCached(
+          path.resolve(modelsRoot),
+          workflowPackage.manifest.requirements.models,
+        );
+      } catch {
+        return complete(await failJob(
+          job.id, attemptId, workerId, jobFencingToken,
+          "Required workflow model bytes drifted from the activated manifest",
           "environment_model_drift", true,
         ));
       }
@@ -342,15 +423,22 @@ export async function executeGenerationJob(
       transport: activeTransport,
       request: { ...defaults, ...request },
       metadata: job.metadataJson as Record<string, unknown>,
-      maxReferenceInputs: workflowPackage.manifest.limits.maxBatch,
+      maxReferenceInputs: workflowPackage.manifest.limits.maxReferenceInputs
+        ?? workflowPackage.manifest.limits.maxBatch,
       signal: executionSignal,
     });
     inputCleanup = materialized.cleanup;
-    const workflow = bindWorkflow(
-      workflowPackage.workflow,
-      workflowPackage.compiled,
-      materialized.parameters,
-      outputPrefix,
+    const workflow = adaptComfyWorkflowRuntimeChoices(
+      bindWorkflow(
+        workflowPackage.workflow,
+        workflowPackage.compiled,
+        materialized.parameters,
+        outputPrefix,
+      ),
+      runtimeObjectInfo,
+      new Set(workflowPackage.compiled.bindings
+        .filter((binding) => binding.source !== "request")
+        .map((binding) => `${binding.nodeId}:${binding.inputName}`)),
     );
 
     const durableCallbacks: ExecutionCallbacks = {
@@ -472,6 +560,8 @@ export async function executeGenerationJob(
           metadata: {
             nodeId: output.nodeId, outputKey: output.outputKey, outputField: output.field,
             mediaKind: output.mediaKind, originalFilename: output.filename,
+            traceId,
+            submissionCorrelationId: correlationId,
           },
           read: () => output.response.body!,
         });
