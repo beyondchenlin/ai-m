@@ -32,7 +32,6 @@
 
 ```powershell
 $env:WORKFLOW_PACKAGE_DIR="D:\workflows\indextts2"
-$env:WORKFLOW_IMPORTER_ID="admin-importer"
 $env:PROFILE_KEY="speech.indextts2.clone"
 $env:PROFILE_DISPLAY_NAME="IndexTTS2 声音克隆"
 $env:EXECUTION_BACKEND_ID="你的声音后端ID"
@@ -48,11 +47,12 @@ $env:CONFIRM_WORKFLOW_DIGEST=$env:WORKFLOW_DIGEST
 $env:CONFIRM_ENVIRONMENT_LOCK_DIGEST="包锁中的环境摘要"
 $env:EXECUTION_BACKEND_ID="你的声音后端ID"
 $env:PROFILE_REVISION_ID="导入输出的配置修订ID"
-$env:WORKFLOW_REVIEWER_ID="另一位审核者"
 $env:ENABLE_BACKEND="true"
 $env:SET_DEFAULT_CAPABILITY="speech"
 pnpm workflow:promote
 ```
+
+导入人和审查人身份均从当前 Windows 登录令牌读取，不接受可自填的身份环境变量。晋级需要两个不同 Windows SID（安全标识符）的审查人，且导入者不能参与审批；同一账号重复执行只计一次。
 
 ## 共享输入目录
 

@@ -1,0 +1,55 @@
+{
+  "tts-index2": {
+    "text": "This is a controlled synthetic reference validation for the single endpoint."
+  },
+  "tts-index2-8g": {
+    "text": "This is the low memory controlled validation run."
+  },
+  "tts-omnivoice-longform-bf16": {
+    "text": "This long form validation confirms that audio output can be committed before the backend restarts.",
+    "referenceText": "This is a synthetic system voice used only for validation.",
+    "speed": 1
+  },
+  "tts-omnivoice-clone-duration-bf16": {
+    "text": "Controlled duration validation.",
+    "referenceText": "This is a synthetic system voice used only for validation.",
+    "speed": 1,
+    "duration": 4
+  },
+  "image-z-image-turbo": {
+    "prompt": "A simple red cube on a neutral studio background, validation image.",
+    "width": 512,
+    "height": 512,
+    "seed": 20260719
+  },
+  "image-z-image-base-bf16": {
+    "prompt": "A simple blue cube on a neutral studio background, validation image.",
+    "width": 512,
+    "height": 512,
+    "seed": 20260719
+  },
+  "image-z-image-turbo-gguf-q4": {
+    "prompt": "A simple green cube on a neutral studio background, validation image.",
+    "width": 512,
+    "height": 512,
+    "seed": 20260719
+  },
+  "image-z-image-turbo-gguf-q8": {
+    "prompt": "A simple yellow cube on a neutral studio background, validation image.",
+    "width": 512,
+    "height": 512,
+    "seed": 20260719
+  },
+  "image-qwen-edit-2511-gguf-q4": {
+    "prompt": "Keep the subject identity and change the background to a neutral studio.",
+    "seed": 20260719,
+    "steps": 4,
+    "cfg": 1
+  },
+  "video-wan2.1-fusionx": {
+    "prompt": "A red cube slowly rotates on a neutral studio background.",
+    "width": 512,
+    "height": 288,
+    "seed": 20260719
+  }
+}

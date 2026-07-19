@@ -1,6 +1,15 @@
 # AI Comic Builder
 
+本地图片、视频和语音工作流的最新接入状态、精确路由设计与完整验收标准见
+[本地工作流接入现状、运行设计与验收标准](docs/local-comfyui-workflow-integration-current.md)。
+
+[本地 ComfyUI 工作流接入说明与完整验收标准](docs/local-comfyui-workflow-integration.md)
+
+当前剩余开发工作、完整验收标准和最终 Go/No-Go 判定统一见 [docs/remaining-work-development-and-acceptance-plan.md](docs/remaining-work-development-and-acceptance-plan.md)，当前代码/测试与旧计划的逐项对齐见 [docs/remaining-work-status-matrix.md](docs/remaining-work-status-matrix.md)，十八类故障的执行标准见 [docs/fault-injection-acceptance-matrix.md](docs/fault-injection-acceptance-matrix.md)，第一轮双独立审查与处置状态见 [docs/reviews/2026-07-19-first-round-adversarial-review.md](docs/reviews/2026-07-19-first-round-adversarial-review.md)。旧计划的勾选状态不单独作为完成证明。
+
 Pixelle 单端口 ComfyUI 的当前代际盘点、真实验证、整体重启与重连流程见 [docs/comfyui-single-endpoint/README.md](docs/comfyui-single-endpoint/README.md)。`workflow:verify:pixelle-single` 默认仅执行 inventory，不会提交任务或重启后端。
+
+工作流晋级采用双人审批：同一不可变包和同一后端环境必须由两名不同、且均非导入者的实名 reviewer 分别运行 `workflow:promote`，第一轮状态为 `reviewed`，第二轮才变为 `active`。撤销使用 `workflow:revoke`，必须同时提供精确 digest 确认、实名操作者和原因；撤销保留历史任务、工件和审批证据。
 
 
 社区交流：[https://linux.do/](https://linux.do/)

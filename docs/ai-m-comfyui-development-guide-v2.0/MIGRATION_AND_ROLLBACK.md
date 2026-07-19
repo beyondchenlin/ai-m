@@ -118,6 +118,26 @@
 
 # 10. 回滚演练
 
+回滚代码前后必须在停止所有写入的维护窗口分别执行保护快照和验证：
+
+```powershell
+$env:AI_M_ROLLBACK_MAINTENANCE_CONFIRM = 'WRITERS-STOPPED'
+$env:AI_M_ROLLBACK_REHEARSAL_MODE = 'capture'
+$env:AI_M_BUILD_COMMIT = '<candidate-git-sha>'
+$env:AI_M_ROLLBACK_ARTIFACT_ROOT = '<restored-generation-artifacts-root>'
+$env:AI_M_ROLLBACK_MANIFEST_PATH = '<isolated-evidence-root>\rollback-preservation.json'
+corepack pnpm ops:rollback:preservation
+
+# 在隔离副本部署回滚版本并执行读取兼容检查，仍保持停止写入。
+$env:AI_M_ROLLBACK_REHEARSAL_MODE = 'verify'
+corepack pnpm ops:rollback:preservation
+```
+
+验证器要求迁移 journal 完全不变、14 张安全/任务/工件表及其列仍存在、
+受保护表行数不减少，且演练前存在的全部工件大小和 SHA-256 不变。任何
+down-migration、删列、删行、工件修改或删除均使演练失败；manifest 使用
+候选 SHA 和内容摘要绑定，并以 `wx` 创建，禁止覆盖既有证据。
+
 - 新配置发布后回到旧云端；
 - 工作进程升级失败后使用旧工作进程读取新任务；
 - 数据库迁移中断；
@@ -135,4 +155,4 @@
 - [ ] 原漫剧回归通过；
 - [ ] 回滚演练有记录；
 - [ ] 旧写路径已停止；
-- [ ] 破坏性清理尚未提前执行。
+- [x] 破坏性清理由 `ops:rollback:preservation` 显式守卫，专项负向测试覆盖 down-migration、删行和工件篡改；

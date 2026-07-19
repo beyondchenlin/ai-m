@@ -1,7 +1,7 @@
 # `ai-m`（当前二开项目）本地工作流平台实施检查表
 
 **版本：** 2.0  
-**更新日期：** 2026-07-13  
+**更新日期：** 2026-07-19
 **使用方式：** 每张拉取请求逐项勾选，并在描述中附测试或审计证据。  
 **标记说明：** `[x]` 已完成 `[~]` 部分完成 `[ ]` 未完成
 
@@ -20,30 +20,30 @@
 - [x] 后端只由管理员登记 — `/api/admin/backends` 路由需功能开关
 - [x] 密钥只保存引用 — `keyReferences` 表存储密钥引用
 - [x] 普通接口不回显密钥 — GET 返回 `maskKey()` 脱敏预览，`sanitizeForLog()` 过滤
-- [x] 请求和错误日志不记录认证头 — `audit.ts` 的 `sanitizeForLog()` 过滤敏感键
-- [ ] 浏览器旧密钥迁移有安全流程 — 未发现迁移脚本或流程代码
+- [x] 请求和错误日志不记录认证头 — `audit.ts` 仅允许固定审计字段；后端认证响应只投影 `keyRefId/headerName`
+- [x] 浏览器旧密钥迁移有安全流程 — model-store hydration 清理 local/session storage 密钥、写入无敏感值迁移标记，后续密钥仅保存在内存
 - [x] 后端地址执行解析地址和网段校验 — `network-policy.ts` 的 `validateBackendUrl()`
 - [x] 禁止重定向 — `network-policy.ts` 的 `noRedirectFetchOptions()` 返回 `redirect: "manual"`
 - [x] 局域网后端使用传输加密和认证 — `executionBackends` 表有 `authType`、`tlsConfigJson` 字段
 
 # C. 工作流供应链
 
-- [ ] 上传进入隔离区 — `validator.ts` 直接验证，未见明确隔离区目录
+- [x] 上传进入隔离区 — `workflow-package-storage.ts` 将普通文件树限额复制到独立 quarantine，复核逐文件大小/摘要后才允许验证和发布
 - [x] 解包有限额和路径检查 — `validator.ts` 的 `DEFAULT_CONSTRAINTS` 限制节点数、包大小，`applyStaticPolicy()` 检查路径遍历
 - [x] 结构约束拒绝未知字段 — `validateWorkflowStructure()` 检查 `allowedNodeClasses`、`maxNodeClasses`
-- [ ] 语义选择器必须唯一 — 未见语义选择器唯一性校验代码
+- [x] 语义选择器必须唯一 — `compileWorkflowBindings()` 对通用包和 Pixelle 包的每个 binding/output 均要求恰好命中一个节点
 - [x] 编译计划绑定工作流摘要 — `validator.ts` 计算 `digest` 和 `workflowSha256`
 - [x] 自定义节点固定提交摘要 — `packageLockJson` 字段存储锁定信息
 - [x] 平台安全策略独立 — `WorkflowStaticPolicy` 接口独立定义
-- [ ] 冒烟测试在隔离后端 — `examples/fixtures/` 存在但未见自动化冒烟测试
-- [ ] 双人审查 — `workflowPackageRevisions` 有 `reviewedBy` 字段但未见审查流程实现
-- [ ] 发布目录只读 — 未见发布目录权限控制代码
-- [ ] 撤销机制可用 — `naming.ts` 有 `REVOKED` 状态但未见撤销 API 实现
+- [~] 冒烟测试在隔离后端 — `verify-single-comfyui.test.ts` 已用本地假后端覆盖提交、下载、重启和重连；真实隔离设备验收尚未完成
+- [x] 双人审查 — 0067 不可变审批表；身份从 Windows 登录令牌 SID（安全标识符）导出且不可自填，导入者不可自审，同一后端环境需两个不同 SID（安全标识符）才能激活
+- [x] 发布目录只读 — 发布仅允许 quarantine 直属子目录原子移动；文件/目录写位清除并递归复核，Pixelle 已验证代际在导入前同样执行只读保护
+- [x] 撤销机制可用 — `workflow:revoke` 原子撤销包、禁用关联 profile、删除默认指针并保留审批和历史任务
 
 # D. 环境验证
 
 - [x] 记录引擎、运行时、加速后端和节点摘要 — `comfyui-behavior-probe.ts` 的 `probeBackendFeatures()`
-- [ ] 模型记录大小和摘要 — 未见模型文件大小和摘要记录代码
+- [x] 模型记录大小和摘要 — prepare 以稳定文件句柄流式记录 size/SHA-256 并绑定 generation；晋级和每次执行均复核，任一漂移 fail closed
 - [x] 环境变化使验证过期 — `comfyui-behavior-probe.ts` 的 `checkEnvironmentDrift()`
 - [x] 节点信息缓存按环境指纹 — `BackendFeatureSnapshot` 包含 `environmentFingerprint`
 - [x] 客户端任务编号经过行为探测 — `probeExternalIdStrategy()` 探测策略
@@ -58,7 +58,7 @@
 - [x] 所有关键写入检查令牌 — `renewJobClaim()`、`releaseJobClaim()`、`renewResourceSlot()` 均校验
 - [x] 心跳和租约时长合理 — `LEASE_CONFIG` 定义合理参数
 - [x] 失去租约后工作器停止写入 — `src/worker/index.ts` 心跳失败时安全退出
-- [ ] 项目配额和公平性 — 未见项目级配额或公平调度代码
+- [x] 项目配额和公平性 — `claimJob()` 原子执行项目并发上限、低占用项目优先和可配置饥饿上限，并有并发测试
 - [x] 数据库事务短 — 所有数据库操作为单条 SQL，无长事务
 
 # F. 提交、恢复和重试
@@ -72,7 +72,7 @@
 - [x] 收集失败只重试收集 — `classifySubmissionError()` 区分 `retryScope`
 - [x] 提交失败只重试提交 — `RetryMode` 类型区分重试范围
 - [x] 错误分类决定重试 — `ErrorClass` 枚举和 `classifySubmissionError()` 实现分类
-- [ ] 已有工件阻止模型重跑 — 未见明确检查已提交工件阻止重跑的逻辑
+- [x] 已有工件阻止模型重跑 — `orchestrator-integration.test.ts` 验证已接受但响应异常的提交只进入对账且不重新提交，Worker finalization 只选择已提交工件
 
 # G. 取消
 
@@ -97,11 +97,11 @@
 
 # I. 媒体输入输出
 
-- [ ] 输入权限校验 — 未见明确的输入权限校验中间件
+- [x] 输入权限校验 — `input-access.ts` 集中校验 source/generated artifact 的 committed、project、owner 边界并由 job/voice 两条输入链复用；voice profile 与 artifact 下载继续执行 user/project 复核，跨项目/跨用户测试 fail closed
 - [x] 任务专用暂存 — `commit.ts` 使用 `data/task-staging/{attemptId}` 目录
-- [ ] 执行后端不挂载完整上传目录 — 未见部署配置或挂载控制代码
-- [ ] 通用任务暂存卷不直接挂载给推理实例 — 未见部署配置
-- [ ] 后端摄取目录只含当前安全租户或当前资源槽任务 — 未见租户隔离目录代码
+- [~] 执行后端不挂载完整上传目录 — 托管配置要求独立 DataRoot；真实参数已指向专用 input/output/user，但后端与应用仍为同一 SID（安全标识符），宽泛访问控制下仍可读取上传目录
+- [~] 通用任务暂存卷不直接挂载给推理实例 — DataRoot 与通用 supply-chain、Pixelle staging 互不嵌套且配置 fail closed；操作系统访问控制尚未证明推理身份读取被拒绝
+- [~] 后端摄取目录只含当前安全租户或当前资源槽任务 — 代码只允许 `ai-m/<currentJob>/<currentAttempt>` 并拒绝其他文件/目录/链接；尚未在独立低权限服务身份下完成真实应用任务链
 - [x] 输出流式 — `streamCommitArtifact()` 实现流式读写
 - [x] 字节、像素、时长和数量限制 — `parameter-normalization.ts` 和 `content-detection.ts`
 - [x] 魔数和安全解码 — `content-detection.ts` 的 `detectMimeType()` 和 `validateMagicBytes()`
@@ -133,39 +133,39 @@
 
 - [x] 旧流程特征测试 — `regression-baseline.test.ts` 覆盖旧供应商协议映射、Legacy 配置解析等
 - [x] 单元测试 — `pr06-archiving.test.ts`、`pr05-transport.test.ts`、`regression-baseline.test.ts`
-- [ ] 结构约束测试 — `validator.ts` 实现了约束检查但无专门测试
-- [ ] 假后端集成测试 — 未见 mock/fake backend 测试
-- [ ] 提交不确定测试 — 未见 `SUBMISSION_UNKNOWN` 专门测试
-- [ ] 工作器终止测试 — Worker 实现了优雅关闭但无专门测试
-- [ ] 租约竞态测试 — 未见 lease race condition 专门测试
-- [ ] 磁盘满测试 — 未见 disk full 专门测试
-- [ ] 大文件测试 — 未见 large file 专门测试
-- [ ] 服务端请求伪造测试 — `network-policy.ts` 实现 SSRF 防护但无专门测试
-- [ ] 越权工件测试 — `commit.ts` 实现访问控制但无专门测试
+- [x] 结构约束测试 — `workflows/__tests__/validator.test.ts` 覆盖空图、节点/类上限、allowlist、畸形节点图、路径和环境漂移
+- [x] 假后端集成测试 — `verify-single-comfyui.test.ts` 和 `orchestrator-integration.test.ts` 覆盖提交、完成、下载、重启、重连及失败清理
+- [x] 提交不确定测试 — `orchestrator-integration.test.ts` 覆盖响应丢失后对账和证据不足升级人工处理
+- [x] 工作器终止测试 — `worker/__tests__/index.test.ts` 覆盖 SIGINT、SIGTERM、shutdown 后释放新 claim 和续租失败
+- [x] 租约竞态测试 — `leases.test.ts`、`slot-reconciliation-concurrency.test.ts` 和 job/artifact recovery concurrency 测试覆盖多连接与多进程竞态
+- [x] 磁盘满测试 — `commit.test.ts` 注入真实 `ENOSPC` 写失败，验证有界拒绝、记录进入 QUARANTINED、无发布工件和无残留 staging 文件
+- [x] 大文件测试 — `commit.test.ts` 和 `verify-single-comfyui.test.ts` 覆盖超限流、部分文件清理及禁止发布
+- [x] 服务端请求伪造测试 — `network-policy.test.ts`、WebSocket policy 和 deadline 测试覆盖元数据地址、解析地址、端口、重定向及 DNS/WS 绕过
+- [x] 越权工件测试 — `commit.test.ts` 覆盖跨用户读取拒绝，artifact route 再次按项目所有权查询
 - [ ] 真实设备验收 — 未见真实设备验收测试
-- [ ] 样例自动校验通过 — 未见样例自动校验机制
+- [x] 样例自动校验通过 — `tools/validate_examples.py` 已接入 `test:validate-examples` 和 `quality:static`，当前基线运行通过
 
 # M. 可观测性与运维
 
-- [~] 统一关联编号 — `contracts/providers.ts` 定义 `traceId` 字段，但无中间件实现传播
-- [~] 阶段耗时指标 — 多个文件记录 `durationMs`，但无统一指标收集系统
-- [~] 提交不确定告警 — `comfyui-reconciliation.ts` 实现判断逻辑，但无告警通知发送
-- [~] 租约失效告警 — Worker 在租约丢失时输出日志，但无告警通知
-- [ ] 环境漂移告警 — 未见环境漂移检测或告警机制
-- [~] 磁盘水位告警 — `disk-cleanup.ts` 实现 `checkDiskUsage`，但无告警通知
-- [~] 日志字段白名单 — `audit.ts` 的 `sanitizeForLog` 为黑名单模式，非白名单
-- [ ] 运维处理不确定任务的页面 — 未见管理员/运维页面
-- [ ] 备份和恢复演练 — 未见备份恢复脚本或演练记录
+- [x] 统一关联编号 — 创建任务时写入可信 `traceId`，attempt 使用 `traceId.attempt-*` 作为提交关联号，输出工件保存二者
+- [x] 阶段耗时指标 — `/api/admin/operations/health` 按 attempt phase 汇总数量、平均耗时和最大耗时，并汇总任务状态
+- [x] 提交不确定告警 — 0068 持久化主动告警；Worker 扫描与运维 API 均刷新，支持证据绑定确认和信号清除后自动恢复
+- [x] 租约失效告警 — 最近 24 小时租约/claim 丢失与过期占用槽位统一触发 critical 告警
+- [x] 环境漂移告警 — 环境/模型漂移与 workflow/backend validation 缺失进入 warning 告警闭环
+- [x] 磁盘水位告警 — 85% warning、95% critical；恢复到阈值下自动 RESOLVED
+- [x] 日志字段白名单 — `audit.ts` 使用显式字段/值类型 allowlist，未知、嵌套和密钥样式字段在持久化前丢弃
+- [x] 运维处理不确定任务的页面 — `/operations` 与 `/api/admin/operations/attention` 仅列出证据安全字段并登记受控原因/证据引用，不允许强制结束或改变任务状态
+- [x] 备份和恢复演练 — `ops:recovery:rehearse` 创建逐文件摘要恢复包，只恢复到全新隔离目录并复核 SQLite integrity、全量文件大小/摘要；当前 85 文件/25,578,737 字节真实演练通过
 
 # N. 发布与回滚
 
 - [x] 功能开关服务端控制 — `feature-flags.ts` 实现完整功能开关机制，支持环境变量控制
-- [ ] 小范围项目灰度 — 未见项目级灰度发布机制
-- [~] 回滚不删除新表和工件 — `MIGRATION_AND_ROLLBACK.md` 文档说明原则，但代码中无显式保护
+- [x] 小范围项目灰度 — `isEnabledForProject()` 要求全局开关启用并支持精确项目 allowlist；空值、畸形、超限配置 fail closed，任务服务及本地图片/语音入口统一执行
+- [x] 回滚不删除新表和工件 — `ops:rollback:preservation` 在维护窗口前后核对迁移日志、15 张保护表的列、主键、逐行摘要和全部既有工件摘要；降级迁移、删行或篡改均失败
 - [x] 默认配置可回退 — 多个模块有 `DEFAULT_*` 常量支持配置回退
 - [x] 运行中任务有排空方案 — `src/worker/index.ts` 实现 `gracefulShutdown` 优雅关闭
-- [ ] 工作流撤销测试 — 未见工作流撤销专门测试
-- [~] 浏览器旧密钥清理 — 有 `legacy-` 前缀检测和迁移文档，但无实际清理代码
+- [x] 工作流撤销测试 — `approval-service.test.ts` 验证撤销阻止新审批、禁用 profile/default 且保留不可变审批
+- [x] 浏览器旧密钥清理 — `purgeLegacyBrowserCredentials()` 清理 local/session storage 并记录无敏感值完成标记
 - [x] 发布后漫剧回归通过 — `regression-baseline.test.ts` 验证旧流程不受影响
 
 ---
@@ -175,26 +175,26 @@
 | 分类 | 已完成 `[x]` | 部分完成 `[~]` | 未完成 `[ ]` | 总计 |
 |------|:---:|:---:|:---:|:---:|
 | A. 架构与责任边界 | 7 | 0 | 0 | 7 |
-| B. 服务端配置和密钥 | 7 | 0 | 1 | 8 |
-| C. 工作流供应链 | 5 | 0 | 6 | 11 |
-| D. 环境验证 | 5 | 0 | 1 | 6 |
-| E. 持久任务和并发 | 8 | 0 | 1 | 9 |
-| F. 提交、恢复和重试 | 9 | 0 | 1 | 10 |
+| B. 服务端配置和密钥 | 8 | 0 | 0 | 8 |
+| C. 工作流供应链 | 10 | 1 | 0 | 11 |
+| D. 环境验证 | 6 | 0 | 0 | 6 |
+| E. 持久任务和并发 | 9 | 0 | 0 | 9 |
+| F. 提交、恢复和重试 | 10 | 0 | 0 | 10 |
 | G. 取消 | 6 | 0 | 0 | 6 |
 | H. 实时连接和轮询 | 9 | 0 | 0 | 9 |
-| I. 媒体输入输出 | 8 | 0 | 4 | 12 |
+| I. 媒体输入输出 | 9 | 3 | 0 | 12 |
 | J. 工件与权限 | 6 | 0 | 0 | 6 |
 | K. Z-Image | 7 | 0 | 0 | 7 |
-| L. 测试与质量 | 2 | 0 | 11 | 13 |
-| M. 可观测性与运维 | 0 | 6 | 3 | 9 |
-| N. 发布与回滚 | 4 | 2 | 2 | 8 |
-| **合计** | **83** | **8** | **31** | **121** |
+| L. 测试与质量 | 12 | 0 | 1 | 13 |
+| M. 可观测性与运维 | 9 | 0 | 0 | 9 |
+| N. 发布与回滚 | 8 | 0 | 0 | 8 |
+| **合计** | **116** | **4** | **1** | **121** |
 
-**完成率：68.6% 已完成，6.6% 部分完成，25.6% 未完成**
+**完成率：95.9% 已完成，3.3% 部分完成，0.8% 未完成**
 
 ### 主要缺口
 
-1. **测试与质量（L）**：11/13 未完成，是最大短板
-2. **工作流供应链（C）**：隔离区、语义选择器唯一性、冒烟测试、双人审查、发布目录只读、撤销机制
-3. **媒体输入输出（I）**：输入权限校验、部署配置相关项（3 项为部署拓扑约束）
-4. **可观测性（M）**：有基础逻辑但缺告警通知和运维页面
+1. **工作流供应链（C）**：代码侧隔离、只读发布、选择器、双人审查和撤销已闭环；仅真实隔离后端冒烟待设备验收
+2. **媒体输入输出（I）**：代码守卫已完成；真实部署仍须提供操作系统访问控制、挂载和进程可见性证据
+3. **可观测性（M）**：统一关联号、阶段指标、四类主动告警、证据确认、自动恢复和备份恢复演练均已通过代码侧验收
+4. **测试与质量（L）**：磁盘满故障测试已完成；仍缺六包真实设备、十八类故障注入和实际回滚证据

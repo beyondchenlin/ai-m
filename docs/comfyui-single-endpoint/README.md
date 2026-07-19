@@ -1,5 +1,9 @@
 # Pixelle 单端口 ComfyUI 工作流准备
 
+> 当前剩余工作、十包强制验收、故障注入、证据格式和最终放行判定统一见 [`../remaining-work-development-and-acceptance-plan.md`](../remaining-work-development-and-acceptance-plan.md)。本文保留具体命令和单端口安全操作约束。
+
+部署挂载与摄取根的代码/dry-run 验收见[部署隔离验收记录](deployment-isolation-attestation.md)。
+
 ## Task 4：单端口盘点、执行、整体重启和重连
 
 验证器只接受 `http://127.0.0.1:8000`，只读取 `PIXELLE_WORKFLOW_STAGING_DIR/current.json` 指向的当前内容寻址代际，并只调用 Pixelle 固定的 `scripts/comfyui/stop_backend.ps1` 与 `start_backend.ps1`。它不会 import、promote 或 enable 工作流。
@@ -9,7 +13,9 @@
 ```powershell
 $env:PIXELLE_ROOT = 'D:\demo1\Pixelle\Pixelle'
 $env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-single'
-$env:AI_M_MANAGED_COMFYUI_DATA_ROOT = 'E:\ComfyUIData'
+$env:AI_M_MANAGED_COMFYUI_DATA_ROOT = 'E:\ComfyUIData-ai-m'
+$env:AI_M_MANAGED_COMFYUI_MODELS_ROOT = 'E:\ComfyUIData\models'
+$env:AI_M_COMFYUI_SHARED_INPUT_ROOT = 'E:\ComfyUIData-ai-m\input'
 $env:AI_M_MANAGED_COMFYUI_ROOT = 'E:\comfyui\resources\ComfyUI'
 $env:AI_M_MANAGED_COMFYUI_PYTHON_EXE = 'E:\ComfyUIData\.venv\Scripts\python.exe'
 $env:AI_M_MANAGED_COMFYUI_BASE_URL = 'http://127.0.0.1:8000'
@@ -19,13 +25,16 @@ $env:TASK4_MODE = 'inventory-only'
 corepack pnpm workflow:verify:pixelle-single
 ```
 
-真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包。每个包都执行：submit 前持久化 restart-required marker、限时轮询 history、流式限额下载并 fsync 临时归档、关闭旧连接、停止并启动整个 8000 后端、确认 PID/process creation/connection identity 全部变化、重新探测并收集 evidence 事实。上一包的 `restart.after` 必须精确等于下一包的 `listener.before`；六包全部通过后，CLI 使用同一个新鲜 `issuedAt` 对全部 evidence 重新签名，默认有效期为 1 小时且绝不允许超过 24 小时。运行窗口到 `expiresAt` 超过 24 小时会 fail closed。CLI 随后在当前时间严格重验磁盘上的全部 evidence，把最后一包 `restart.after` 记录为最终 endpoint，再一次原子 rename 发布整个 committed set：
+真实验证需要提供按 package 名分组的 JSON 参数文件；语音包还需要一个受控 WAV 文件。只有显式确认精确令牌后，CLI 才会顺序执行当前代际的包。每个包都执行：submit 前持久化 restart-required marker、限时轮询 history、流式限额下载并 fsync 临时归档、关闭旧连接、停止并启动整个 8000 后端、确认 PID/process creation/connection identity 全部变化、重新探测并收集 evidence 事实。上一包的 `restart.after` 必须精确等于下一包的 `listener.before`；十包全部通过后，CLI 使用同一个新鲜 `issuedAt` 对全部 evidence 重新签名，默认有效期为 1 小时且绝不允许超过 24 小时。运行窗口到 `expiresAt` 超过 24 小时会 fail closed。CLI 随后在当前时间严格重验磁盘上的全部 evidence，把最后一包 `restart.after` 记录为最终 endpoint，再一次原子 rename 发布整个 committed set：
+
+可复制的十包参数基线见 [`task4-parameters.example.json`](task4-parameters.example.json)。语音参考必须是明确获准的声音，或像本轮准备项一样使用本机系统合成语音，不能擅自使用真实人员录音。
 
 ```powershell
 $env:TASK4_MODE = 'verify'
 $env:TASK4_CONFIRM_RESTART = 'RESTART-127.0.0.1:8000'
 $env:TASK4_PARAMETERS_FILE = 'D:\task4\parameters.json'
 $env:TASK4_REFERENCE_AUDIO_FILE = 'D:\task4\controlled-reference.wav'
+$env:TASK4_REFERENCE_IMAGE_FILES_JSON = '["D:\\task4\\reference-a.png","D:\\task4\\reference-b.png"]'
 $env:TASK4_COMMITTED_DIR = 'D:\task4\committed-generation'
 corepack pnpm workflow:verify:pixelle-single
 ```
@@ -34,7 +43,7 @@ corepack pnpm workflow:verify:pixelle-single
 
 如果 stop/start 或重连 readiness 结果不确定，CLI 会保留 `PIXELLE_WORKFLOW_STAGING_DIR/task4-restart-blocked.json` 并拒绝后续运行。操作员必须先从系统外部核对 8000 listener、PID、启动时间及健康探测，再用当前 generation digest 明确解除；例如 `$env:TASK4_RECOVERY_CONFIRM = 'RECOVER-<generationDigest>'`。恢复流程会再次建立新 WebSocket、核对 OS listener 并执行两项 readiness probe，全部成功后才删除 marker。
 
-整个 recovery、连接、六包运行、重启和 committed 发布都先取得 staging 共用的 identity-bound `prepare.lock`，再取得 `task4.lock`，并按相反顺序释放。固定顺序避免死锁，也让 prepare/GC 与 Task 4 互斥。两把锁覆盖锁内读取 `current.json`、六包执行和最终 committed 发布；签名和发布前都会再次确认 current digest 未切换。prepare、GC 与 Task 4 共用同一个 boot-session/process-creation identity 和 process-liveness 实现。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；旧 Task 4 的 Windows epoch-ms identity 会按其毫秒精度与新 identity 比较，新格式之间仍按完整 100ns 精度比较。不可识别的旧 schema 2 identity 在 owner 存活时 fail closed 并要求人工审计。PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复。
+整个 recovery、连接、十包运行、重启和 committed 发布都先取得 staging 共用的 identity-bound `prepare.lock`，再取得 `task4.lock`，并按相反顺序释放。固定顺序避免死锁，也让 prepare/GC 与 Task 4 互斥。两把锁覆盖锁内读取 `current.json`、十包执行和最终 committed 发布；签名和发布前都会再次确认 current digest 未切换。prepare、GC 与 Task 4 共用同一个 boot-session/process-creation identity 和 process-liveness 实现。锁记录使用 schema 2 的 PID、process identity、随机 token 与开始时间；旧 Task 4 的 Windows epoch-ms identity 会按其毫秒精度与新 identity 比较，新格式之间仍按完整 100ns 精度比较。不可识别的旧 schema 2 identity 在 owner 存活时 fail closed 并要求人工审计。PID 复用或陈旧锁只有在旧身份明确不同/不存在时才隔离恢复。
 
 本阶段只从只读目录 `D:\demo1\Pixelle\Pixelle\workflows\selfhost` 准备六个候选包，统一面向 `http://127.0.0.1:8000`。结果始终是 `prepared-environment-unverified`：prepare 不探测 ComfyUI、不写数据库、不创建 profile，也不执行 import、promote 或 enable。
 
@@ -47,7 +56,7 @@ $env:PIXELLE_WORKFLOW_STAGING_DIR = 'D:\demo1\ai-m-workflow-staging\pixelle-sing
 corepack pnpm workflow:prepare:pixelle-single
 ```
 
-首次运行会创建带 ownership marker 的 staging 根目录。以后每次运行都先取得跨进程 `prepare.lock`，对六个源文件建立同一快照，再在带 token marker 的临时目录中写完并逐字节校验全部包。内容摘要确定后，目录原子改名为 `generations/<generationDigest>`，最后只原子更新 `current.json` 指针。
+首次运行会创建带 ownership marker 的 staging 根目录。以后每次运行都先取得跨进程 `prepare.lock`，对九个唯一源工作流建立同一快照，再在带 token marker 的临时目录中写完并逐字节校验全部十个包。两个量化包共享同一份源工作流，因此源工作流数不是内容包数。内容摘要确定后，目录原子改名为 `generations/<generationDigest>`，最后只原子更新 `current.json` 指针。
 
 相同输入会复用同一代际；输入变化会增加新代际，旧代际不会删除或覆盖。崩溃留下的、可识别的 `.tmp-generation-*` 会被报告为 orphan，不会自动递归清理。已有 unmanaged 目录、危险路径、symlink/junction、异常 lock 或无法确认归属的临时内容都会拒绝处理。
 
@@ -57,13 +66,17 @@ prepare lock 使用 schema 2，同时绑定 PID、process identity（系统 boot
 
 默认保护阈值为 32 个 generations、16 个 temp orphans、4 GiB staging 字节和 256 MiB 磁盘低水位。超过任一 generation/orphan/byte/free-space 限制都会停止发布，旧代际不会被自动删除。
 
-每个代际包含六个包：
+每个代际包含十个包：
 
 - `tts-index2`
 - `tts-index2-8g`
 - `tts-omnivoice-longform-bf16`
 - `tts-omnivoice-clone-duration-bf16`
 - `image-z-image-turbo`
+- `image-z-image-base-bf16`
+- `image-z-image-turbo-gguf-q4`
+- `image-z-image-turbo-gguf-q8`
+- `image-qwen-edit-2511-gguf-q4`
 - `video-wan2.1-fusionx`
 
 每个包包含 `workflow.api.json`、`manifest.json`、`compiled-bindings.json` 和 `package.lock.json`。CLI 和包内不输出本机绝对 staging 路径；输出的 requirements 只是后续验证清单，不代表当前 ComfyUI 已满足要求。
@@ -100,7 +113,6 @@ $env:WORKFLOW_PACKAGE_NAME = 'tts-index2'
 $env:EXPECTED_GENERATION_DIGEST = '<generationDigest>'
 $env:EXPECTED_PACKAGE_DIGEST = '<packageDigest>'
 $env:TASK4_VERIFIED_EVIDENCE_FILE = 'D:\task4\committed-generation\evidence\tts-index2.json'
-$env:WORKFLOW_IMPORTER_ID = 'local-importer'
 $env:PROFILE_KEY = 'pixelle.tts.index2.local'
 $env:PROFILE_DISPLAY_NAME = 'Pixelle IndexTTS2 Local'
 $env:EXECUTION_BACKEND_ID = '<8000 后端数据库 ID>'
@@ -110,6 +122,8 @@ $logDir = "$env:PIXELLE_WORKFLOW_STAGING_DIR\logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 corepack pnpm workflow:import:verified-generation | Tee-Object -FilePath (Join-Path $logDir 'import-tts-index2.log')
 ```
+
+导入身份不再接受环境变量；命令会从当前 Windows 登录令牌读取 SID（安全标识符）并写入来源记录。后续两次晋级审批必须分别由两个不同的 Windows SID（安全标识符）执行，且都不得与导入者相同。
 
 通用 `workflow:import` 与 `WORKFLOW_PACKAGE_DIR` 继续兼容既有非 Pixelle 工作流；它不是 Pixelle verified-generation 入口，不得用于绕过上面的 Task 4 证据要求。
 

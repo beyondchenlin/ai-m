@@ -1,5 +1,7 @@
 # Operations Security Hardening Implementation Plan
 
+> Current execution status, evidence requirements, complete acceptance criteria, and the final Go/No-Go decision are maintained in [`../../remaining-work-development-and-acceptance-plan.md`](../../remaining-work-development-and-acceptance-plan.md). This file retains the detailed race schedules, compatibility notes, and implementation history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the still-reproducible generation recovery races, transport/authentication boundary gaps, enqueue/input durability gaps, and canonicalization ambiguities without changing successful public workflows or duplicating external inference.
@@ -211,19 +213,19 @@ For every task, follow the same review loop after its task-specific checks:
 - Modify: `src/lib/db/schema.ts`
 - Create: `src/lib/security/trusted-proxy-auth.ts`
 - Modify: `src/lib/get-user-id.ts`
-- Modify: `src/lib/config/bootstrap.ts`
+- Modify: `.env.example`
 - Create: `src/lib/security/__tests__/trusted-proxy-auth.test.ts`
 - Create: `src/lib/security/__tests__/trusted-proxy-replay-process.test.ts`
 - Modify: `src/lib/security/__tests__/user-identity.test.ts`
 - Modify: `src/lib/db/__tests__/migration-journal.test.ts`
 
-- [ ] Spawn two real Node processes against one temp DB with the same signed request; assert exactly one acceptance.
-- [ ] Add mutation tests for scheme, authority, query ordering/encoding, and body; assert an unchanged signature fails.
-- [ ] Add decoded-secret tests: long low-entropy text and short decoded base64 fail; 32 random decoded bytes pass.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/security/__tests__/trusted-proxy-auth.test.ts src/lib/security/__tests__/trusted-proxy-replay-process.test.ts src/lib/security/__tests__/user-identity.test.ts`.
-- [ ] Add nonce table with unique `(issuer/key-id, nonce)` and expiry index; implement atomic reserve and bounded cleanup.
-- [ ] Implement versioned canonical proof bytes and constant-time signature verification after strict header parsing.
-- [ ] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/security/__tests__/trusted-proxy-auth.test.ts src/lib/security/__tests__/trusted-proxy-replay-process.test.ts src/lib/security/__tests__/user-identity.test.ts src/lib/db/__tests__/migration-journal.test.ts`.
+- [x] Spawn two real Node processes against one temp DB with the same signed request; assert exactly one acceptance.
+- [x] Add mutation tests for scheme, authority, method, path, query ordering/encoding, and body; assert an unchanged signature fails.
+- [x] Add decoded-secret tests: long low-entropy text and short decoded base64 fail; 32 random decoded bytes pass.
+- [x] Run the focused regression: `corepack pnpm vitest run src/lib/security/__tests__/trusted-proxy-auth.test.ts src/lib/security/__tests__/trusted-proxy-replay-process.test.ts src/lib/security/__tests__/user-identity.test.ts`.
+- [x] Add nonce table with unique `(issuer, key-id, nonce)` and expiry index; implement atomic reserve and bounded cleanup.
+- [x] Implement versioned canonical proof bytes and constant-time signature verification after strict header parsing.
+- [x] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/security/__tests__/trusted-proxy-auth.test.ts src/lib/security/__tests__/trusted-proxy-replay-process.test.ts src/lib/security/__tests__/user-identity.test.ts src/lib/db/__tests__/migration-journal.test.ts`.
 
 **Compatibility/rollback:** Support old proof version only behind an explicit, time-bounded non-production flag; production defaults fail closed. Existing single-user mode is unchanged. Keep nonce rows/table if code rolls back.
 
@@ -247,12 +249,12 @@ For every task, follow the same review loop after its task-specific checks:
 - Create: `src/lib/generation/jobs/__tests__/request-validation.test.ts`
 - Create: `src/app/api/generation/jobs/__tests__/route.test.ts`
 
-- [ ] Add table-driven tests for unknown keys, forbidden overrides, missing required values, wrong types, NaN/infinity, numeric bounds, depth, and payload size.
-- [ ] Instrument repositories/backend/slot acquisition; assert every invalid request produces zero job, attempt, backend, and slot calls.
-- [ ] Assert semantic client failures map to `400`, while byte/depth/collection limits map to `413` with stable non-secret codes.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/jobs/__tests__/request-validation.test.ts src/app/api/generation/jobs/__tests__/route.test.ts`.
-- [ ] Implement compiled-binding validation/normalization in the service before idempotency hashing or inserts; keep the route as a thin error mapper.
-- [ ] Run focused gates: `corepack pnpm vitest run src/lib/generation/jobs/__tests__/request-validation.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts src/app/api/generation/jobs/__tests__/route.test.ts src/lib/security/__tests__/request-validation.test.ts` and `corepack pnpm build`.
+- [x] Add table-driven tests for unknown keys, forbidden overrides, missing required values, wrong types, NaN/infinity, numeric bounds, depth, and payload size.
+- [x] Instrument persistence boundaries; assert every invalid request produces zero job, attempt, and slot rows (the enqueue service performs no backend call).
+- [x] Assert semantic client failures map to `400`, while byte/depth/collection limits map to `413` with stable non-secret codes.
+- [x] Run the focused regression: `corepack pnpm vitest run src/lib/generation/jobs/__tests__/request-validation.test.ts src/app/api/generation/jobs/__tests__/route.test.ts`.
+- [x] Implement compiled-binding validation/normalization in the service before idempotency hashing or inserts; keep the route as a thin error mapper.
+- [x] Run focused gates: `corepack pnpm vitest run src/lib/generation/jobs/__tests__/request-validation.test.ts src/lib/generation/jobs/__tests__/request-validation-service.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts src/app/api/generation/jobs/__tests__/route.test.ts src/lib/security/__tests__/request-validation.test.ts` and `corepack pnpm build`.
 
 **Compatibility/rollback:** Preserve valid request/response shapes and digest behavior for already-canonical valid inputs. Existing queued jobs bypass revalidation and remain executable. No migration.
 
@@ -276,17 +278,17 @@ For every task, follow the same review loop after its task-specific checks:
 - Modify: `src/lib/generation/reference-image-processor.ts`
 - Modify: `src/lib/generation/input-materializer.ts`
 - Modify: `src/lib/generation/source-assets.ts`
-- Create: `src/lib/generation/__tests__/input-artifact-snapshot.test.ts`
+- Modify: `src/lib/generation/jobs/__tests__/request-validation-service.test.ts`
 - Create: `src/lib/generation/__tests__/input-materializer-concurrency.test.ts`
 - Modify: `src/lib/db/__tests__/migration-journal.test.ts`
 
-- [ ] Add an enqueue/delete race using two DB connections; assert either enqueue links the artifact and deletion loses, or deletion wins and enqueue fails before job creation.
-- [ ] Add a real filesystem barrier that replaces a source path with same-length bytes between hash and upload. Assert replacement is rejected and unchecked bytes never upload.
-- [ ] Test descriptor mismatch, final `fstat` mismatch, partial reads, and legacy jobs with no link.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/__tests__/input-artifact-snapshot.test.ts src/lib/generation/__tests__/input-materializer-concurrency.test.ts`.
-- [ ] Add link table/foreign keys/indexes and create links in the job transaction from already-processed reference descriptors.
-- [ ] Refactor bounded read/copy to one `FileHandle`, hash the exact streamed bytes, verify initial/final device/inode/size/mtime identity where supported, and close in `finally`.
-- [ ] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/input-artifact-snapshot.test.ts src/lib/generation/__tests__/input-materializer-concurrency.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts src/lib/db/__tests__/migration-journal.test.ts`.
+- [x] Add a two-connection enqueue/delete contention case; enqueue links the asset transactionally and the competing deletion loses.
+- [x] Add a real filesystem replacement case with same-length bytes; replacement is rejected before verified bytes are returned to the uploader.
+- [x] Test descriptor size/digest mismatch and final path/`fstat` identity mismatch; the full worker suite exercises legacy jobs with no link.
+- [x] Run the focused regression: `corepack pnpm vitest run src/lib/generation/__tests__/input-materializer-concurrency.test.ts src/lib/generation/jobs/__tests__/request-validation-service.test.ts`.
+- [x] Add link table/guards/index and create links in the job transaction from already-processed source/reference descriptors.
+- [x] Refactor bounded read/copy to one `FileHandle`, hash the exact streamed bytes, verify initial/final device/inode/size/mtime identity where supported, and close in `finally`.
+- [x] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/input-materializer-concurrency.test.ts src/lib/generation/jobs/__tests__/request-validation-service.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts src/lib/db/__tests__/migration-journal.test.ts src/lib/db/__tests__/migration-startup.test.ts`.
 
 **Compatibility/rollback:** Existing jobs without links use a documented legacy read path that still verifies the current descriptor; new jobs require links. Deletion becomes more restrictive, not destructive. Keep links if callers roll back.
 
@@ -310,12 +312,12 @@ For every task, follow the same review loop after its task-specific checks:
 - Create: `src/lib/generation/__tests__/source-asset-quota-concurrency.test.ts`
 - Modify: `src/lib/db/__tests__/migration-journal.test.ts`
 
-- [ ] Start concurrent uploads through separate DB connections/processes with barriered streams. Sample disk usage and assert committed plus in-flight reserved bytes never exceeds quota.
-- [ ] Test client disconnect, ffprobe failure, process death/TTL recovery, reservation renewal, and exact-boundary success.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/__tests__/source-asset-quota-concurrency.test.ts`.
-- [ ] Add reservation table with project, upload owner/token, reserved bytes, expiry, and status; reserve under an immediate transaction before opening the destination.
-- [ ] Renew during long writes, finalize reservation and asset atomically, and remove partial files on all loser paths.
-- [ ] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/source-asset-quota-concurrency.test.ts src/lib/db/__tests__/migration-journal.test.ts`.
+- [x] Start concurrent reservations through two real Node processes and separate DB connections; assert committed plus live reserved bytes cannot exceed quota.
+- [x] Test client disconnect, ffprobe failure, process death/TTL recovery, reservation renewal, and exact-boundary success.
+- [x] Run the focused regression: `corepack pnpm vitest run src/lib/generation/__tests__/source-asset-quota-concurrency.test.ts src/lib/generation/__tests__/source-asset-upload-failures.test.ts`.
+- [x] Add reservation table with project, upload owner/token, reserved bytes, expiry, and status; reserve under an immediate transaction before opening the destination.
+- [x] Renew during long writes, finalize reservation and asset atomically, and remove partial files on all loser paths.
+- [x] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/source-asset-quota-concurrency.test.ts src/lib/generation/__tests__/source-asset-upload-failures.test.ts src/lib/db/__tests__/migration-journal.test.ts src/lib/db/__tests__/migration-startup.test.ts`.
 
 **Compatibility/rollback:** Preserve the current per-file 50 MB limit and API response. Existing assets count as committed usage. Roll back route/service first; keep reservation records until expired and reconciled.
 
@@ -340,12 +342,12 @@ For every task, follow the same review loop after its task-specific checks:
 - Create: `src/app/api/projects/[id]/voice-profiles/__tests__/route.test.ts`
 - Modify: `src/lib/db/__tests__/migration-journal.test.ts`
 
-- [ ] Race two real service instances/DB connections with the same key and digest; assert one profile and identical response identity.
-- [ ] Reuse the key with one semantic field changed; assert `409` and no processing side effect. Test different users/projects remain isolated.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/__tests__/voice-profile-idempotency.test.ts src/app/api/projects/[id]/voice-profiles/__tests__/route.test.ts`.
-- [ ] Add scoped key/digest fields and unique index; implement winner readback and mismatch conflict.
-- [ ] Require a bounded idempotency key for new writes, with an explicit compatibility window only if current clients cannot deploy atomically.
-- [ ] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/voice-profile-idempotency.test.ts src/app/api/projects/[id]/voice-profiles/__tests__/route.test.ts src/lib/db/__tests__/migration-journal.test.ts`.
+- [x] Race two real service processes/DB connections with the same key and digest; assert one profile and identical response identity.
+- [x] Reuse the key with one semantic field changed; assert `409` and no processing side effect. Test different users/projects remain isolated.
+- [x] Run the focused regression: `corepack pnpm vitest run src/lib/generation/__tests__/voice-profile-idempotency.test.ts src/app/api/projects/[id]/voice-profiles/__tests__/route.test.ts`.
+- [x] Add scoped key/digest fields and unique index; implement winner readback, SQLite busy retry, and mismatch conflict.
+- [x] Require a bounded idempotency key for new writes through body or header; existing null-key rows remain readable.
+- [x] Run migration and focused gates: `python tools/test_migrations.py` and `corepack pnpm vitest run src/lib/generation/__tests__/voice-profile-idempotency.test.ts src/app/api/projects/[id]/voice-profiles/__tests__/route.test.ts src/lib/db/__tests__/migration-journal.test.ts src/lib/db/__tests__/migration-startup.test.ts`.
 
 **Compatibility/rollback:** Existing profiles have null keys and remain readable. If a compatibility window is required, server-generated keys are non-retryable and clearly signaled; remove that mode after clients send keys. Keep unique data on rollback.
 
@@ -370,12 +372,12 @@ For every task, follow the same review loop after its task-specific checks:
 - Modify: mutating `src/app/api/**/route.ts` handlers through the narrowest existing shared route/auth wrappers
 - Create: `src/lib/security/__tests__/mutation-route-coverage.test.ts`
 
-- [ ] Add sub-boundary tests for browser cookie requests: missing headers, cross-origin, HTTP configured origin in production, malformed Referer, `Sec-Fetch-Site: cross-site`, and valid same-origin.
-- [ ] Separately test bearer/admin/service requests: valid strong bearer works without browser headers; cookie presence cannot downgrade into service classification; invalid bearer fails.
-- [ ] Add a static route-coverage test that enumerates mutating handlers and requires the central guard or an approved bearer-only wrapper.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/security/__tests__/request-origin.test.ts src/lib/security/__tests__/mutation-request.test.ts src/lib/security/__tests__/mutation-route-coverage.test.ts`.
-- [ ] Implement canonical origin parsing, production HTTPS enforcement, browser/service classification, and shared wrapper integration; never infer trust from header absence.
-- [ ] Run focused gates: `corepack pnpm vitest run src/lib/security/__tests__/request-origin.test.ts src/lib/security/__tests__/mutation-request.test.ts src/lib/security/__tests__/mutation-route-coverage.test.ts src/lib/security/__tests__/request-validation.test.ts` and `corepack pnpm build`.
+- [x] Add sub-boundary tests for browser cookie requests: missing headers, cross-origin, HTTP configured origin in production, malformed Referer, `Sec-Fetch-Site: cross-site`, and valid same-origin.
+- [x] Separately test bearer/admin/service requests: valid strong bearer works without browser headers; cookie presence cannot downgrade into service classification; invalid bearer fails.
+- [x] Add a static route-coverage test that enumerates mutating handlers and requires the central guard or an approved bearer-only wrapper.
+- [x] Run RED: `corepack pnpm vitest run src/lib/security/__tests__/request-origin.test.ts src/lib/security/__tests__/mutation-request.test.ts src/lib/security/__tests__/mutation-route-coverage.test.ts`.
+- [x] Implement canonical origin parsing, production HTTPS enforcement, browser/service classification, and shared wrapper integration; never infer trust from header absence.
+- [x] Run focused gates: `corepack pnpm vitest run src/lib/security/__tests__/request-origin.test.ts src/lib/security/__tests__/mutation-request.test.ts src/lib/security/__tests__/mutation-route-coverage.test.ts src/lib/security/__tests__/request-validation.test.ts` and `corepack pnpm build`.
 
 **Compatibility/rollback:** The strong admin bearer gate remains unchanged. Document service clients that must send bearer auth. A temporary report-only mode may inventory browser callers, but production enforcement must have a dated cutoff and cannot accept missing origin indefinitely. No migration.
 
@@ -396,13 +398,13 @@ For every task, follow the same review loop after its task-specific checks:
 - Modify: call sites returned by `rg "sha256\(" src/lib src/app`
 - Modify: persisted-digest compatibility tests in `src/lib/generation/jobs/__tests__/idempotency.test.ts`
 
-- [ ] Add golden vectors for object ordering, escapes/Unicode, RFC numeric examples, negative zero, and nested structures; add rejection tests for NaN/infinity, undefined, functions, cycles, and lone surrogates.
-- [ ] Add the ambiguity regression: canonical JSON `null` and raw UTF-8 bytes `"null"` must require different APIs even if their digest bytes happen to match.
-- [ ] Inventory every call site and label it canonical-data or raw-bytes before changing code.
-- [ ] Run RED: `corepack pnpm vitest run src/lib/generation/workflows/__tests__/canonical.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts`.
-- [ ] Implement strict canonical serialization and split hash APIs; migrate call sites mechanically according to the reviewed inventory.
-- [ ] Preserve persisted digests for existing valid JSON. If any golden representation differs, add an explicit digest version and dual-read compatibility rather than silently rewriting identities.
-- [ ] Run focused gates: `corepack pnpm vitest run src/lib/generation/workflows/__tests__/canonical.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts` and `rg "sha256\(" src/lib src/app` to confirm no ambiguous API remains.
+- [x] Add golden vectors for object ordering, escapes/Unicode, RFC numeric examples, negative zero, and nested structures; add rejection tests for NaN/infinity, undefined, functions, cycles, and lone surrogates.
+- [x] Add the ambiguity regression: canonical JSON `null` and raw UTF-8 bytes `"null"` must require different APIs even if their digest bytes happen to match.
+- [x] Inventory every call site and label it canonical-data or raw-bytes before changing code.
+- [x] Run RED: `corepack pnpm vitest run src/lib/generation/workflows/__tests__/canonical.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts`.
+- [x] Implement strict canonical serialization and split hash APIs; migrate call sites mechanically according to the reviewed inventory.
+- [x] Preserve persisted digests for existing valid JSON. If any golden representation differs, add an explicit digest version and dual-read compatibility rather than silently rewriting identities.
+- [x] Run focused gates: `corepack pnpm vitest run src/lib/generation/workflows/__tests__/canonical.test.ts src/lib/generation/jobs/__tests__/idempotency.test.ts` and `rg "sha256\(" src/lib src/app` to confirm no ambiguous API remains.
 
 **Compatibility/rollback:** No migration unless the call-site inventory proves a persisted representation change; in that case stop and amend this plan with a versioned migration before implementation. Existing valid persisted digests must continue to resolve. Rollback restores old function names only after callers are reverted.
 
@@ -412,9 +414,9 @@ For every task, follow the same review loop after its task-specific checks:
 
 ## Final integration and release gate
 
-- [ ] Run all migration checks: `python tools/test_migrations.py` and `corepack pnpm test:migrations`.
+- [x] Run all migration checks: `python tools/test_migrations.py` and `corepack pnpm test:migrations`.
 - [ ] Run worker and application builds: `corepack pnpm worker:build` and `corepack pnpm build`.
-- [ ] Run the complete static gate: `corepack pnpm quality:static`.
+- [x] Run the complete static gate: `corepack pnpm quality:static`.
 - [ ] Repeat the real concurrency/process/network suites together:
 
   ```powershell

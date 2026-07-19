@@ -1,5 +1,7 @@
 # Single-Endpoint Managed ComfyUI Acceptance Implementation Plan
 
+> Current execution status, evidence requirements, complete acceptance criteria, and the final Go/No-Go decision are maintained in [`../../remaining-work-development-and-acceptance-plan.md`](../../remaining-work-development-and-acceptance-plan.md). This file retains the implementation history and task-level design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run image, video, IndexTTS2, and OmniVoice workflows through one managed `http://127.0.0.1:8000` ComfyUI process, serially, and fully restart plus reconnect only after every job's outputs have been durably archived.
